@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`rustrest` is a minimal HTTP/web framework written in Rust (edition 2024). It provides a small, hand-written routing layer (`App` / `Request` / `Response`) on top of **hyper 1.x** for the HTTP transport, served on `tokio`. Route handlers may be **synchronous or asynchronous** (the framework user picks per route), and routes support **path parameters** (`/users/:id`). Treat this as a framework-building project: prefer extending the hand-written abstractions in `src/app.rs` over pulling in a higher-level framework (axum, actix, warp, etc.) unless explicitly asked.
+`rustrest` is a minimal HTTP/web framework written in Rust (edition 2024). It provides a small, hand-written routing layer (`App` / `Router` / `Request` / `Response`) on top of **hyper 1.x** for the HTTP transport, served on `tokio`. It is loosely modeled on Express: route handlers may be **synchronous or asynchronous**, routes support **path parameters** (`/users/:id`), routers can be defined per-file and **mounted** under a prefix (including nested), and **middleware** runs in an onion (`next`) model. Treat this as a framework-building project: prefer extending the hand-written abstractions over pulling in a higher-level framework (axum, actix, warp, etc.) unless explicitly asked.
 
 User-facing strings and console output are in Spanish — match that convention when adding routes or messages.
 
@@ -21,26 +21,30 @@ Edition 2024 requires a Rust 1.85+ stable toolchain.
 
 ## Architecture
 
-Two source files:
+Source files:
 
-- `src/main.rs` — entry point (`#[tokio::main]`). Constructs an `App`, registers routes with closures (the demos cover sync/async handlers, a `POST` reading the JSON body, and `GET`/`PUT`/`DELETE` with a `:id` path param), then `app.listen(addr).await`.
-- `src/app.rs` — the framework core.
+- `src/main.rs` — entry point (`#[tokio::main]`). Builds the `App`, adds middleware (`app.layer(...)`), registers root routes, mounts routers, then `app.listen(addr).await`.
+- `src/app.rs` — the framework core (everything below).
+- `src/users.rs`, `src/api.rs` — **example** user-land route modules. Each exposes `pub fn router() -> Router`. `api` mounts `users` (nesting); `main` mounts `api` under `/api`. This is the pattern for organizing routes/sub-routes across files.
 
 Core types (all in `src/app.rs`):
-- `App { routes: Vec<Route> }` — routes are matched in **registration order** (not a hash lookup), so register more specific routes before param routes.
-- `Route { method, pattern: Vec<Segment>, handler }` + `enum Segment { Static, Param }` — a path pattern is parsed by `parse_pattern` (`/users/:id` → `[Static("users"), Param("id")]`); `match_pattern` compares it against the request's `path_segments`, capturing params. `App::route(method, path)` returns the first matching handler plus captured params.
-- `Handler` — internal type: `Box<dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync>`. Every user handler is normalized into this future-returning shape.
-- `IntoHandler<Marker>` — the trait that lets `App::get`/`post`/`put`/`delete` accept **both** sync (`Fn(Request) -> Response`) and async (`Fn(Request) -> impl Future<Output = Response>`) handlers. Two blanket impls coexist via the `Marker` type-parameter trick (`SyncMarker` / `AsyncMarker`); the marker is inferred from the closure's return type, so callers never name it. Sync handlers are wrapped in an immediately-ready future.
-- `Request { method, path, query, headers, body, params }` — full request data, plus `req.param("id")` (a captured path param) and `req.json::<T>()` (deserialize the JSON body into `T`).
-- `Response { status, body, content_type }` — constructors: `Response::send(text)` (text/plain), `Response::json(&value)` (application/json; serialization failure degrades to 500), `Response::not_found()` (404), `Response::bad_request()` (400). The private `into_hyper(self)` converts it to a `hyper::Response<Full<Bytes>>`.
+- `App { router: Router, middlewares: Vec<Middleware> }` — owns the root router and the **global** middleware chain. `get/post/put/delete` delegate to the root router; `mount(prefix, router)` adds a sub-router; `layer(mw)` adds global middleware; `listen` runs the server.
+- `Router { routes, middlewares }` — a standalone, mountable set of routes with `get/post/put/delete`, `mount` (nest another router), and `layer` (**router-scoped** middleware that applies only to this router's routes). Routes are matched in **registration order** (no specificity ranking).
+- `Route { method, pattern: Vec<Segment>, handler, middlewares }` + `enum Segment { Static, Param }` — each route carries the scoped middleware chain baked in at mount time. `parse_pattern` turns `/users/:id` into segments; `match_pattern` matches request segments and captures params; `Router::route` returns the first match (cloned handler + its middleware chain + params).
+- `Handler = Arc<dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync>` — `Arc` (not `Box`) so handlers can be cloned into the middleware chain. User handlers are normalized into this via `IntoHandler<Marker>` (the `SyncMarker`/`AsyncMarker` type-parameter trick lets one method accept both sync and async closures; the marker is inferred from the return type).
+- `Next = Box<dyn FnOnce(Request) -> Pin<Box<...>> + Send>` and `Middleware = Arc<dyn Fn(Request, Next) -> Pin<Box<...>> + Send + Sync>` — the onion model. `IntoMiddleware` boxes a user `Fn(Request, Next) -> impl Future<Output = Response>`. **Note:** middleware closures must annotate the param as `next: Next` (the type can't be inferred from the body).
+- `Request { method, path, query, headers, body, params }` — plus `req.param("id")` and `req.json::<T>()`.
+- `Response { status, body, content_type }` — `send` (text/plain), `json` (application/json; failure → 500), `not_found` (404), `bad_request` (400); private `into_hyper`.
 
-Request flow (`App::listen` → `App::handle`): binds a `tokio::net::TcpListener` and wraps `self` in an `Arc`. For each accepted connection it wraps the stream in `hyper_util::rt::TokioIo`, clones the `Arc`, and spawns a task serving it with `hyper::server::conn::http1::Builder::serve_connection` plus a `service_fn`. `App::handle` is **async**: it reads method / path / query / headers from the borrowed hyper request, matches the route (capturing path params) via `App::route`, buffers the body (size-bounded — see below), builds a `Request`, **awaits** the matched handler's future (or `Response::not_found()`), and converts the result with `Response::into_hyper()`.
+Request flow (`App::listen` → `App::handle` → `App::dispatch`): per connection, the tokio stream is wrapped in `TokioIo` and served via `http1::Builder::serve_connection` + a `service_fn`. `handle` builds a `Request` (method/path/query/headers + size-bounded body), then `dispatch` routes it (capturing path params, or a 404 handler if unmatched) and builds the middleware **onion**: innermost = matched handler, then that route's scoped middlewares, then the global `App` middlewares outermost (each group wrapped last-to-first so the first-registered runs outermost within its group). Global middleware runs for **every** request (including 404s); scoped middleware runs only for the routes of the router it was added to.
 
 ### Dependencies note
-hyper 1.x is low-level, so two companion crates are required and used here: `hyper-util` (the `TokioIo` adapter bridging tokio's IO to hyper's traits) and `http-body-util` (`Full<Bytes>` response body, plus `BodyExt`/`Limited` for bounded body collection). `serde` + `serde_json` back `Response::json` and `Request::json`.
+hyper 1.x is low-level, so two companion crates are required and used: `hyper-util` (`TokioIo` adapter) and `http-body-util` (`Full<Bytes>` body, plus `BodyExt`/`Limited` for bounded body collection). `serde` + `serde_json` back `Response::json` and `Request::json`.
 
 ### Constraints to know when extending
-- `GET`/`POST`/`PUT`/`DELETE` have registration helpers; they all delegate to the private `App::add`. Add other methods by mirroring them (they only differ by the method string).
-- Routing matches by path segments with `:name` placeholders. Precedence is **first match in registration order** — there is no static-over-dynamic specificity ranking, so register concrete routes (e.g. `/users/me`) before param routes (`/users/:id`). Trailing/duplicate slashes are ignored; matching requires the same segment count. The raw query string is exposed unparsed in `Request::query`.
-- The body is buffered fully into a `String` with a **64 KB cap** (`MAX_BODY_BYTES`, enforced via `http_body_util::Limited`) and decoded UTF-8 lossily; on overflow or read error the handler sees an empty body. No streaming (responses are `Full<Bytes>`).
-- Handlers must be `Send + Sync + 'static` (closures may only capture `Send + Sync` data), since the `App` is shared across connection tasks via `Arc`.
+- `GET`/`POST`/`PUT`/`DELETE` helpers exist on both `App` and `Router` (delegating to a private `add`). Mirror them for other methods.
+- Routing matches by path segments with `:name` placeholders. Precedence is **first match in registration order** — register concrete routes (e.g. `/users/me`) before param routes (`/users/:id`). Trailing/duplicate slashes are ignored; matching requires equal segment count. The raw query string is exposed unparsed in `Request::query`.
+- `mount` flattens: it prepends the prefix to each sub-route's pattern, **bakes the mounted router's `layer` middlewares into each route** (outermost-first), and concatenates into the parent's `Vec`. Nesting composes; params in a prefix (e.g. `/users/:uid`) are captured too.
+- Middleware uses the onion model: call `next(req).await` to continue, or return a `Response` early to short-circuit. `App::layer` is **global**; `Router::layer` is **scoped** to that router's routes (applied when mounted — so a `layer` on a router mounted at `/api` runs only for `/api/*`). There is no per-path middleware without a router.
+- The body is buffered fully into a `String` with a **64 KB cap** (`MAX_BODY_BYTES` via `http_body_util::Limited`), UTF-8 lossy; on overflow/error the handler sees an empty body. No streaming (responses are `Full<Bytes>`).
+- Handlers and middleware must be `Send + Sync + 'static` (closures may only capture `Send + Sync` data), since the `App` is shared across connection tasks via `Arc`.
