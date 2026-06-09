@@ -55,7 +55,7 @@ pub fn gzip() -> Middleware {
 
             if !accepts_gzip
                 || res.status == 101
-                || res.body.is_empty()
+                || res.body_bytes().is_none_or(<[u8]>::is_empty)
                 || res.headers.contains_key(CONTENT_ENCODING)
             {
                 return res;

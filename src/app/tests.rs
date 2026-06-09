@@ -92,7 +92,7 @@ async fn http_errors_keep_status_and_can_use_global_error_handler() {
     let res = app.dispatch(dummy_request("")).await;
 
     assert_eq!(res.status, 400);
-    assert_eq!(res.body, r#"{"error":"Invalid name","status":400}"#);
+    assert_eq!(res.body_text(), r#"{"error":"Invalid name","status":400}"#);
 }
 
 #[tokio::test]
@@ -151,7 +151,7 @@ async fn router_guards_block_requests_and_scoped_fallbacks_handle_misses() {
         .headers
         .insert("x-api-key".to_string(), "secret".to_string());
     let allowed = app.dispatch(allowed_req).await;
-    assert_eq!(allowed.body, "private");
+    assert_eq!(allowed.body_text(), "private");
 
     let mut fallback_req = request_with_method("GET", "/api/not-found");
     fallback_req
@@ -159,7 +159,7 @@ async fn router_guards_block_requests_and_scoped_fallbacks_handle_misses() {
         .insert("x-api-key".to_string(), "secret".to_string());
     let fallback = app.dispatch(fallback_req).await;
     assert_eq!(fallback.status, 404);
-    assert_eq!(fallback.body, "fallback api");
+    assert_eq!(fallback.body_text(), "fallback api");
 }
 
 #[tokio::test]
@@ -242,10 +242,23 @@ fn request_with_method(method: &str, path: &str) -> Request {
 }
 
 #[test]
+fn response_body_accessors_and_no_desync_for_streams() {
+    let bytes_res = Response::send("hi");
+    assert_eq!(bytes_res.status, 200);
+    assert_eq!(bytes_res.content_type, "text/plain; charset=utf-8");
+    assert_eq!(bytes_res.body_bytes(), Some(&b"hi"[..]));
+    assert_eq!(bytes_res.body_text(), "hi");
+
+    // A streamed response keeps no in-memory body to desync from its stream.
+    let stream_res = Response::stream(stream::iter(vec![Ok(Bytes::from_static(b"x"))]));
+    assert_eq!(stream_res.body_bytes(), None);
+}
+
+#[test]
 fn send_sets_text_plain_and_200() {
     let res = Response::send("hello");
     assert_eq!(res.status, 200);
-    assert_eq!(res.body, "hello");
+    assert_eq!(res.body_text(), "hello");
     assert_eq!(res.content_type, "text/plain; charset=utf-8");
 }
 
@@ -253,7 +266,7 @@ fn send_sets_text_plain_and_200() {
 fn not_found_sets_404() {
     let res = Response::not_found();
     assert_eq!(res.status, 404);
-    assert_eq!(res.body, "404 Not Found");
+    assert_eq!(res.body_text(), "404 Not Found");
 }
 
 #[test]
@@ -273,7 +286,7 @@ fn json_serializes_value_with_200_and_json_content_type() {
     let res = Response::json(&User { id: 1, name: "Ada" });
     assert_eq!(res.status, 200);
     assert_eq!(res.content_type, "application/json");
-    assert_eq!(res.body, r#"{"id":1,"name":"Ada"}"#);
+    assert_eq!(res.body_text(), r#"{"id":1,"name":"Ada"}"#);
 }
 
 #[test]
@@ -467,7 +480,7 @@ async fn dispatch_runs_sync_handler() {
     let mut app = App::new();
     app.get("/", |_r: Request| Response::send("sync"));
     let res = app.dispatch(dummy_request("")).await;
-    assert_eq!(res.body, "sync");
+    assert_eq!(res.body_text(), "sync");
 }
 
 #[tokio::test]
@@ -475,7 +488,7 @@ async fn dispatch_runs_async_handler() {
     let mut app = App::new();
     app.get("/", |_r: Request| async move { Response::send("async") });
     let res = app.dispatch(dummy_request("")).await;
-    assert_eq!(res.body, "async");
+    assert_eq!(res.body_text(), "async");
 }
 
 #[tokio::test]
@@ -488,7 +501,7 @@ async fn dispatch_accepts_result_handlers() {
     let res = app.dispatch(dummy_request("")).await;
 
     assert_eq!(res.status, 200);
-    assert_eq!(res.body, "ok");
+    assert_eq!(res.body_text(), "ok");
 }
 
 #[tokio::test]
@@ -530,7 +543,7 @@ async fn request_can_access_shared_state() {
 
     let res = app.dispatch(dummy_request("")).await;
 
-    assert_eq!(res.body, "rustrest");
+    assert_eq!(res.body_text(), "rustrest");
 }
 
 #[tokio::test]
@@ -556,7 +569,7 @@ async fn middleware_wraps_handler_and_runs() {
     });
 
     let res = app.dispatch(dummy_request("")).await;
-    assert_eq!(res.body, "handler");
+    assert_eq!(res.body_text(), "handler");
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 
@@ -567,7 +580,7 @@ async fn middleware_can_short_circuit() {
     app.layer(|_req: Request, _next: Next| async move { Response::send("blocked") });
 
     let res = app.dispatch(dummy_request("")).await;
-    assert_eq!(res.body, "blocked");
+    assert_eq!(res.body_text(), "blocked");
 }
 
 #[tokio::test]
@@ -627,12 +640,12 @@ async fn router_layer_scopes_middleware_to_its_routes() {
     let mut req = dummy_request("");
     req.path = "/api/thing".to_string();
     let res = app.dispatch(req).await;
-    assert_eq!(res.body, "scoped");
+    assert_eq!(res.body_text(), "scoped");
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 
     // A request outside the mount does not.
     let res = app.dispatch(dummy_request("")).await;
-    assert_eq!(res.body, "root");
+    assert_eq!(res.body_text(), "root");
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 
@@ -656,7 +669,7 @@ async fn app_static_files_serves_files_with_content_type() {
         .await;
 
     assert_eq!(res.status, 200);
-    assert_eq!(res.body, "body { color: red; }");
+    assert_eq!(res.body_text(), "body { color: red; }");
     assert_eq!(res.content_type, "text/css; charset=utf-8");
 
     fs::remove_dir_all(root).unwrap();
@@ -707,5 +720,5 @@ async fn handle_strips_body_for_head_requests() {
     let res = app.dispatch(request_with_method("HEAD", "/")).await;
 
     assert_eq!(res.status, 200);
-    assert_eq!(res.body, "");
+    assert_eq!(res.body_text(), "");
 }

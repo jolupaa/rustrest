@@ -27,7 +27,6 @@ enum BodyKind {
 
 pub struct Response {
     pub status: u16,
-    pub body: String,
     pub content_type: String,
     pub headers: HeaderMap,
     body_kind: BodyKind,
@@ -42,7 +41,6 @@ impl Response {
     pub fn bytes(bytes: Bytes, content_type: impl Into<String>) -> Self {
         Self {
             status: 200,
-            body: String::from_utf8_lossy(&bytes).into_owned(),
             content_type: content_type.into(),
             headers: HeaderMap::new(),
             body_kind: BodyKind::Bytes(bytes),
@@ -57,7 +55,6 @@ impl Response {
         let frames = stream.map(|chunk| chunk.map(Frame::data));
         Self {
             status: 200,
-            body: String::new(),
             content_type: "application/octet-stream".to_string(),
             headers: HeaderMap::new(),
             body_kind: BodyKind::Stream(Box::pin(frames)),
@@ -188,8 +185,24 @@ impl Response {
         }
     }
 
+    /// Returns the response body bytes when it is an in-memory body.
+    /// Streamed and empty bodies return `None` (nothing to read up-front).
+    pub fn body_bytes(&self) -> Option<&[u8]> {
+        match &self.body_kind {
+            BodyKind::Bytes(bytes) => Some(bytes),
+            BodyKind::Stream(_) | BodyKind::Empty => None,
+        }
+    }
+
+    /// Returns the in-memory body as a lossy UTF-8 view (empty for streams).
+    pub fn body_text(&self) -> std::borrow::Cow<'_, str> {
+        match &self.body_kind {
+            BodyKind::Bytes(bytes) => String::from_utf8_lossy(bytes),
+            BodyKind::Stream(_) | BodyKind::Empty => std::borrow::Cow::Borrowed(""),
+        }
+    }
+
     pub(crate) fn clear_body(&mut self) {
-        self.body.clear();
         self.body_kind = BodyKind::Empty;
     }
 
@@ -199,7 +212,6 @@ impl Response {
     {
         if let BodyKind::Bytes(bytes) = &self.body_kind {
             let mapped = Bytes::from(mapper(bytes)?);
-            self.body = String::from_utf8_lossy(&mapped).into_owned();
             self.body_kind = BodyKind::Bytes(mapped);
         }
         Ok(())
@@ -213,7 +225,6 @@ impl Response {
     pub(crate) fn into_hyper(self) -> hyper::Response<ResponseBody> {
         let Response {
             status,
-            body: _,
             content_type,
             headers,
             body_kind,
