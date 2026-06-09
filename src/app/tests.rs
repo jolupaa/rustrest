@@ -620,6 +620,32 @@ async fn middlewares_nest_in_registration_order() {
 }
 
 #[tokio::test]
+async fn per_route_middleware_applies_only_to_that_route() {
+    let hits = Arc::new(AtomicUsize::new(0));
+
+    let mut app = App::new();
+    let counter = Arc::clone(&hits);
+    app.get("/guarded", |_r: Request| Response::send("guarded"))
+        .layer(move |req: Request, next: Next| {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                next(req).await
+            }
+        });
+    app.get("/open", |_r: Request| Response::send("open"));
+
+    let res = app.dispatch(request_with_method("GET", "/guarded")).await;
+    assert_eq!(res.body_text(), "guarded");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    // A different route does not run the per-route middleware.
+    let res = app.dispatch(request_with_method("GET", "/open")).await;
+    assert_eq!(res.body_text(), "open");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn router_layer_scopes_middleware_to_its_routes() {
     let hits = Arc::new(AtomicUsize::new(0));
 

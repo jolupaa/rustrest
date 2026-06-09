@@ -21,7 +21,7 @@ pub use extract::{FromRequest, Json, Path, Query, State};
 pub use handler::{ErrorHandler, Handler, IntoHandler, IntoMiddleware, Middleware, Next};
 pub use request::Request;
 pub use response::{IntoResponse, Response};
-pub use router::Router;
+pub use router::{RouteHandle, Router};
 pub use server::App;
 pub use sse::SseEvent;
 pub use state::StateStore;

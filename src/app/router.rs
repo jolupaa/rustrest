@@ -105,60 +105,60 @@ impl Router {
         }
     }
 
-    pub fn get<H, M>(&mut self, path: &str, handler: H)
+    pub fn get<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
     where
         H: IntoHandler<M>,
     {
-        self.add("GET", path, handler);
+        self.add("GET", path, handler)
     }
 
-    pub fn post<H, M>(&mut self, path: &str, handler: H)
+    pub fn post<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
     where
         H: IntoHandler<M>,
     {
-        self.add("POST", path, handler);
+        self.add("POST", path, handler)
     }
 
-    pub fn put<H, M>(&mut self, path: &str, handler: H)
+    pub fn put<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
     where
         H: IntoHandler<M>,
     {
-        self.add("PUT", path, handler);
+        self.add("PUT", path, handler)
     }
 
-    pub fn delete<H, M>(&mut self, path: &str, handler: H)
+    pub fn delete<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
     where
         H: IntoHandler<M>,
     {
-        self.add("DELETE", path, handler);
+        self.add("DELETE", path, handler)
     }
 
-    pub fn patch<H, M>(&mut self, path: &str, handler: H)
+    pub fn patch<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
     where
         H: IntoHandler<M>,
     {
-        self.add("PATCH", path, handler);
+        self.add("PATCH", path, handler)
     }
 
-    pub fn options<H, M>(&mut self, path: &str, handler: H)
+    pub fn options<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
     where
         H: IntoHandler<M>,
     {
-        self.add("OPTIONS", path, handler);
+        self.add("OPTIONS", path, handler)
     }
 
-    pub fn head<H, M>(&mut self, path: &str, handler: H)
+    pub fn head<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
     where
         H: IntoHandler<M>,
     {
-        self.add("HEAD", path, handler);
+        self.add("HEAD", path, handler)
     }
 
-    pub fn all<H, M>(&mut self, path: &str, handler: H)
+    pub fn all<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
     where
         H: IntoHandler<M>,
     {
-        self.add(METHOD_ALL, path, handler);
+        self.add(METHOD_ALL, path, handler)
     }
 
     pub fn websocket<F, Fut>(&mut self, path: &str, handler: F)
@@ -222,7 +222,7 @@ impl Router {
         self.add_static_route("HEAD", &pattern, root);
     }
 
-    fn add<H, M>(&mut self, method: &str, path: &str, handler: H)
+    fn add<H, M>(&mut self, method: &str, path: &str, handler: H) -> RouteHandle<'_>
     where
         H: IntoHandler<M>,
     {
@@ -232,6 +232,11 @@ impl Router {
             handler: handler.into_handler(),
             middlewares: Vec::new(),
         });
+        let index = self.routes.len() - 1;
+        RouteHandle {
+            router: self,
+            index,
+        }
     }
 
     fn add_static_route(&mut self, method: &str, path: &str, root: Arc<PathBuf>) {
@@ -296,6 +301,25 @@ impl Router {
             }
         }
         None
+    }
+}
+
+/// A handle to a just-registered route, returned by the route methods so that
+/// per-route middleware can be attached: `app.get("/admin", h).layer(auth)`.
+/// The handle is ignorable when no per-route middleware is needed.
+pub struct RouteHandle<'a> {
+    router: &'a mut Router,
+    index: usize,
+}
+
+impl RouteHandle<'_> {
+    /// Adds a middleware that wraps only this route. Repeated calls stack, with
+    /// the first-added middleware outermost.
+    pub fn layer<MW: IntoMiddleware>(self, middleware: MW) -> Self {
+        self.router.routes[self.index]
+            .middlewares
+            .push(middleware.into_middleware());
+        self
     }
 }
 

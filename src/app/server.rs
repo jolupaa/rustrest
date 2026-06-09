@@ -19,7 +19,7 @@ use tokio::net::{TcpListener, ToSocketAddrs};
 
 use super::{
     ErrorHandler, HttpError, IntoHandler, IntoMiddleware, Middleware, Next, Request, Response,
-    Router, StateStore,
+    RouteHandle, Router, StateStore,
 };
 use super::{ResponseBody, not_found_handler, panic_response, parse_cookies, parse_query};
 
@@ -108,65 +108,62 @@ impl App {
         self
     }
 
-    pub fn get<H, M>(&mut self, path: &str, handler: H)
+    pub fn get<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
     where
         H: IntoHandler<M>,
     {
-        self.router.get(path, handler);
+        self.router.get(path, handler)
     }
 
     // These delegate to the root router and are part of the public API even
     // when a given binary registers its routes through a Router instead.
-    #[allow(dead_code)]
-    pub fn post<H, M>(&mut self, path: &str, handler: H)
+    pub fn post<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
     where
         H: IntoHandler<M>,
     {
-        self.router.post(path, handler);
+        self.router.post(path, handler)
     }
 
-    #[allow(dead_code)]
-    pub fn put<H, M>(&mut self, path: &str, handler: H)
+    pub fn put<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
     where
         H: IntoHandler<M>,
     {
-        self.router.put(path, handler);
+        self.router.put(path, handler)
     }
 
-    #[allow(dead_code)]
-    pub fn delete<H, M>(&mut self, path: &str, handler: H)
+    pub fn delete<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
     where
         H: IntoHandler<M>,
     {
-        self.router.delete(path, handler);
+        self.router.delete(path, handler)
     }
 
-    pub fn patch<H, M>(&mut self, path: &str, handler: H)
+    pub fn patch<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
     where
         H: IntoHandler<M>,
     {
-        self.router.patch(path, handler);
+        self.router.patch(path, handler)
     }
 
-    pub fn options<H, M>(&mut self, path: &str, handler: H)
+    pub fn options<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
     where
         H: IntoHandler<M>,
     {
-        self.router.options(path, handler);
+        self.router.options(path, handler)
     }
 
-    pub fn head<H, M>(&mut self, path: &str, handler: H)
+    pub fn head<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
     where
         H: IntoHandler<M>,
     {
-        self.router.head(path, handler);
+        self.router.head(path, handler)
     }
 
-    pub fn all<H, M>(&mut self, path: &str, handler: H)
+    pub fn all<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
     where
         H: IntoHandler<M>,
     {
-        self.router.all(path, handler);
+        self.router.all(path, handler)
     }
 
     pub fn websocket<F, Fut>(&mut self, path: &str, handler: F)
