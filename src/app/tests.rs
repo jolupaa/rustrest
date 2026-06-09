@@ -499,6 +499,92 @@ fn response_cookie_appends_set_cookie_headers() {
 }
 
 #[test]
+fn cookie_builder_renders_attributes() {
+    let header = Cookie::new("sid", "abc")
+        .domain("example.com")
+        .max_age_secs(3600)
+        .secure(true)
+        .http_only(true)
+        .same_site(SameSite::Strict)
+        .to_header_value();
+    assert_eq!(
+        header,
+        "sid=abc; Path=/; Domain=example.com; Max-Age=3600; Secure; HttpOnly; SameSite=Strict"
+    );
+
+    let res = Response::send("ok")
+        .set_cookie(Cookie::new("a", "1"))
+        .clear_cookie("old");
+    let cookies: Vec<_> = res
+        .headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap().to_string())
+        .collect();
+    assert!(cookies.contains(&"a=1; Path=/".to_string()), "{cookies:?}");
+    assert!(
+        cookies.contains(&"old=; Path=/; Max-Age=0".to_string()),
+        "{cookies:?}"
+    );
+}
+
+#[test]
+fn signed_values_roundtrip_and_reject_tampering() {
+    let signed = sign_value("secret", "user42");
+    assert_ne!(signed, "user42");
+    assert_eq!(verify_value("secret", &signed).as_deref(), Some("user42"));
+    assert_eq!(verify_value("wrong-secret", &signed), None);
+    assert_eq!(verify_value("secret", "user42.forged"), None);
+    assert_eq!(verify_value("secret", "no-signature"), None);
+}
+
+#[tokio::test]
+async fn sessions_middleware_assigns_and_persists_session() {
+    let sessions = Sessions::new("top-secret");
+    let mut app = App::new();
+    app.layer(sessions.middleware());
+    let store = sessions.clone();
+    app.get("/visit", move |req: Request| {
+        let id = req.session_id().expect("session id set").to_string();
+        let visits = store
+            .get(&id, "visits")
+            .and_then(|count| count.parse::<u32>().ok())
+            .unwrap_or(0)
+            + 1;
+        store.set(&id, "visits", &visits.to_string());
+        Response::send(&visits.to_string())
+    });
+
+    let client = TestClient::new(app);
+
+    // First visit creates the session and sets a signed cookie.
+    let res = client.get("/visit").send().await;
+    assert_eq!(res.body_text(), "1");
+    let set_cookie = res
+        .headers
+        .get(SET_COOKIE)
+        .expect("session cookie set")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (name, value) = set_cookie
+        .split(';')
+        .next()
+        .unwrap()
+        .split_once('=')
+        .unwrap();
+
+    // Replaying the cookie resumes the same session.
+    let res = client.get("/visit").cookie(name, value).send().await;
+    assert_eq!(res.body_text(), "2");
+
+    // A tampered cookie gets a fresh session (and a new Set-Cookie).
+    let res = client.get("/visit").cookie(name, "forged.sig").send().await;
+    assert_eq!(res.body_text(), "1");
+    assert!(res.headers.get(SET_COOKIE).is_some());
+}
+
+#[test]
 fn query_params_are_parsed_and_url_decoded() {
     let query = parse_query("q=rust+rest&tag=web&tag=api&empty=&flag&encoded=hello%20world");
     let req = Request {

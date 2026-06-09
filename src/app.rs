@@ -4,6 +4,7 @@
 //! file wires them together and re-exports the public API (also surfaced at the
 //! crate root via `lib.rs`).
 
+mod cookie;
 mod error;
 mod extract;
 mod form;
@@ -13,11 +14,13 @@ mod request;
 mod response;
 mod router;
 mod server;
+mod session;
 mod sse;
 mod state;
 mod testing;
 mod websocket;
 
+pub use cookie::{Cookie, SameSite, sign_value, verify_value};
 pub use error::{HttpError, IntoHttpError};
 pub use extract::{Cookies, Form, FromRequest, Headers, Json, Path, Query, State};
 pub use form::MultipartPart;
@@ -26,6 +29,7 @@ pub use request::{Request, RequestBuilder};
 pub use response::{IntoResponse, Response};
 pub use router::{RouteHandle, Router};
 pub use server::App;
+pub use session::Sessions;
 pub use sse::SseEvent;
 pub use state::StateStore;
 pub use testing::{TestClient, TestRequest};
