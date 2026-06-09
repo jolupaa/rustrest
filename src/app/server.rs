@@ -7,11 +7,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::FutureExt;
-use http_body_util::{BodyExt, Limited};
-use hyper::body::{Bytes, Incoming};
+use http_body_util::{BodyExt, LengthLimitError, Limited};
+use hyper::body::Incoming;
 use hyper::header::{CONNECTION, COOKIE, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE};
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::{TcpListener, ToSocketAddrs};
@@ -22,8 +22,26 @@ use super::{
 };
 use super::{ResponseBody, not_found_handler, panic_response, parse_cookies, parse_query};
 
-/// Maximum request body we will buffer into memory (64 KB).
-const MAX_BODY_BYTES: usize = 64 * 1024;
+/// Default maximum request body we will buffer into memory (64 KB).
+const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// Server-wide limits and timeouts, configured via builder methods on [`App`].
+#[derive(Clone, Copy)]
+pub struct ServerConfig {
+    max_body_size: usize,
+    request_timeout: Option<Duration>,
+    header_read_timeout: Option<Duration>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            max_body_size: DEFAULT_MAX_BODY_BYTES,
+            request_timeout: None,
+            header_read_timeout: None,
+        }
+    }
+}
 
 fn is_websocket_upgrade_request(req: &hyper::Request<Incoming>) -> bool {
     req.method().as_str().eq_ignore_ascii_case("GET")
@@ -54,6 +72,7 @@ pub struct App {
     middlewares: Vec<Middleware>,
     state: StateStore,
     error_handler: Option<ErrorHandler>,
+    config: ServerConfig,
 }
 
 impl App {
@@ -63,7 +82,29 @@ impl App {
             middlewares: Vec::new(),
             state: StateStore::default(),
             error_handler: None,
+            config: ServerConfig::default(),
         }
+    }
+
+    /// Sets the maximum request body size buffered into memory. Requests whose
+    /// body exceeds this return `413 Payload Too Large`. Defaults to 64 KB.
+    pub fn max_body_size(&mut self, bytes: usize) -> &mut Self {
+        self.config.max_body_size = bytes;
+        self
+    }
+
+    /// Sets a per-request timeout for handler execution. On timeout the client
+    /// receives `408 Request Timeout`. Defaults to no timeout.
+    pub fn request_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.config.request_timeout = Some(timeout);
+        self
+    }
+
+    /// Sets how long a connection may take to send its request headers
+    /// (slow-loris protection). Defaults to no timeout.
+    pub fn header_read_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.config.header_read_timeout = Some(timeout);
+        self
     }
 
     pub fn get<H, M>(&mut self, path: &str, handler: H)
@@ -221,8 +262,15 @@ impl App {
         listener: TcpListener,
         shutdown: impl Future<Output = ()> + Send,
     ) -> io::Result<()> {
+        let header_read_timeout = self.config.header_read_timeout;
         let app = Arc::new(self);
-        let builder = auto::Builder::new(TokioExecutor::new());
+        let mut builder = auto::Builder::new(TokioExecutor::new());
+        if let Some(timeout) = header_read_timeout {
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(timeout);
+        }
         let graceful = GracefulShutdown::new();
         let mut shutdown = std::pin::pin!(shutdown);
 
@@ -306,12 +354,21 @@ impl App {
 
         // Buffer the body up to MAX_BODY_BYTES; on overflow or read error,
         // fall back to an empty body.
-        let body = match Limited::new(req.into_body(), MAX_BODY_BYTES)
+        // Buffer the body up to the configured limit. On overflow return 413;
+        // on any other read error return 400 (no longer a silent empty body).
+        let body = match Limited::new(req.into_body(), self.config.max_body_size)
             .collect()
             .await
         {
             Ok(collected) => collected.to_bytes(),
-            Err(_) => Bytes::new(),
+            Err(err) => {
+                let error = if err.downcast_ref::<LengthLimitError>().is_some() {
+                    HttpError::new(413, "Payload Too Large")
+                } else {
+                    HttpError::bad_request("Could not read request body")
+                };
+                return self.error_response(error).into_hyper();
+            }
         };
 
         let request = Request {
@@ -327,7 +384,25 @@ impl App {
             upgrade,
         };
 
-        self.dispatch(request).await.into_hyper()
+        // Apply the per-request timeout (if configured) around the handler.
+        let response = match self.config.request_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, self.dispatch(request)).await {
+                Ok(response) => response,
+                Err(_) => self.error_response(HttpError::new(408, "Request Timeout")),
+            },
+            None => self.dispatch(request).await,
+        };
+
+        response.into_hyper()
+    }
+
+    /// Builds a response for an error, routing it through the registered
+    /// `error_handler` if one is set, otherwise a default plain-text response.
+    fn error_response(&self, error: HttpError) -> Response {
+        match &self.error_handler {
+            Some(handler) => handler(error),
+            None => Response::from_error(error),
+        }
     }
 
     /// Routes the request (capturing path params), then runs it through the

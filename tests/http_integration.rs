@@ -7,6 +7,62 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 
 #[tokio::test]
+async fn oversized_body_returns_413() {
+    let mut app = App::new();
+    app.max_body_size(16);
+    app.post("/upload", |_req: Request| Response::send("ok"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(app.serve(listener));
+
+    let body = "x".repeat(100);
+    let request = format!(
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    server.abort();
+
+    assert!(
+        response.starts_with("HTTP/1.1 413"),
+        "expected 413, got: {response}"
+    );
+}
+
+#[tokio::test]
+async fn slow_handler_times_out_with_408() {
+    let mut app = App::new();
+    app.request_timeout(Duration::from_millis(50));
+    app.get("/slow", |_req: Request| async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Response::send("too late")
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(app.serve(listener));
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    server.abort();
+
+    assert!(
+        response.starts_with("HTTP/1.1 408"),
+        "expected 408, got: {response}"
+    );
+}
+
+#[tokio::test]
 async fn serve_with_shutdown_returns_after_signal() {
     let mut app = App::new();
     app.get("/ping", |_req: Request| Response::send("pong"));
