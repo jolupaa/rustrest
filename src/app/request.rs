@@ -35,6 +35,12 @@ pub struct Request {
 }
 
 impl Request {
+    /// Starts building a `Request` by hand — the entry point for unit-testing
+    /// handlers and middleware without a TCP connection.
+    pub fn builder() -> RequestBuilder {
+        RequestBuilder::new()
+    }
+
     /// Returns a captured path parameter by name.
     pub fn param(&self, name: &str) -> Option<&str> {
         self.params.get(name).map(String::as_str)
@@ -130,6 +136,142 @@ impl Request {
     /// Deserializes the request body as JSON into `T`.
     pub fn json<T: DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_slice(&self.body)
+    }
+}
+
+/// Builds a [`Request`] piece by piece. Header names are lowercased to mirror
+/// how the real server normalizes them; a path given as `/x?a=1` is split into
+/// path + query automatically.
+pub struct RequestBuilder {
+    method: String,
+    path: String,
+    raw_query: Option<String>,
+    headers: Vec<(String, String)>,
+    cookies: HashMap<String, String>,
+    params: HashMap<String, String>,
+    state: StateStore,
+    body: Bytes,
+    remote_addr: Option<SocketAddr>,
+}
+
+impl RequestBuilder {
+    pub fn new() -> Self {
+        Self {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            raw_query: None,
+            headers: Vec::new(),
+            cookies: HashMap::new(),
+            params: HashMap::new(),
+            state: StateStore::default(),
+            body: Bytes::new(),
+            remote_addr: None,
+        }
+    }
+
+    pub fn method(mut self, method: &str) -> Self {
+        self.method = method.to_ascii_uppercase();
+        self
+    }
+
+    /// Sets the request path. A query string may be included (`/x?a=1`).
+    pub fn path(mut self, path: &str) -> Self {
+        match path.split_once('?') {
+            Some((path, query)) => {
+                self.path = path.to_string();
+                self.raw_query = Some(query.to_string());
+            }
+            None => self.path = path.to_string(),
+        }
+        self
+    }
+
+    /// Sets the raw query string (without the leading `?`).
+    pub fn query(mut self, raw_query: &str) -> Self {
+        self.raw_query = Some(raw_query.to_string());
+        self
+    }
+
+    /// Appends a header. Repeated names are all kept (see `headers_all`).
+    pub fn header(mut self, name: &str, value: &str) -> Self {
+        self.headers
+            .push((name.to_ascii_lowercase(), value.to_string()));
+        self
+    }
+
+    pub fn cookie(mut self, name: &str, value: &str) -> Self {
+        self.cookies.insert(name.to_string(), value.to_string());
+        self
+    }
+
+    /// Sets a captured path parameter, as routing would have.
+    pub fn param(mut self, name: &str, value: &str) -> Self {
+        self.params.insert(name.to_string(), value.to_string());
+        self
+    }
+
+    /// Inserts a value into the request's state store (one per type).
+    pub fn state<T>(mut self, value: T) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        self.state.insert(value);
+        self
+    }
+
+    pub fn body(mut self, body: impl Into<Bytes>) -> Self {
+        self.body = body.into();
+        self
+    }
+
+    /// Serializes `value` as the JSON body and sets the content type.
+    pub fn json<T: serde::Serialize>(self, value: &T) -> Self {
+        let body = serde_json::to_vec(value).unwrap_or_default();
+        self.header("content-type", "application/json").body(body)
+    }
+
+    pub fn remote_addr(mut self, addr: SocketAddr) -> Self {
+        self.remote_addr = Some(addr);
+        self
+    }
+
+    pub fn build(self) -> Request {
+        let query = self
+            .raw_query
+            .as_deref()
+            .map(parse_query)
+            .unwrap_or_default();
+        let mut headers = HashMap::new();
+        let mut cookies = self.cookies;
+        for (name, value) in &self.headers {
+            if name == "cookie" {
+                for (cookie_name, cookie_value) in parse_cookies(value) {
+                    cookies.entry(cookie_name).or_insert(cookie_value);
+                }
+            }
+            headers.insert(name.clone(), value.clone());
+        }
+
+        Request {
+            method: self.method,
+            path: self.path,
+            raw_query: self.raw_query,
+            query,
+            headers,
+            cookies,
+            body: self.body,
+            params: self.params,
+            state: self.state,
+            upgrade: None,
+            remote_addr: self.remote_addr,
+            header_pairs: self.headers,
+        }
+    }
+}
+
+impl Default for RequestBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

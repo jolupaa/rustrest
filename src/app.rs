@@ -14,17 +14,19 @@ mod router;
 mod server;
 mod sse;
 mod state;
+mod testing;
 mod websocket;
 
 pub use error::{HttpError, IntoHttpError};
 pub use extract::{FromRequest, Json, Path, Query, State};
 pub use handler::{ErrorHandler, Handler, IntoHandler, IntoMiddleware, Middleware, Next};
-pub use request::Request;
+pub use request::{Request, RequestBuilder};
 pub use response::{IntoResponse, Response};
 pub use router::{RouteHandle, Router};
 pub use server::App;
 pub use sse::SseEvent;
 pub use state::StateStore;
+pub use testing::{TestClient, TestRequest};
 pub use websocket::{
     IntoWebSocketHandler, WebSocket, WebSocketError, WebSocketEvent, WebSocketHandler,
     WebSocketMessage,

@@ -32,9 +32,9 @@ const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
 /// Server-wide limits and timeouts, configured via builder methods on [`App`].
 #[derive(Clone, Copy)]
 pub struct ServerConfig {
-    max_body_size: usize,
-    request_timeout: Option<Duration>,
-    header_read_timeout: Option<Duration>,
+    pub(crate) max_body_size: usize,
+    pub(crate) request_timeout: Option<Duration>,
+    pub(crate) header_read_timeout: Option<Duration>,
 }
 
 impl Default for ServerConfig {
@@ -76,7 +76,7 @@ pub struct App {
     middlewares: Vec<Middleware>,
     state: StateStore,
     error_handler: Option<ErrorHandler>,
-    config: ServerConfig,
+    pub(crate) config: ServerConfig,
 }
 
 impl App {
@@ -389,21 +389,24 @@ impl App {
             header_pairs,
         };
 
-        // Apply the per-request timeout (if configured) around the handler.
-        let response = match self.config.request_timeout {
+        self.run_request(request).await.into_hyper()
+    }
+
+    /// Runs a request through dispatch, applying the configured per-request
+    /// timeout (408 on expiry). Shared by the real server and the test client.
+    pub(crate) async fn run_request(&self, request: Request) -> Response {
+        match self.config.request_timeout {
             Some(timeout) => match tokio::time::timeout(timeout, self.dispatch(request)).await {
                 Ok(response) => response,
                 Err(_) => self.error_response(HttpError::new(408, "Request Timeout")),
             },
             None => self.dispatch(request).await,
-        };
-
-        response.into_hyper()
+        }
     }
 
     /// Builds a response for an error, routing it through the registered
     /// `error_handler` if one is set, otherwise a default plain-text response.
-    fn error_response(&self, error: HttpError) -> Response {
+    pub(crate) fn error_response(&self, error: HttpError) -> Response {
         match &self.error_handler {
             Some(handler) => handler(error),
             None => Response::from_error(error),

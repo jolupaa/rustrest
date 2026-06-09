@@ -287,6 +287,85 @@ fn response_body_accessors_and_no_desync_for_streams() {
 }
 
 #[test]
+fn request_builder_builds_full_request() {
+    struct Cfg {
+        name: &'static str,
+    }
+
+    let req = Request::builder()
+        .method("POST")
+        .path("/users/42?active=true&tag=a&tag=b")
+        .header("X-Tag", "uno")
+        .header("x-tag", "dos")
+        .cookie("sid", "abc")
+        .param("id", "42")
+        .state(Cfg { name: "test" })
+        .body(r#"{"n":1}"#)
+        .build();
+
+    assert_eq!(req.method, "POST");
+    assert_eq!(req.path, "/users/42");
+    assert_eq!(req.query("active"), Some("true"));
+    assert_eq!(req.query_all("tag"), vec!["a", "b"]);
+    // Header names are lowercased like the real server; map keeps last value,
+    // headers_all keeps every value.
+    assert_eq!(req.header("X-Tag"), Some("dos"));
+    assert_eq!(req.headers_all("x-tag"), vec!["uno", "dos"]);
+    assert_eq!(req.cookie("sid"), Some("abc"));
+    assert_eq!(req.param("id"), Some("42"));
+    assert_eq!(req.bytes(), br#"{"n":1}"#);
+    assert_eq!(req.state::<Cfg>().unwrap().name, "test");
+}
+
+#[tokio::test]
+async fn test_client_drives_app_without_tcp() {
+    let mut app = App::new();
+    app.layer(|req: Request, next: Next| async move {
+        let res = next(req).await;
+        res.header("x-mw", "ran")
+    });
+    app.get("/hello/:name", |req: Request| {
+        let name = req.param("name").unwrap_or("?");
+        let lang = req.query("lang").unwrap_or("en");
+        Response::send(&format!("hola {} ({})", name, lang))
+    });
+    app.post("/echo", |req: Request| Response::send(&req.text()));
+
+    let client = TestClient::new(app);
+
+    let res = client.get("/hello/ada?lang=es").send().await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.body_text(), "hola ada (es)");
+    assert_eq!(res.headers.get("x-mw").unwrap(), "ran");
+
+    let res = client.post("/echo").body("ping").send().await;
+    assert_eq!(res.body_text(), "ping");
+
+    let res = client.get("/missing").send().await;
+    assert_eq!(res.status, 404);
+}
+
+#[tokio::test]
+async fn test_client_honors_body_limit_and_timeout() {
+    let mut app = App::new();
+    app.max_body_size(4);
+    app.request_timeout(std::time::Duration::from_millis(30));
+    app.post("/up", |_r: Request| Response::send("ok"));
+    app.get("/slow", |_r: Request| async {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        Response::send("late")
+    });
+
+    let client = TestClient::new(app);
+
+    let res = client.post("/up").body("way too large").send().await;
+    assert_eq!(res.status, 413);
+
+    let res = client.get("/slow").send().await;
+    assert_eq!(res.status, 408);
+}
+
+#[test]
 fn send_sets_text_plain_and_200() {
     let res = Response::send("hello");
     assert_eq!(res.status, 200);
