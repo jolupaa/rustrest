@@ -164,6 +164,36 @@ async fn router_guards_block_requests_and_scoped_fallbacks_handle_misses() {
 }
 
 #[tokio::test]
+async fn error_handler_formats_404_and_405() {
+    #[derive(Serialize)]
+    struct ErrorBody {
+        error: String,
+        status: u16,
+    }
+
+    let mut app = App::new();
+    app.error_handler(|err: HttpError| {
+        Response::json(&ErrorBody {
+            error: err.message().to_string(),
+            status: err.status(),
+        })
+        .status(err.status())
+    });
+    app.get("/exists", |_r: Request| Response::send("ok"));
+
+    // Unmatched route (404) flows through the error handler.
+    let res = app.dispatch(request_with_method("GET", "/missing")).await;
+    assert_eq!(res.status, 404);
+    assert_eq!(res.content_type, "application/json");
+    assert!(res.body_text().contains("\"status\":404"));
+
+    // Method mismatch (405) flows through the error handler too.
+    let res = app.dispatch(request_with_method("POST", "/exists")).await;
+    assert_eq!(res.status, 405);
+    assert_eq!(res.content_type, "application/json");
+}
+
+#[tokio::test]
 async fn response_formats_sse_events() {
     let events = stream::iter(vec![
         SseEvent::new("hello").event("greeting").id("1"),

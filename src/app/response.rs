@@ -82,19 +82,11 @@ impl Response {
     }
 
     pub fn not_found() -> Self {
-        Self::bytes(
-            Bytes::from_static(b"404 Not Found"),
-            "text/plain; charset=utf-8",
-        )
-        .status(404)
+        Self::from_error(HttpError::not_found("Not Found"))
     }
 
     pub fn bad_request() -> Self {
-        Self::bytes(
-            Bytes::from_static(b"400 Bad Request"),
-            "text/plain; charset=utf-8",
-        )
-        .status(400)
+        Self::from_error(HttpError::bad_request("Bad Request"))
     }
 
     pub fn internal_server_error() -> Self {
