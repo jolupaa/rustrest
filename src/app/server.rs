@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use futures_util::FutureExt;
 use http_body_util::{BodyExt, Limited};
-use hyper::body::Incoming;
+use hyper::body::{Bytes, Incoming};
 use hyper::header::{CONNECTION, COOKIE, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -253,8 +253,8 @@ impl App {
             .collect()
             .await
         {
-            Ok(collected) => String::from_utf8_lossy(&collected.to_bytes()).into_owned(),
-            Err(_) => String::new(),
+            Ok(collected) => collected.to_bytes(),
+            Err(_) => Bytes::new(),
         };
 
         let request = Request {

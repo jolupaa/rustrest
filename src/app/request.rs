@@ -1,5 +1,7 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 
+use hyper::body::Bytes;
 use hyper::header::{SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION};
 use hyper::upgrade::OnUpgrade;
 use serde::de::DeserializeOwned;
@@ -18,8 +20,8 @@ pub struct Request {
     pub query: HashMap<String, Vec<String>>,
     pub headers: HashMap<String, String>,
     pub cookies: HashMap<String, String>,
-    /// Request body, decoded as UTF-8 (lossy), capped at 64 KB.
-    pub body: String,
+    /// Raw request body bytes (binary-safe), capped by the server's body limit.
+    pub(crate) body: Bytes,
     /// Captured path parameters, e.g. `/users/:id` matching `/users/42`
     /// yields `{"id": "42"}`.
     pub params: HashMap<String, String>,
@@ -94,9 +96,19 @@ impl Request {
             && self.header(SEC_WEBSOCKET_VERSION.as_str()) == Some("13")
     }
 
+    /// Returns the raw request body bytes (binary-safe).
+    pub fn bytes(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// Returns the request body as a lossy UTF-8 string view.
+    pub fn text(&self) -> Cow<'_, str> {
+        String::from_utf8_lossy(&self.body)
+    }
+
     /// Deserializes the request body as JSON into `T`.
     pub fn json<T: DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
-        serde_json::from_str(&self.body)
+        serde_json::from_slice(&self.body)
     }
 }
 

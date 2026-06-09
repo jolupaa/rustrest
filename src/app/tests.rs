@@ -21,7 +21,7 @@ fn dummy_request(body: &str) -> Request {
         query: HashMap::new(),
         headers: HashMap::new(),
         cookies: HashMap::new(),
-        body: body.to_string(),
+        body: Bytes::from(body.to_string()),
         params: HashMap::new(),
         state: StateStore::default(),
         upgrade: None,
@@ -343,7 +343,7 @@ fn query_params_are_parsed_and_url_decoded() {
         query,
         headers: HashMap::new(),
         cookies: HashMap::new(),
-        body: String::new(),
+        body: Bytes::new(),
         params: HashMap::new(),
         state: StateStore::default(),
         upgrade: None,
@@ -389,6 +389,18 @@ fn request_json_deserializes_body() {
 fn request_json_errors_on_invalid_body() {
     let req = dummy_request("not json");
     assert!(req.json::<serde_json::Value>().is_err());
+}
+
+#[test]
+fn request_body_bytes_preserve_non_utf8_and_text_is_lossy() {
+    // Bytes that are not valid UTF-8 must survive intact through `bytes()`,
+    // while `text()` exposes a lossy view for text consumers.
+    let raw: &[u8] = &[0xff, 0xfe, b'h', b'i'];
+    let mut req = dummy_request("");
+    req.body = Bytes::copy_from_slice(raw);
+
+    assert_eq!(req.bytes(), raw);
+    assert_eq!(req.text(), String::from_utf8_lossy(raw));
 }
 
 #[test]
