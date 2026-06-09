@@ -18,6 +18,7 @@
 //! ```
 //!
 //! The [`app`] module is also available with the framework's public core types.
+#![forbid(unsafe_code)]
 
 pub mod app;
 

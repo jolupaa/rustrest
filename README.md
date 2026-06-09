@@ -71,7 +71,7 @@ RustRest uses Rust edition 2024 and requires Rust `1.85` or newer.
 use rustrest::{App, Request, Response};
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::io::Result<()> {
     let mut app = App::new();
 
     app.get("/", |_req: Request| {
@@ -83,7 +83,7 @@ async fn main() {
         Response::send(&format!("Requested user: {}", id))
     });
 
-    app.listen("127.0.0.1:3000").await;
+    app.listen("127.0.0.1:3000").await
 }
 ```
 
@@ -752,14 +752,25 @@ This validates upgrade headers and returns `101 Switching Protocols` with `Sec-W
 
 ## Serving with an Existing TcpListener
 
-Besides `listen`, you can use `serve` for tests or custom bootstrap code:
+Besides `listen`, you can use `serve` for tests or custom bootstrap code, or
+`serve_with_shutdown` / `listen_with_shutdown` for graceful shutdown:
 
 ```rust
 use tokio::net::TcpListener;
 
 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-app.serve(listener).await;
+
+// Serve until the process is killed.
+app.serve(listener).await?;
+
+// Or stop accepting on a signal and drain in-flight connections:
+// app.serve_with_shutdown(listener, async {
+//     tokio::signal::ctrl_c().await.ok();
+// }).await?;
 ```
+
+`listen`, `serve`, and the `*_with_shutdown` variants all return
+`std::io::Result<()>`.
 
 ## Testing
 
