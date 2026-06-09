@@ -29,6 +29,9 @@ pub struct Request {
     pub(crate) state: StateStore,
     pub(crate) upgrade: Option<OnUpgrade>,
     pub(crate) remote_addr: Option<SocketAddr>,
+    /// All inbound header (lowercased-name, value) pairs in arrival order,
+    /// preserving duplicates that the convenience `headers` map collapses.
+    pub(crate) header_pairs: Vec<(String, String)>,
 }
 
 impl Request {
@@ -67,6 +70,17 @@ impl Request {
                 self.headers.get(&lower)
             })
             .map(String::as_str)
+    }
+
+    /// Returns all values for a request header, case-insensitively, in arrival
+    /// order. Preserves duplicates (e.g. multiple `X-Forwarded-For`) that the
+    /// `header()`/`headers` convenience view collapses to a single value.
+    pub fn headers_all(&self, name: &str) -> Vec<&str> {
+        self.header_pairs
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+            .collect()
     }
 
     /// Returns the client's socket address, if known (set by the server).

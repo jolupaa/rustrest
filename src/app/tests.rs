@@ -26,6 +26,7 @@ fn dummy_request(body: &str) -> Request {
         state: StateStore::default(),
         upgrade: None,
         remote_addr: None,
+        header_pairs: Vec::new(),
     }
 }
 
@@ -392,6 +393,7 @@ fn query_params_are_parsed_and_url_decoded() {
         state: StateStore::default(),
         upgrade: None,
         remote_addr: None,
+        header_pairs: Vec::new(),
     };
 
     assert_eq!(req.query("q"), Some("rust rest"));

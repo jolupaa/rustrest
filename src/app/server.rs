@@ -340,16 +340,16 @@ impl App {
         } else {
             None
         };
-        let headers = req
-            .headers()
-            .iter()
-            .map(|(name, value)| {
-                (
-                    name.as_str().to_string(),
-                    value.to_str().unwrap_or("").to_string(),
-                )
-            })
-            .collect();
+        // Build a convenience single-value map (last value wins) and a
+        // full-fidelity list that preserves duplicate headers.
+        let mut headers: HashMap<String, String> = HashMap::new();
+        let mut header_pairs: Vec<(String, String)> = Vec::new();
+        for (name, value) in req.headers().iter() {
+            let name = name.as_str().to_string();
+            let value = value.to_str().unwrap_or("").to_string();
+            headers.insert(name.clone(), value.clone());
+            header_pairs.push((name, value));
+        }
         let cookies = req
             .headers()
             .get(COOKIE)
@@ -386,6 +386,7 @@ impl App {
             state: self.state.clone(),
             upgrade,
             remote_addr,
+            header_pairs,
         };
 
         // Apply the per-request timeout (if configured) around the handler.

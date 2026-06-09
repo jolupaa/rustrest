@@ -7,6 +7,34 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 
 #[tokio::test]
+async fn duplicate_request_headers_are_all_preserved() {
+    let mut app = App::new();
+    app.get("/h", |req: Request| {
+        Response::send(&req.headers_all("x-tag").join(","))
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(app.serve(listener));
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"GET /h HTTP/1.1\r\nHost: localhost\r\nX-Tag: a\r\nX-Tag: b\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    server.abort();
+
+    assert!(
+        response.ends_with("a,b"),
+        "expected both header values, got: {response}"
+    );
+}
+
+#[tokio::test]
 async fn request_exposes_client_peer_address() {
     let mut app = App::new();
     app.get("/whoami", |req: Request| match req.remote_addr() {
