@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use flate2::Compression;
-use flate2::write::GzEncoder;
+use flate2::write::{GzEncoder, ZlibEncoder};
 use hyper::header::{CONTENT_ENCODING, VARY};
 
 use super::{HttpError, IntoMiddleware, Middleware, Next, Request, Response};
@@ -96,6 +96,119 @@ pub fn tracing() -> Middleware {
             println!("--> {} {}", method, path);
             let res = next(req).await;
             println!("<-- {} {} ({})", method, path, res.status);
+            res
+        })
+    })
+}
+
+/// Bodies smaller than this are not worth compressing.
+const COMPRESSION_MIN_BYTES: usize = 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Encoding {
+    #[cfg(feature = "brotli")]
+    Brotli,
+    Gzip,
+    Deflate,
+}
+
+impl Encoding {
+    fn name(self) -> &'static str {
+        match self {
+            #[cfg(feature = "brotli")]
+            Encoding::Brotli => "br",
+            Encoding::Gzip => "gzip",
+            Encoding::Deflate => "deflate",
+        }
+    }
+
+    fn encode(self, body: &[u8]) -> Result<Vec<u8>, HttpError> {
+        let failed =
+            |err: std::io::Error| HttpError::internal_server_error(format!("Compression: {err}"));
+        match self {
+            #[cfg(feature = "brotli")]
+            Encoding::Brotli => {
+                let mut writer = brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22);
+                writer.write_all(body).map_err(failed)?;
+                writer.flush().map_err(failed)?;
+                Ok(writer.into_inner())
+            }
+            Encoding::Gzip => {
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(body).map_err(failed)?;
+                encoder.finish().map_err(failed)
+            }
+            Encoding::Deflate => {
+                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(body).map_err(failed)?;
+                encoder.finish().map_err(failed)
+            }
+        }
+    }
+}
+
+/// Picks the best supported encoding from an `Accept-Encoding` header
+/// (brotli, when the feature is on, then gzip, then deflate). `q=0` refuses.
+fn choose_encoding(accept_encoding: &str) -> Option<Encoding> {
+    #[cfg(feature = "brotli")]
+    let mut brotli_ok = false;
+    let mut gzip_ok = false;
+    let mut deflate_ok = false;
+
+    for part in accept_encoding.split(',') {
+        let token = part.trim();
+        let (name, params) = token.split_once(';').unwrap_or((token, ""));
+        if params.replace(' ', "").eq_ignore_ascii_case("q=0") {
+            continue;
+        }
+        match name.trim().to_ascii_lowercase().as_str() {
+            #[cfg(feature = "brotli")]
+            "br" => brotli_ok = true,
+            "gzip" => gzip_ok = true,
+            "deflate" => deflate_ok = true,
+            _ => {}
+        }
+    }
+
+    #[cfg(feature = "brotli")]
+    if brotli_ok {
+        return Some(Encoding::Brotli);
+    }
+    if gzip_ok {
+        Some(Encoding::Gzip)
+    } else if deflate_ok {
+        Some(Encoding::Deflate)
+    } else {
+        None
+    }
+}
+
+/// Content negotiation for response compression with a 1 KB minimum size.
+/// Supports gzip and deflate (plus brotli with the `brotli` feature).
+pub fn compression() -> Middleware {
+    compression_with_min_size(COMPRESSION_MIN_BYTES)
+}
+
+/// Like [`compression`], with a custom minimum body size.
+pub fn compression_with_min_size(min_size: usize) -> Middleware {
+    Arc::new(move |req: Request, next: Next| {
+        let encoding = req.header("accept-encoding").and_then(choose_encoding);
+        Box::pin(async move {
+            let mut res = next(req).await;
+            let Some(encoding) = encoding else {
+                return res;
+            };
+            if res.status == 101
+                || res.headers.contains_key(CONTENT_ENCODING)
+                || res.body_bytes().is_none_or(|body| body.len() < min_size)
+            {
+                return res;
+            }
+            if res.map_body_bytes(|body| encoding.encode(body)).is_ok() {
+                res = res
+                    .header(CONTENT_ENCODING.as_str(), encoding.name())
+                    .append_header(VARY.as_str(), "Accept-Encoding");
+            }
             res
         })
     })

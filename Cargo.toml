@@ -11,7 +11,12 @@ keywords = ["http", "web", "framework", "hyper", "tokio"]
 categories = ["web-programming::http-server", "network-programming"]
 exclude = ["AGENTS.md", "CLAUDE.md"]
 
+[features]
+default = []
+brotli = ["dep:brotli"]
+
 [dependencies]
+brotli = { version = "7", optional = true }
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }

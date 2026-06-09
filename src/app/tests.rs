@@ -177,6 +177,58 @@ async fn builtin_middlewares_add_cors_request_id_gzip_and_tracing() {
 }
 
 #[tokio::test]
+async fn compression_negotiates_encoding_and_skips_small_bodies() {
+    let mut app = App::new();
+    app.layer(middleware::compression());
+    let big = "x".repeat(2048);
+    app.get("/big", move |_r: Request| Response::send(&big));
+    app.get("/small", |_r: Request| Response::send("tiny"));
+
+    let client = TestClient::new(app);
+
+    // Only deflate accepted -> zlib-encoded body.
+    let res = client
+        .get("/big")
+        .header("accept-encoding", "deflate")
+        .send()
+        .await;
+    assert_eq!(res.headers.get(CONTENT_ENCODING).unwrap(), "deflate");
+    let mut decoder = flate2::read::ZlibDecoder::new(res.body_bytes().unwrap());
+    let mut decoded = String::new();
+    decoder.read_to_string(&mut decoded).unwrap();
+    assert_eq!(decoded.len(), 2048);
+
+    // gzip preferred when both are accepted; Vary advertises the negotiation.
+    let res = client
+        .get("/big")
+        .header("accept-encoding", "deflate, gzip;q=0.8")
+        .send()
+        .await;
+    assert_eq!(res.headers.get(CONTENT_ENCODING).unwrap(), "gzip");
+    assert_eq!(res.headers.get("vary").unwrap(), "Accept-Encoding");
+
+    // Bodies under the threshold are left alone.
+    let res = client
+        .get("/small")
+        .header("accept-encoding", "gzip")
+        .send()
+        .await;
+    assert!(res.headers.get(CONTENT_ENCODING).is_none());
+
+    // No Accept-Encoding -> untouched.
+    let res = client.get("/big").send().await;
+    assert!(res.headers.get(CONTENT_ENCODING).is_none());
+
+    // q=0 explicitly refuses an encoding.
+    let res = client
+        .get("/big")
+        .header("accept-encoding", "gzip;q=0, deflate")
+        .send()
+        .await;
+    assert_eq!(res.headers.get(CONTENT_ENCODING).unwrap(), "deflate");
+}
+
+#[tokio::test]
 async fn cors_builder_handles_preflight_and_origin_allowlist() {
     let mut app = App::new();
     app.layer(
