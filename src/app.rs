@@ -31,9 +31,12 @@ pub use websocket::{
 };
 
 // Crate-internal helpers shared across submodules.
-pub(crate) use handler::{not_found_handler, panic_response};
+pub(crate) use handler::{
+    method_not_allowed_handler, not_found_handler, options_handler, panic_response,
+};
 pub(crate) use request::{decode_component, parse_cookies, parse_query};
 pub(crate) use response::ResponseBody;
+pub(crate) use router::allow_header_value;
 
 #[cfg(test)]
 mod tests;

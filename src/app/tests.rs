@@ -556,6 +556,44 @@ async fn dispatch_unmatched_returns_404() {
 }
 
 #[tokio::test]
+async fn unmatched_method_returns_405_with_allow() {
+    let mut app = App::new();
+    app.get("/only", |_r: Request| Response::send("get"));
+
+    let res = app.dispatch(request_with_method("POST", "/only")).await;
+
+    assert_eq!(res.status, 405);
+    assert_eq!(res.headers.get("allow").unwrap(), "GET, HEAD, OPTIONS");
+}
+
+#[tokio::test]
+async fn head_is_auto_served_from_get() {
+    let mut app = App::new();
+    app.get("/page", |_r: Request| Response::send("hello"));
+
+    let res = app.dispatch(request_with_method("HEAD", "/page")).await;
+
+    // Matched via the GET route; body stripped because the method is HEAD.
+    assert_eq!(res.status, 200);
+    assert_eq!(res.body_text(), "");
+}
+
+#[tokio::test]
+async fn options_is_auto_answered_with_allow() {
+    let mut app = App::new();
+    app.get("/thing", |_r: Request| Response::send("g"));
+    app.post("/thing", |_r: Request| Response::send("p"));
+
+    let res = app.dispatch(request_with_method("OPTIONS", "/thing")).await;
+
+    assert_eq!(res.status, 204);
+    let allow = res.headers.get("allow").unwrap().to_str().unwrap();
+    assert!(allow.contains("GET"), "allow: {allow}");
+    assert!(allow.contains("POST"), "allow: {allow}");
+    assert!(allow.contains("OPTIONS"), "allow: {allow}");
+}
+
+#[tokio::test]
 async fn middleware_wraps_handler_and_runs() {
     let mut app = App::new();
     app.get("/", |_r: Request| Response::send("handler"));

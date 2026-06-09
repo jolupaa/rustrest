@@ -302,6 +302,39 @@ impl Router {
         }
         None
     }
+
+    /// Returns the distinct concrete methods registered for routes whose
+    /// pattern matches `path` (ignoring the request method). Used to build the
+    /// `Allow` header for 405/OPTIONS responses. `*` (catch-all) is excluded.
+    pub(crate) fn allowed_methods(&self, path: &str) -> Vec<String> {
+        let segments = path_segments(path);
+        let mut methods = Vec::new();
+        for route in &self.routes {
+            if route.method == METHOD_ALL {
+                continue;
+            }
+            if match_pattern(&route.pattern, &segments).is_some()
+                && !methods.contains(&route.method)
+            {
+                methods.push(route.method.clone());
+            }
+        }
+        methods
+    }
+}
+
+/// Builds an `Allow` header value from the matched methods, implicitly adding
+/// `HEAD` (when `GET` is present) and `OPTIONS`, both of which the server
+/// answers automatically.
+pub(crate) fn allow_header_value(allowed: &[String]) -> String {
+    let mut methods = allowed.to_vec();
+    if methods.iter().any(|m| m == "GET") && !methods.iter().any(|m| m == "HEAD") {
+        methods.push("HEAD".to_string());
+    }
+    if !methods.iter().any(|m| m == "OPTIONS") {
+        methods.push("OPTIONS".to_string());
+    }
+    methods.join(", ")
 }
 
 /// A handle to a just-registered route, returned by the route methods so that

@@ -21,7 +21,10 @@ use super::{
     ErrorHandler, HttpError, IntoHandler, IntoMiddleware, Middleware, Next, Request, Response,
     RouteHandle, Router, StateStore,
 };
-use super::{ResponseBody, not_found_handler, panic_response, parse_cookies, parse_query};
+use super::{
+    Handler, ResponseBody, allow_header_value, method_not_allowed_handler, not_found_handler,
+    options_handler, panic_response, parse_cookies, parse_query,
+};
 
 /// Default maximum request body we will buffer into memory (64 KB).
 const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
@@ -406,15 +409,46 @@ impl App {
         }
     }
 
+    /// Resolves a request that did not directly match a route: auto-serves
+    /// HEAD from a matching GET, auto-answers OPTIONS with `Allow`, returns 405
+    /// when the path exists for other methods, or falls through to 404.
+    fn resolve_miss(
+        &self,
+        method: &str,
+        path: &str,
+    ) -> (Handler, Vec<Middleware>, HashMap<String, String>) {
+        let allowed = self.router.allowed_methods(path);
+        if allowed.is_empty() {
+            (not_found_handler(), Vec::new(), HashMap::new())
+        } else if method == "HEAD" && allowed.iter().any(|m| m == "GET") {
+            self.router
+                .route("GET", path)
+                .expect("GET route present per allowed_methods")
+        } else if method == "OPTIONS" {
+            (
+                options_handler(allow_header_value(&allowed)),
+                Vec::new(),
+                HashMap::new(),
+            )
+        } else {
+            (
+                method_not_allowed_handler(allow_header_value(&allowed)),
+                Vec::new(),
+                HashMap::new(),
+            )
+        }
+    }
+
     /// Routes the request (capturing path params), then runs it through the
     /// middleware onion ending at the matched handler (or a 404 handler).
     pub(crate) async fn dispatch(&self, mut request: Request) -> Response {
         request.state = self.state.clone();
         let is_head = request.method == "HEAD";
-        let (handler, route_middlewares, params) = self
-            .router
-            .route(&request.method, &request.path)
-            .unwrap_or_else(|| (not_found_handler(), Vec::new(), HashMap::new()));
+        let (handler, route_middlewares, params) =
+            match self.router.route(&request.method, &request.path) {
+                Some(found) => found,
+                None => self.resolve_miss(&request.method, &request.path),
+            };
         request.params = params;
 
         // Innermost layer: the matched handler.

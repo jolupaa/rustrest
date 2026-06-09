@@ -121,3 +121,28 @@ pub(crate) fn not_found_handler() -> Handler {
         },
     )
 }
+
+/// A handler that responds `405 Method Not Allowed` with the given `Allow`
+/// header. Carries an `HttpError` so a registered error handler can format it.
+pub(crate) fn method_not_allowed_handler(allow: String) -> Handler {
+    Arc::new(
+        move |_req: Request| -> Pin<Box<dyn Future<Output = Response> + Send>> {
+            let allow = allow.clone();
+            Box::pin(async move {
+                Response::from_error(HttpError::new(405, "Method Not Allowed"))
+                    .header("allow", &allow)
+            })
+        },
+    )
+}
+
+/// A handler that auto-answers `OPTIONS` with `204 No Content` and an `Allow`
+/// header listing the methods registered for the path.
+pub(crate) fn options_handler(allow: String) -> Handler {
+    Arc::new(
+        move |_req: Request| -> Pin<Box<dyn Future<Output = Response> + Send>> {
+            let allow = allow.clone();
+            Box::pin(async move { Response::send("").status(204).header("allow", &allow) })
+        },
+    )
+}
