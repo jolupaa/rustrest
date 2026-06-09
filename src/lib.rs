@@ -6,14 +6,14 @@
 //! use rustrest::{App, Request, Response};
 //!
 //! #[tokio::main]
-//! async fn main() {
+//! async fn main() -> std::io::Result<()> {
 //!     let mut app = App::new();
 //!
 //!     app.get("/", |_req: Request| {
 //!         Response::send("Hello from RustRest")
 //!     });
 //!
-//!     app.listen("127.0.0.1:3000").await;
+//!     app.listen("127.0.0.1:3000").await
 //! }
 //! ```
 //!

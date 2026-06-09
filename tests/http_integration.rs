@@ -1,9 +1,41 @@
 use futures_util::{SinkExt, StreamExt};
 use rustrest::app::{App, Request, Response, WebSocketEvent};
 use serde_json::json;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
+
+#[tokio::test]
+async fn serve_with_shutdown_returns_after_signal() {
+    let mut app = App::new();
+    app.get("/ping", |_req: Request| Response::send("pong"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(app.serve_with_shutdown(listener, async move {
+        let _ = rx.await;
+    }));
+
+    // A request before shutdown is served normally.
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    assert!(response.contains("pong"));
+
+    // After signaling shutdown, the server stops accepting and returns Ok.
+    tx.send(()).unwrap();
+    let joined = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server should stop within timeout")
+        .expect("server task should not panic");
+    assert!(joined.is_ok());
+}
 
 #[tokio::test]
 async fn app_serves_real_http_requests() {

@@ -4,7 +4,7 @@ mod users;
 use rustrest::{App, Next, Request, Response};
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::io::Result<()> {
     let mut app = App::new();
 
     // Global middleware (onion model): runs before and after the handler.
@@ -24,5 +24,5 @@ async fn main() {
     // Result: /api/users, /api/users/:id, ...
     app.mount("/api", api::router());
 
-    app.listen("127.0.0.1:3000").await;
+    app.listen("127.0.0.1:3000").await
 }

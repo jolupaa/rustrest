@@ -1,16 +1,20 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::future::Future;
+use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::FutureExt;
 use http_body_util::{BodyExt, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{CONNECTION, COOKIE, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE};
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
+use hyper_util::server::graceful::GracefulShutdown;
+use tokio::net::{TcpListener, ToSocketAddrs};
 
 use super::{
     ErrorHandler, HttpError, IntoHandler, IntoMiddleware, Middleware, Next, Request, Response,
@@ -178,43 +182,96 @@ impl App {
         self.middlewares.push(middleware.into_middleware());
     }
 
-    pub async fn listen(self, address: &str) {
-        let listener = TcpListener::bind(address)
-            .await
-            .expect("Unable to start server");
-
-        println!("Server listening at http://{}", address);
-        self.serve(listener).await;
+    /// Binds to `address` and serves connections until the process is killed.
+    /// Returns an error only if binding fails; accept errors are non-fatal.
+    pub async fn listen(self, address: impl ToSocketAddrs) -> io::Result<()> {
+        let listener = TcpListener::bind(address).await?;
+        if let Ok(local) = listener.local_addr() {
+            println!("Server listening at http://{}", local);
+        }
+        self.serve(listener).await
     }
 
-    pub async fn serve(self, listener: TcpListener) {
-        let app = Arc::new(self);
-        loop {
-            let (stream, _) = listener
-                .accept()
-                .await
-                .expect("Error accepting the connection");
+    /// Binds to `address` and serves until `shutdown` resolves, then drains
+    /// in-flight connections gracefully.
+    pub async fn listen_with_shutdown(
+        self,
+        address: impl ToSocketAddrs,
+        shutdown: impl Future<Output = ()> + Send,
+    ) -> io::Result<()> {
+        let listener = TcpListener::bind(address).await?;
+        if let Ok(local) = listener.local_addr() {
+            println!("Server listening at http://{}", local);
+        }
+        self.serve_with_shutdown(listener, shutdown).await
+    }
 
-            // Adapt the tokio stream to hyper's IO traits.
+    /// Serves connections on `listener` until the process is killed.
+    pub async fn serve(self, listener: TcpListener) -> io::Result<()> {
+        self.serve_with_shutdown(listener, std::future::pending::<()>())
+            .await
+    }
+
+    /// Serves connections on `listener` until `shutdown` resolves. A transient
+    /// accept error is logged and retried — it never tears down the server.
+    /// Once `shutdown` fires, the listener is closed and outstanding
+    /// connections are drained (bounded by a 10s timeout).
+    pub async fn serve_with_shutdown(
+        self,
+        listener: TcpListener,
+        shutdown: impl Future<Output = ()> + Send,
+    ) -> io::Result<()> {
+        let app = Arc::new(self);
+        let builder = auto::Builder::new(TokioExecutor::new());
+        let graceful = GracefulShutdown::new();
+        let mut shutdown = std::pin::pin!(shutdown);
+
+        loop {
+            let stream = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok((stream, _peer)) => stream,
+                    Err(err) => {
+                        eprintln!("Error accepting connection: {}", err);
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        continue;
+                    }
+                },
+                _ = &mut shutdown => break,
+            };
+
+            // Adapt the tokio stream to hyper's IO traits. `auto::Builder`
+            // serves HTTP/1 and HTTP/2 and supports upgrades (WebSockets);
+            // `into_owned` detaches the connection so it can outlive `builder`.
             let io = TokioIo::new(stream);
             let app = Arc::clone(&app);
+            let connection = builder
+                .serve_connection_with_upgrades(
+                    io,
+                    service_fn(move |req: hyper::Request<Incoming>| {
+                        let app = Arc::clone(&app);
+                        async move { Ok::<_, Infallible>(app.handle(req).await) }
+                    }),
+                )
+                .into_owned();
 
-            // Serve each connection concurrently.
+            // Serve each connection concurrently, watched for graceful drain.
+            let watched = graceful.watch(connection);
             tokio::spawn(async move {
-                let service = service_fn(move |req: hyper::Request<Incoming>| {
-                    let app = Arc::clone(&app);
-                    async move { Ok::<_, Infallible>(app.handle(req).await) }
-                });
-
-                if let Err(err) = http1::Builder::new()
-                    .serve_connection(io, service)
-                    .with_upgrades()
-                    .await
-                {
+                if let Err(err) = watched.await {
                     eprintln!("Error serving connection: {:?}", err);
                 }
             });
         }
+
+        // Stop accepting new connections, then drain the in-flight ones.
+        drop(listener);
+        tokio::select! {
+            _ = graceful.shutdown() => {}
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                eprintln!("Timed out waiting for in-flight connections to drain");
+            }
+        }
+        Ok(())
     }
 
     /// Translates a hyper request into a [`Request`] (method, path, query,
