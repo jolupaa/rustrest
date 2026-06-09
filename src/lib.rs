@@ -23,9 +23,9 @@
 pub mod app;
 
 pub use app::{
-    App, ErrorHandler, Form, FromRequest, Handler, HttpError, IntoHandler, IntoHttpError,
-    IntoMiddleware, IntoResponse, IntoWebSocketHandler, Json, Middleware, MultipartPart, Next,
-    Path, Query, Request, RequestBuilder, Response, RouteHandle, Router, SseEvent, State,
-    StateStore, TestClient, TestRequest, WebSocket, WebSocketError, WebSocketEvent,
-    WebSocketHandler, WebSocketMessage, middleware,
+    App, Cookies, ErrorHandler, Form, FromRequest, Handler, Headers, HttpError, IntoHandler,
+    IntoHttpError, IntoMiddleware, IntoResponse, IntoWebSocketHandler, Json, Middleware,
+    MultipartPart, Next, Path, Query, Request, RequestBuilder, Response, RouteHandle, Router,
+    SseEvent, State, StateStore, TestClient, TestRequest, WebSocket, WebSocketError,
+    WebSocketEvent, WebSocketHandler, WebSocketMessage, middleware,
 };

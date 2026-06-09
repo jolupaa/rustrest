@@ -71,6 +71,49 @@ fn typed_extractors_read_json_path_query_and_state() {
     assert_eq!(config.app_name, "rustrest");
 }
 
+#[test]
+fn extra_extractors_cover_scalars_bodies_wrappers_and_maps() {
+    #[derive(Deserialize)]
+    struct MyCookies {
+        sid: String,
+    }
+    #[derive(Deserialize)]
+    struct MyHeaders {
+        #[serde(rename = "x-api-key")]
+        key: String,
+    }
+
+    let mut req = dummy_request("cuerpo");
+    req.params.insert("id".to_string(), "42".to_string());
+    req.cookies.insert("sid".to_string(), "abc".to_string());
+    req.headers
+        .insert("x-api-key".to_string(), "k1".to_string());
+
+    // Scalar Path for single-param routes (numbers and strings).
+    let Path(id) = req.extract::<Path<u32>>().unwrap();
+    assert_eq!(id, 42);
+    let Path(raw) = req.extract::<Path<String>>().unwrap();
+    assert_eq!(raw, "42");
+
+    // Raw body extractors.
+    let bytes = req.extract::<Bytes>().unwrap();
+    assert_eq!(&bytes[..], b"cuerpo");
+    let text = req.extract::<String>().unwrap();
+    assert_eq!(text, "cuerpo");
+
+    // Option/Result wrappers never fail the extraction itself.
+    let missing: Option<Json<serde_json::Value>> = req.extract().unwrap();
+    assert!(missing.is_none());
+    let failed: Result<Json<serde_json::Value>, HttpError> = req.extract().unwrap();
+    assert!(failed.is_err());
+
+    // Typed cookie/header maps.
+    let Cookies(cookies) = req.extract::<Cookies<MyCookies>>().unwrap();
+    assert_eq!(cookies.sid, "abc");
+    let Headers(headers) = req.extract::<Headers<MyHeaders>>().unwrap();
+    assert_eq!(headers.key, "k1");
+}
+
 #[tokio::test]
 async fn http_errors_keep_status_and_can_use_global_error_handler() {
     #[derive(Serialize)]

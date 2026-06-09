@@ -19,7 +19,7 @@ mod testing;
 mod websocket;
 
 pub use error::{HttpError, IntoHttpError};
-pub use extract::{Form, FromRequest, Json, Path, Query, State};
+pub use extract::{Cookies, Form, FromRequest, Headers, Json, Path, Query, State};
 pub use form::MultipartPart;
 pub use handler::{ErrorHandler, Handler, IntoHandler, IntoMiddleware, Middleware, Next};
 pub use request::{Request, RequestBuilder};
