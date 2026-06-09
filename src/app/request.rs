@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 
 use hyper::body::Bytes;
 use hyper::header::{SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION};
@@ -27,6 +28,7 @@ pub struct Request {
     pub params: HashMap<String, String>,
     pub(crate) state: StateStore,
     pub(crate) upgrade: Option<OnUpgrade>,
+    pub(crate) remote_addr: Option<SocketAddr>,
 }
 
 impl Request {
@@ -65,6 +67,11 @@ impl Request {
                 self.headers.get(&lower)
             })
             .map(String::as_str)
+    }
+
+    /// Returns the client's socket address, if known (set by the server).
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        self.remote_addr
     }
 
     /// Returns shared application state by type.

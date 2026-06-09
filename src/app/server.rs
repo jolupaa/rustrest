@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::Duration;
@@ -275,9 +276,9 @@ impl App {
         let mut shutdown = std::pin::pin!(shutdown);
 
         loop {
-            let stream = tokio::select! {
+            let (stream, peer) = tokio::select! {
                 accepted = listener.accept() => match accepted {
-                    Ok((stream, _peer)) => stream,
+                    Ok(pair) => pair,
                     Err(err) => {
                         eprintln!("Error accepting connection: {}", err);
                         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -297,7 +298,7 @@ impl App {
                     io,
                     service_fn(move |req: hyper::Request<Incoming>| {
                         let app = Arc::clone(&app);
-                        async move { Ok::<_, Infallible>(app.handle(req).await) }
+                        async move { Ok::<_, Infallible>(app.handle(req, Some(peer)).await) }
                     }),
                 )
                 .into_owned();
@@ -324,7 +325,11 @@ impl App {
 
     /// Translates a hyper request into a [`Request`] (method, path, query,
     /// headers, size-bounded body), dispatches it, and converts the result.
-    async fn handle(&self, mut req: hyper::Request<Incoming>) -> hyper::Response<ResponseBody> {
+    async fn handle(
+        &self,
+        mut req: hyper::Request<Incoming>,
+        remote_addr: Option<SocketAddr>,
+    ) -> hyper::Response<ResponseBody> {
         // Read everything that only needs a borrow before consuming the body.
         let method = req.method().as_str().to_string();
         let path = req.uri().path().to_string();
@@ -352,8 +357,6 @@ impl App {
             .map(parse_cookies)
             .unwrap_or_default();
 
-        // Buffer the body up to MAX_BODY_BYTES; on overflow or read error,
-        // fall back to an empty body.
         // Buffer the body up to the configured limit. On overflow return 413;
         // on any other read error return 400 (no longer a silent empty body).
         let body = match Limited::new(req.into_body(), self.config.max_body_size)
@@ -382,6 +385,7 @@ impl App {
             params: HashMap::new(),
             state: self.state.clone(),
             upgrade,
+            remote_addr,
         };
 
         // Apply the per-request timeout (if configured) around the handler.
