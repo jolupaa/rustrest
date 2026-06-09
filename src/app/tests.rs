@@ -177,6 +177,70 @@ async fn builtin_middlewares_add_cors_request_id_gzip_and_tracing() {
 }
 
 #[tokio::test]
+async fn cors_builder_handles_preflight_and_origin_allowlist() {
+    let mut app = App::new();
+    app.layer(
+        middleware::Cors::new()
+            .allow_origin("https://app.example.com")
+            .allow_credentials(true)
+            .max_age_secs(600),
+    );
+    app.get("/data", |_r: Request| Response::send("data"));
+    app.post("/data", |_r: Request| Response::send("created"));
+
+    let client = TestClient::new(app);
+
+    // Preflight short-circuits with the CORS grant.
+    let res = client
+        .options("/data")
+        .header("origin", "https://app.example.com")
+        .header("access-control-request-method", "POST")
+        .header("access-control-request-headers", "x-custom")
+        .send()
+        .await;
+    assert_eq!(res.status, 204);
+    assert_eq!(
+        res.headers.get("access-control-allow-origin").unwrap(),
+        "https://app.example.com"
+    );
+    assert_eq!(
+        res.headers.get("access-control-allow-credentials").unwrap(),
+        "true"
+    );
+    assert_eq!(res.headers.get("access-control-max-age").unwrap(), "600");
+    assert!(res.headers.get("access-control-allow-methods").is_some());
+    assert_eq!(
+        res.headers.get("access-control-allow-headers").unwrap(),
+        "x-custom"
+    );
+
+    // Normal request from an allowed origin gets the grant appended.
+    let res = client
+        .get("/data")
+        .header("origin", "https://app.example.com")
+        .send()
+        .await;
+    assert_eq!(res.body_text(), "data");
+    assert_eq!(
+        res.headers.get("access-control-allow-origin").unwrap(),
+        "https://app.example.com"
+    );
+    assert_eq!(res.headers.get("vary").unwrap(), "Origin");
+
+    // Disallowed origin: no grant emitted.
+    let res = client
+        .get("/data")
+        .header("origin", "https://evil.example")
+        .send()
+        .await;
+    assert!(res.headers.get("access-control-allow-origin").is_none());
+
+    // Same-origin/non-CORS request untouched.
+    let res = client.get("/data").send().await;
+    assert!(res.headers.get("access-control-allow-origin").is_none());
+}
+
+#[tokio::test]
 async fn router_guards_block_requests_and_scoped_fallbacks_handle_misses() {
     let mut api = Router::new();
     api.guard(|req: &Request| req.header("x-api-key") == Some("secret"));
