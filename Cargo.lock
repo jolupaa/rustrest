@@ -578,6 +578,7 @@ dependencies = [
  "futures-util",
  "hmac",
  "http-body-util",
+ "httpdate",
  "hyper",
  "hyper-util",
  "serde",

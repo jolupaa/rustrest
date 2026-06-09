@@ -1153,8 +1153,109 @@ async fn app_static_files_serves_files_with_content_type() {
         .await;
 
     assert_eq!(res.status, 200);
-    assert_eq!(res.body_text(), "body { color: red; }");
     assert_eq!(res.content_type, "text/css; charset=utf-8");
+    // Files are streamed, so read the body from the hyper response.
+    let body = res
+        .into_hyper()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&body[..], b"body { color: red; }");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn static_files_support_conditional_and_range_requests() {
+    let root = std::env::temp_dir().join(format!(
+        "rustrest-static-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("static.txt"), "0123456789").unwrap();
+
+    let mut app = App::new();
+    app.static_files("/assets", &root);
+    let client = TestClient::new(app);
+
+    // Full GET: 200 with validators and a streamed, exact-length body.
+    let res = client.get("/assets/static.txt").send().await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.headers.get("content-length").unwrap(), "10");
+    assert_eq!(res.headers.get("accept-ranges").unwrap(), "bytes");
+    assert!(res.headers.get("last-modified").is_some());
+    let etag = res
+        .headers
+        .get("etag")
+        .expect("etag set")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body = res
+        .into_hyper()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&body[..], b"0123456789");
+
+    // If-None-Match revalidation -> 304.
+    let res = client
+        .get("/assets/static.txt")
+        .header("if-none-match", &etag)
+        .send()
+        .await;
+    assert_eq!(res.status, 304);
+
+    // Byte range -> 206 with Content-Range.
+    let res = client
+        .get("/assets/static.txt")
+        .header("range", "bytes=2-5")
+        .send()
+        .await;
+    assert_eq!(res.status, 206);
+    assert_eq!(res.headers.get("content-range").unwrap(), "bytes 2-5/10");
+    assert_eq!(res.headers.get("content-length").unwrap(), "4");
+    let body = res
+        .into_hyper()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&body[..], b"2345");
+
+    // Suffix range (last N bytes).
+    let res = client
+        .get("/assets/static.txt")
+        .header("range", "bytes=-3")
+        .send()
+        .await;
+    assert_eq!(res.status, 206);
+    assert_eq!(res.headers.get("content-range").unwrap(), "bytes 7-9/10");
+    let body = res
+        .into_hyper()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&body[..], b"789");
+
+    // Unsatisfiable range -> 416 with the total size.
+    let res = client
+        .get("/assets/static.txt")
+        .header("range", "bytes=50-")
+        .send()
+        .await;
+    assert_eq!(res.status, 416);
+    assert_eq!(res.headers.get("content-range").unwrap(), "bytes */10");
 
     fs::remove_dir_all(root).unwrap();
 }

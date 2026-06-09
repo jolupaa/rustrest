@@ -1,10 +1,15 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::future::Future;
+use std::io::SeekFrom;
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use futures_util::Stream;
 use hyper::body::Bytes;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use super::decode_component;
 use super::{
@@ -377,10 +382,174 @@ async fn serve_static_file(root: Arc<PathBuf>, req: Request) -> Response {
         file_path.push("index.html");
     }
 
-    match tokio::fs::read(&file_path).await {
-        Ok(bytes) => Response::bytes(Bytes::from(bytes), content_type_for_path(&file_path)),
-        Err(_) => Response::not_found(),
+    let Ok(metadata) = tokio::fs::metadata(&file_path).await else {
+        return Response::not_found();
+    };
+    let total_len = metadata.len();
+    let modified = metadata.modified().ok();
+    let etag = modified.map(|time| {
+        let stamp = time
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("\"{:x}-{:x}\"", total_len, stamp)
+    });
+
+    let validators = |res: Response| -> Response {
+        let mut res = res.header("accept-ranges", "bytes");
+        if let Some(etag) = &etag {
+            res = res.header("etag", etag);
+        }
+        if let Some(modified) = modified {
+            res = res.header("last-modified", &httpdate::fmt_http_date(modified));
+        }
+        res
+    };
+
+    // Conditional GET: If-None-Match wins over If-Modified-Since.
+    if let Some(if_none_match) = req.header("if-none-match") {
+        let matches = etag.as_deref().is_some_and(|etag| {
+            if_none_match
+                .split(',')
+                .any(|candidate| candidate.trim() == etag || candidate.trim() == "*")
+        });
+        if matches {
+            return validators(Response::send("").status(304));
+        }
+    } else if let (Some(since), Some(modified)) = (
+        req.header("if-modified-since")
+            .and_then(|value| httpdate::parse_http_date(value).ok()),
+        modified,
+    ) {
+        // HTTP dates have second resolution.
+        let to_secs = |time: SystemTime| {
+            time.duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or_default()
+        };
+        if to_secs(modified) <= to_secs(since) {
+            return validators(Response::send("").status(304));
+        }
     }
+
+    // A structurally valid but unsatisfiable Range gets 416; a malformed one
+    // is ignored and the full file is served (as the RFC allows).
+    let range = match req
+        .header("range")
+        .map(|raw| parse_byte_range(raw, total_len))
+    {
+        Some(RangeParse::Satisfiable(start, end)) => Some((start, end)),
+        Some(RangeParse::Unsatisfiable) => {
+            return validators(
+                Response::send("")
+                    .status(416)
+                    .header("content-range", &format!("bytes */{}", total_len)),
+            );
+        }
+        Some(RangeParse::Ignored) | None => None,
+    };
+
+    let Ok(mut file) = tokio::fs::File::open(&file_path).await else {
+        return Response::not_found();
+    };
+
+    let (start, len, mut response_status) = match range {
+        Some((start, end)) => (start, end - start + 1, 206),
+        None => (0, total_len, 200),
+    };
+    if start > 0 && file.seek(SeekFrom::Start(start)).await.is_err() {
+        return Response::internal_server_error();
+    }
+    // An empty file has nothing to stream; serve it as a normal 200.
+    if len == 0 {
+        response_status = 200;
+    }
+
+    let mut res = Response::stream(file_stream(file, len))
+        .status(response_status)
+        .content_type(content_type_for_path(&file_path))
+        .header("content-length", &len.to_string());
+    if let Some((start, end)) = range {
+        res = res.header(
+            "content-range",
+            &format!("bytes {}-{}/{}", start, end, total_len),
+        );
+    }
+    validators(res)
+}
+
+enum RangeParse {
+    Satisfiable(u64, u64),
+    Unsatisfiable,
+    Ignored,
+}
+
+/// Parses a single-range `Range: bytes=...` header against a resource of
+/// `total_len` bytes. Multi-range and malformed headers are ignored.
+fn parse_byte_range(raw: &str, total_len: u64) -> RangeParse {
+    let Some(spec) = raw.trim().strip_prefix("bytes=") else {
+        return RangeParse::Ignored;
+    };
+    if spec.contains(',') {
+        return RangeParse::Ignored;
+    }
+    let Some((start_raw, end_raw)) = spec.split_once('-') else {
+        return RangeParse::Ignored;
+    };
+    let (start_raw, end_raw) = (start_raw.trim(), end_raw.trim());
+
+    if start_raw.is_empty() {
+        // Suffix form: last N bytes.
+        let Ok(suffix) = end_raw.parse::<u64>() else {
+            return RangeParse::Ignored;
+        };
+        if suffix == 0 || total_len == 0 {
+            return RangeParse::Unsatisfiable;
+        }
+        let start = total_len.saturating_sub(suffix);
+        return RangeParse::Satisfiable(start, total_len - 1);
+    }
+
+    let Ok(start) = start_raw.parse::<u64>() else {
+        return RangeParse::Ignored;
+    };
+    if start >= total_len {
+        return RangeParse::Unsatisfiable;
+    }
+    let end = if end_raw.is_empty() {
+        total_len - 1
+    } else {
+        match end_raw.parse::<u64>() {
+            Ok(end) => end.min(total_len - 1),
+            Err(_) => return RangeParse::Ignored,
+        }
+    };
+    if end < start {
+        return RangeParse::Ignored;
+    }
+    RangeParse::Satisfiable(start, end)
+}
+
+/// Streams `len` bytes from `file` in 64 KB chunks. On a read error the
+/// stream ends early; the explicit Content-Length lets clients detect it.
+fn file_stream(
+    file: tokio::fs::File,
+    len: u64,
+) -> impl Stream<Item = Result<Bytes, Infallible>> + Send {
+    futures_util::stream::unfold((file, len), |(mut file, remaining)| async move {
+        if remaining == 0 {
+            return None;
+        }
+        let chunk = remaining.min(64 * 1024) as usize;
+        let mut buffer = vec![0u8; chunk];
+        match file.read(&mut buffer).await {
+            Ok(0) | Err(_) => None,
+            Ok(read) => {
+                buffer.truncate(read);
+                Some((Ok(Bytes::from(buffer)), (file, remaining - read as u64)))
+            }
+        }
+    })
 }
 
 fn safe_static_path(root: &FsPath, requested: &str) -> Option<PathBuf> {
