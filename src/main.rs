@@ -1,8 +1,5 @@
-mod api;
-mod app;
-mod users;
-
-use app::{App, Next, Request, Response};
+use rustrest::api;
+use rustrest::app::{App, Next, Request, Response};
 
 #[tokio::main]
 async fn main() {

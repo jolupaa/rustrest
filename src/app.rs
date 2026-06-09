@@ -3,25 +3,38 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::fmt::Display;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use base64::Engine;
 use futures_util::{FutureExt, Stream, StreamExt};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full, Limited, StreamBody};
 use hyper::HeaderMap;
 use hyper::body::{Bytes, Frame, Incoming};
-use hyper::header::{CONTENT_TYPE, COOKIE, HeaderName, HeaderValue, SET_COOKIE};
+use hyper::header::{
+    CACHE_CONTROL, CONNECTION, CONTENT_TYPE, COOKIE, HeaderName, HeaderValue, SEC_WEBSOCKET_ACCEPT,
+    SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, SET_COOKIE, UPGRADE,
+};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use sha1::{Digest, Sha1};
 use tokio::net::TcpListener;
+
+mod error;
+mod extract;
+pub mod middleware;
+mod sse;
+
+pub use error::{HttpError, IntoHttpError};
+pub use extract::{FromRequest, Json, Path, Query, State};
+pub use sse::SseEvent;
 
 /// Maximum request body we will buffer into memory (64 KB).
 const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -44,6 +57,7 @@ pub type Next = Box<dyn FnOnce(Request) -> Pin<Box<dyn Future<Output = Response>
 /// `Response` without calling `next`.
 pub type Middleware =
     Arc<dyn Fn(Request, Next) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync>;
+pub type ErrorHandler = Arc<dyn Fn(HttpError) -> Response + Send + Sync>;
 
 /// A single segment of a route pattern.
 #[derive(Clone)]
@@ -189,11 +203,11 @@ fn parse_cookies(header: &str) -> HashMap<String, String> {
 }
 
 #[derive(Clone, Default)]
-pub struct State {
+pub struct StateStore {
     values: Arc<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
 }
 
-impl State {
+impl StateStore {
     pub fn insert<T>(&mut self, value: T)
     where
         T: Send + Sync + 'static,
@@ -228,7 +242,7 @@ pub struct Request {
     /// Captured path parameters, e.g. `/users/:id` matching `/users/42`
     /// yields `{"id": "42"}`.
     pub params: HashMap<String, String>,
-    state: State,
+    state: StateStore,
 }
 
 impl Request {
@@ -258,12 +272,44 @@ impl Request {
         self.cookies.get(name).map(String::as_str)
     }
 
+    /// Returns a request header by name, case-insensitively.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .get(name)
+            .or_else(|| {
+                let lower = name.to_ascii_lowercase();
+                self.headers.get(&lower)
+            })
+            .map(String::as_str)
+    }
+
     /// Returns shared application state by type.
     pub fn state<T>(&self) -> Option<Arc<T>>
     where
         T: Send + Sync + 'static,
     {
         self.state.get::<T>()
+    }
+
+    pub fn extract<E>(&self) -> Result<E, HttpError>
+    where
+        E: FromRequest,
+    {
+        E::from_request(self)
+    }
+
+    pub fn is_websocket_upgrade(&self) -> bool {
+        self.method.eq_ignore_ascii_case("GET")
+            && self
+                .header("upgrade")
+                .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+            && self.header("connection").is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+            })
+            && self.header(SEC_WEBSOCKET_KEY.as_str()).is_some()
+            && self.header(SEC_WEBSOCKET_VERSION.as_str()) == Some("13")
     }
 
     /// Deserializes the request body as JSON into `T`.
@@ -284,6 +330,7 @@ pub struct Response {
     pub content_type: String,
     pub headers: HeaderMap,
     body_kind: BodyKind,
+    error: Option<HttpError>,
 }
 
 impl Response {
@@ -298,6 +345,7 @@ impl Response {
             content_type: content_type.into(),
             headers: HeaderMap::new(),
             body_kind: BodyKind::Bytes(bytes),
+            error: None,
         }
     }
 
@@ -312,7 +360,19 @@ impl Response {
             content_type: "application/octet-stream".to_string(),
             headers: HeaderMap::new(),
             body_kind: BodyKind::Stream(Box::pin(frames)),
+            error: None,
         }
+    }
+
+    pub fn sse<S>(events: S) -> Self
+    where
+        S: Stream<Item = SseEvent> + Send + 'static,
+    {
+        let chunks = events.map(|event| Ok(Bytes::from(event.format())));
+        Self::stream(chunks)
+            .content_type("text/event-stream")
+            .header(CACHE_CONTROL.as_str(), "no-cache")
+            .header(CONNECTION.as_str(), "keep-alive")
     }
 
     /// Serializes `value` to JSON. If serialization fails, degrades to a 500.
@@ -340,11 +400,18 @@ impl Response {
     }
 
     pub fn internal_server_error() -> Self {
-        Self::bytes(
-            Bytes::from_static(b"500 Error interno del servidor"),
-            "text/plain; charset=utf-8",
-        )
-        .status(500)
+        Self::from_error(HttpError::internal_server_error(
+            "Error interno del servidor",
+        ))
+    }
+
+    pub fn from_error(error: HttpError) -> Self {
+        let status = error.status();
+        let body = format!("{} {}", status, error.message());
+        let mut response =
+            Self::bytes(Bytes::from(body), "text/plain; charset=utf-8").status(status);
+        response.error = Some(error);
+        response
     }
 
     pub fn redirect(location: &str) -> Self {
@@ -384,6 +451,26 @@ impl Response {
         )
     }
 
+    pub fn websocket(req: &Request) -> Result<Self, HttpError> {
+        if !req.is_websocket_upgrade() {
+            return Err(HttpError::bad_request("Upgrade WebSocket invalido"));
+        }
+
+        let key = req
+            .header(SEC_WEBSOCKET_KEY.as_str())
+            .ok_or_else(|| HttpError::bad_request("Falta Sec-WebSocket-Key"))?;
+        let mut hasher = Sha1::new();
+        hasher.update(key.as_bytes());
+        hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        let accept = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+
+        Ok(Self::send("")
+            .status(101)
+            .header(UPGRADE.as_str(), "websocket")
+            .header(CONNECTION.as_str(), "Upgrade")
+            .header(SEC_WEBSOCKET_ACCEPT.as_str(), &accept))
+    }
+
     fn set_header(&mut self, name: &str, value: &str) {
         if let (Ok(name), Ok(value)) = (
             HeaderName::from_bytes(name.as_bytes()),
@@ -407,6 +494,22 @@ impl Response {
         self.body_kind = BodyKind::Empty;
     }
 
+    pub(super) fn map_body_bytes<F>(&mut self, mapper: F) -> Result<(), HttpError>
+    where
+        F: FnOnce(&[u8]) -> Result<Vec<u8>, HttpError>,
+    {
+        if let BodyKind::Bytes(bytes) = &self.body_kind {
+            let mapped = Bytes::from(mapper(bytes)?);
+            self.body = String::from_utf8_lossy(&mapped).into_owned();
+            self.body_kind = BodyKind::Bytes(mapped);
+        }
+        Ok(())
+    }
+
+    fn take_error(&mut self) -> Option<HttpError> {
+        self.error.take()
+    }
+
     /// Converts our framework response into a hyper response.
     fn into_hyper(self) -> hyper::Response<ResponseBody> {
         let Response {
@@ -415,6 +518,7 @@ impl Response {
             content_type,
             headers,
             body_kind,
+            error: _,
         } = self;
 
         let hyper_body = match body_kind {
@@ -467,16 +571,23 @@ impl IntoResponse for Response {
 
 impl<E> IntoResponse for Result<Response, E>
 where
-    E: Display,
+    E: IntoHttpError,
 {
     fn into_response(self) -> Response {
         match self {
             Ok(response) => response,
             Err(err) => {
+                let err = err.into_http_error();
                 eprintln!("Handler devolvió error: {}", err);
-                Response::internal_server_error()
+                Response::from_error(err)
             }
         }
+    }
+}
+
+impl IntoResponse for HttpError {
+    fn into_response(self) -> Response {
+        Response::from_error(self)
     }
 }
 
@@ -548,6 +659,12 @@ where
                 Box::pin(self(req, next))
             },
         )
+    }
+}
+
+impl IntoMiddleware for Middleware {
+    fn into_middleware(self) -> Middleware {
+        self
     }
 }
 
@@ -627,6 +744,30 @@ impl Router {
     /// the router is mounted.
     pub fn layer<MW: IntoMiddleware>(&mut self, middleware: MW) {
         self.middlewares.push(middleware.into_middleware());
+    }
+
+    pub fn guard<G>(&mut self, guard: G)
+    where
+        G: Fn(&Request) -> bool + Send + Sync + 'static,
+    {
+        let guard = Arc::new(guard);
+        self.layer(move |req: Request, next: Next| {
+            let guard = Arc::clone(&guard);
+            async move {
+                if guard(&req) {
+                    next(req).await
+                } else {
+                    Response::from_error(HttpError::forbidden("Acceso denegado"))
+                }
+            }
+        });
+    }
+
+    pub fn fallback<H, M>(&mut self, handler: H)
+    where
+        H: IntoHandler<M>,
+    {
+        self.add(METHOD_ALL, "/*path", handler);
     }
 
     pub fn static_files<P>(&mut self, prefix: &str, root: P)
@@ -743,7 +884,7 @@ async fn serve_static_file(root: Arc<PathBuf>, req: Request) -> Response {
     }
 }
 
-fn safe_static_path(root: &Path, requested: &str) -> Option<PathBuf> {
+fn safe_static_path(root: &FsPath, requested: &str) -> Option<PathBuf> {
     let decoded = decode_component(requested, false);
     let relative = if decoded.is_empty() {
         "index.html"
@@ -752,7 +893,7 @@ fn safe_static_path(root: &Path, requested: &str) -> Option<PathBuf> {
     };
 
     let mut path = root.to_path_buf();
-    for component in Path::new(relative).components() {
+    for component in FsPath::new(relative).components() {
         match component {
             Component::Normal(part) => path.push(part),
             Component::CurDir => {}
@@ -763,7 +904,7 @@ fn safe_static_path(root: &Path, requested: &str) -> Option<PathBuf> {
     Some(path)
 }
 
-fn content_type_for_path(path: &Path) -> &'static str {
+fn content_type_for_path(path: &FsPath) -> &'static str {
     match path.extension().and_then(|ext| ext.to_str()).unwrap_or("") {
         "html" | "htm" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",
@@ -802,7 +943,8 @@ fn not_found_handler() -> Handler {
 pub struct App {
     router: Router,
     middlewares: Vec<Middleware>,
-    state: State,
+    state: StateStore,
+    error_handler: Option<ErrorHandler>,
 }
 
 impl App {
@@ -810,7 +952,8 @@ impl App {
         Self {
             router: Router::new(),
             middlewares: Vec::new(),
-            state: State::default(),
+            state: StateStore::default(),
+            error_handler: None,
         }
     }
 
@@ -880,6 +1023,13 @@ impl App {
         self.router.mount(prefix, router);
     }
 
+    pub fn fallback<H, M>(&mut self, handler: H)
+    where
+        H: IntoHandler<M>,
+    {
+        self.router.fallback(handler);
+    }
+
     pub fn static_files<P>(&mut self, prefix: &str, root: P)
     where
         P: Into<PathBuf>,
@@ -894,6 +1044,13 @@ impl App {
         self.state.insert(value);
     }
 
+    pub fn error_handler<F>(&mut self, handler: F)
+    where
+        F: Fn(HttpError) -> Response + Send + Sync + 'static,
+    {
+        self.error_handler = Some(Arc::new(handler));
+    }
+
     /// Adds a global middleware (onion model). Middlewares run in registration
     /// order on the way in, and in reverse on the way out.
     pub fn layer<MW: IntoMiddleware>(&mut self, middleware: MW) {
@@ -904,10 +1061,13 @@ impl App {
         let listener = TcpListener::bind(address)
             .await
             .expect("Unable to start server");
-        let app = Arc::new(self);
 
         println!("Servidor escuchando en http://{}", address);
+        self.serve(listener).await;
+    }
 
+    pub async fn serve(self, listener: TcpListener) {
+        let app = Arc::new(self);
         loop {
             let (stream, _) = listener
                 .accept()
@@ -1017,6 +1177,11 @@ impl App {
             },
             Err(_) => panic_response(),
         };
+        if let Some(err) = response.take_error()
+            && let Some(handler) = &self.error_handler
+        {
+            response = handler(err);
+        }
         if is_head {
             response.clear_body();
         }
@@ -1031,491 +1196,4 @@ impl Default for App {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use futures_util::stream;
-    use hyper::header::{LOCATION, SET_COOKIE};
-    use serde::Deserialize;
-    use std::collections::HashMap;
-    use std::fs;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn dummy_request(body: &str) -> Request {
-        Request {
-            method: "GET".to_string(),
-            path: "/".to_string(),
-            raw_query: None,
-            query: HashMap::new(),
-            headers: HashMap::new(),
-            cookies: HashMap::new(),
-            body: body.to_string(),
-            params: HashMap::new(),
-            state: State::default(),
-        }
-    }
-
-    fn request_with_method(method: &str, path: &str) -> Request {
-        let mut req = dummy_request("");
-        req.method = method.to_string();
-        req.path = path.to_string();
-        req
-    }
-
-    #[test]
-    fn send_sets_text_plain_and_200() {
-        let res = Response::send("hola");
-        assert_eq!(res.status, 200);
-        assert_eq!(res.body, "hola");
-        assert_eq!(res.content_type, "text/plain; charset=utf-8");
-    }
-
-    #[test]
-    fn not_found_sets_404() {
-        let res = Response::not_found();
-        assert_eq!(res.status, 404);
-        assert_eq!(res.body, "404 No encontrado");
-    }
-
-    #[test]
-    fn bad_request_sets_400() {
-        let res = Response::bad_request();
-        assert_eq!(res.status, 400);
-        assert_eq!(res.content_type, "text/plain; charset=utf-8");
-    }
-
-    #[test]
-    fn json_serializes_value_with_200_and_json_content_type() {
-        #[derive(Serialize)]
-        struct User {
-            id: u32,
-            name: &'static str,
-        }
-        let res = Response::json(&User { id: 1, name: "Ada" });
-        assert_eq!(res.status, 200);
-        assert_eq!(res.content_type, "application/json");
-        assert_eq!(res.body, r#"{"id":1,"name":"Ada"}"#);
-    }
-
-    #[test]
-    fn json_serialization_error_degrades_to_500() {
-        // serde_json cannot serialize a map with non-string (tuple) keys.
-        let mut map: HashMap<(i32, i32), i32> = HashMap::new();
-        map.insert((1, 2), 3);
-        let res = Response::json(&map);
-        assert_eq!(res.status, 500);
-        assert_eq!(res.content_type, "text/plain; charset=utf-8");
-    }
-
-    #[test]
-    fn into_hyper_maps_status_and_content_type_header() {
-        let res = Response::send("hi").into_hyper();
-        assert_eq!(res.status(), 200);
-        assert_eq!(
-            res.headers().get(hyper::header::CONTENT_TYPE).unwrap(),
-            "text/plain; charset=utf-8"
-        );
-    }
-
-    #[test]
-    fn response_allows_arbitrary_headers() {
-        let res = Response::send("ok")
-            .header("x-trace-id", "abc-123")
-            .into_hyper();
-
-        assert_eq!(res.headers().get("x-trace-id").unwrap(), "abc-123");
-    }
-
-    #[test]
-    fn response_redirect_sets_location_header() {
-        let res = Response::redirect("/login").into_hyper();
-
-        assert_eq!(res.status(), 302);
-        assert_eq!(res.headers().get(LOCATION).unwrap(), "/login");
-    }
-
-    #[test]
-    fn response_cookie_appends_set_cookie_headers() {
-        let res = Response::send("ok")
-            .cookie("sid", "abc")
-            .cookie("theme", "dark")
-            .into_hyper();
-        let cookies: Vec<_> = res
-            .headers()
-            .get_all(SET_COOKIE)
-            .iter()
-            .map(|value| value.to_str().unwrap().to_string())
-            .collect();
-
-        assert_eq!(cookies.len(), 2);
-        assert!(cookies.iter().any(|value| value.starts_with("sid=abc")));
-        assert!(cookies.iter().any(|value| value.starts_with("theme=dark")));
-    }
-
-    #[test]
-    fn query_params_are_parsed_and_url_decoded() {
-        let query = parse_query("q=rust+rest&tag=web&tag=api&empty=&flag&encoded=hola%20mundo");
-        let req = Request {
-            method: "GET".to_string(),
-            path: "/buscar".to_string(),
-            raw_query: Some(
-                "q=rust+rest&tag=web&tag=api&empty=&flag&encoded=hola%20mundo".to_string(),
-            ),
-            query,
-            headers: HashMap::new(),
-            cookies: HashMap::new(),
-            body: String::new(),
-            params: HashMap::new(),
-            state: State::default(),
-        };
-
-        assert_eq!(req.query("q"), Some("rust rest"));
-        assert_eq!(req.query("empty"), Some(""));
-        assert_eq!(req.query("flag"), Some(""));
-        assert_eq!(req.query("encoded"), Some("hola mundo"));
-        assert_eq!(req.query_all("tag"), vec!["web", "api"]);
-    }
-
-    #[test]
-    fn request_cookies_are_parsed_from_cookie_header() {
-        let cookies = parse_cookies("sid=abc; theme=dark; empty=");
-        let mut req = dummy_request("");
-        req.cookies = cookies;
-
-        assert_eq!(req.cookie("sid"), Some("abc"));
-        assert_eq!(req.cookie("theme"), Some("dark"));
-        assert_eq!(req.cookie("empty"), Some(""));
-    }
-
-    #[test]
-    fn request_json_deserializes_body() {
-        #[derive(Deserialize, PartialEq, Debug)]
-        struct User {
-            id: u32,
-            name: String,
-        }
-        let req = dummy_request(r#"{"id":1,"name":"Ada"}"#);
-        let user: User = req.json().unwrap();
-        assert_eq!(
-            user,
-            User {
-                id: 1,
-                name: "Ada".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn request_json_errors_on_invalid_body() {
-        let req = dummy_request("not json");
-        assert!(req.json::<serde_json::Value>().is_err());
-    }
-
-    #[test]
-    fn match_pattern_captures_params_and_rejects_mismatches() {
-        let pattern = parse_pattern("/users/:id/posts");
-        let params = match_pattern(&pattern, &path_segments("/users/42/posts")).unwrap();
-        assert_eq!(params.get("id").map(String::as_str), Some("42"));
-        assert!(match_pattern(&pattern, &path_segments("/users/42")).is_none());
-        assert!(match_pattern(&pattern, &path_segments("/users/42/comments")).is_none());
-    }
-
-    #[test]
-    fn router_matches_method_and_path_param() {
-        let mut router = Router::new();
-        router.get("/users", |_r: Request| Response::send("list"));
-        router.get("/users/:id", |req: Request| {
-            Response::send(req.param("id").unwrap_or("?"))
-        });
-
-        assert!(router.route("GET", "/users").is_some());
-        assert!(router.route("POST", "/users").is_none());
-        assert!(router.route("GET", "/nope/extra").is_none());
-
-        let (_handler, _mws, params) = router.route("GET", "/users/42").expect("should match");
-        assert_eq!(params.get("id").map(String::as_str), Some("42"));
-    }
-
-    #[test]
-    fn router_supports_extra_methods_and_all() {
-        let mut router = Router::new();
-        router.patch("/items/:id", |_r: Request| Response::send("patch"));
-        router.options("/items", |_r: Request| Response::send("options"));
-        router.head("/items", |_r: Request| Response::send("head"));
-        router.all("/health", |_r: Request| Response::send("ok"));
-
-        assert!(router.route("PATCH", "/items/1").is_some());
-        assert!(router.route("OPTIONS", "/items").is_some());
-        assert!(router.route("HEAD", "/items").is_some());
-        assert!(router.route("GET", "/health").is_some());
-        assert!(router.route("POST", "/health").is_some());
-    }
-
-    #[test]
-    fn mount_concatenates_prefixes_across_nesting() {
-        let mut users = Router::new();
-        users.get("/:id", |req: Request| {
-            Response::send(req.param("id").unwrap_or("?"))
-        });
-
-        let mut api = Router::new();
-        api.mount("/users", users);
-
-        let mut root = Router::new();
-        root.mount("/api", api);
-
-        let (_handler, _mws, params) = root.route("GET", "/api/users/42").expect("should match");
-        assert_eq!(params.get("id").map(String::as_str), Some("42"));
-        // Only `/:id` was registered, so the bare collection path does not match.
-        assert!(root.route("GET", "/api/users").is_none());
-    }
-
-    #[tokio::test]
-    async fn dispatch_runs_sync_handler() {
-        let mut app = App::new();
-        app.get("/", |_r: Request| Response::send("sync"));
-        let res = app.dispatch(dummy_request("")).await;
-        assert_eq!(res.body, "sync");
-    }
-
-    #[tokio::test]
-    async fn dispatch_runs_async_handler() {
-        let mut app = App::new();
-        app.get("/", |_r: Request| async move { Response::send("async") });
-        let res = app.dispatch(dummy_request("")).await;
-        assert_eq!(res.body, "async");
-    }
-
-    #[tokio::test]
-    async fn dispatch_accepts_result_handlers() {
-        let mut app = App::new();
-        app.get("/", |_r: Request| -> Result<Response, &'static str> {
-            Ok(Response::send("ok"))
-        });
-
-        let res = app.dispatch(dummy_request("")).await;
-
-        assert_eq!(res.status, 200);
-        assert_eq!(res.body, "ok");
-    }
-
-    #[tokio::test]
-    async fn dispatch_converts_handler_errors_to_500() {
-        let mut app = App::new();
-        app.get("/", |_r: Request| -> Result<Response, &'static str> {
-            Err("fallo")
-        });
-
-        let res = app.dispatch(dummy_request("")).await;
-
-        assert_eq!(res.status, 500);
-    }
-
-    #[tokio::test]
-    async fn dispatch_catches_panics_as_500_responses() {
-        let mut app = App::new();
-        app.get("/", |_r: Request| -> Response { panic!("boom") });
-
-        let res = app.dispatch(dummy_request("")).await;
-
-        assert_eq!(res.status, 500);
-    }
-
-    #[tokio::test]
-    async fn request_can_access_shared_state() {
-        struct Config {
-            app_name: &'static str,
-        }
-
-        let mut app = App::new();
-        app.state(Config {
-            app_name: "rustrest",
-        });
-        app.get("/", |req: Request| {
-            let config = req.state::<Config>().expect("state exists");
-            Response::send(config.app_name)
-        });
-
-        let res = app.dispatch(dummy_request("")).await;
-
-        assert_eq!(res.body, "rustrest");
-    }
-
-    #[tokio::test]
-    async fn dispatch_unmatched_returns_404() {
-        let app = App::new();
-        let res = app.dispatch(dummy_request("")).await;
-        assert_eq!(res.status, 404);
-    }
-
-    #[tokio::test]
-    async fn middleware_wraps_handler_and_runs() {
-        let mut app = App::new();
-        app.get("/", |_r: Request| Response::send("handler"));
-
-        let hits = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&hits);
-        app.layer(move |req: Request, next: Next| {
-            let counter = Arc::clone(&counter);
-            async move {
-                counter.fetch_add(1, Ordering::SeqCst);
-                next(req).await
-            }
-        });
-
-        let res = app.dispatch(dummy_request("")).await;
-        assert_eq!(res.body, "handler");
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn middleware_can_short_circuit() {
-        let mut app = App::new();
-        app.get("/", |_r: Request| Response::send("handler"));
-        app.layer(|_req: Request, _next: Next| async move { Response::send("blocked") });
-
-        let res = app.dispatch(dummy_request("")).await;
-        assert_eq!(res.body, "blocked");
-    }
-
-    #[tokio::test]
-    async fn middlewares_nest_in_registration_order() {
-        let mut app = App::new();
-        app.get("/", |_r: Request| Response::send("h"));
-
-        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
-        let o1 = Arc::clone(&order);
-        app.layer(move |req: Request, next: Next| {
-            let o1 = Arc::clone(&o1);
-            async move {
-                o1.lock().unwrap().push("mw1-in");
-                let res = next(req).await;
-                o1.lock().unwrap().push("mw1-out");
-                res
-            }
-        });
-        let o2 = Arc::clone(&order);
-        app.layer(move |req: Request, next: Next| {
-            let o2 = Arc::clone(&o2);
-            async move {
-                o2.lock().unwrap().push("mw2-in");
-                let res = next(req).await;
-                o2.lock().unwrap().push("mw2-out");
-                res
-            }
-        });
-
-        let _ = app.dispatch(dummy_request("")).await;
-        assert_eq!(
-            *order.lock().unwrap(),
-            vec!["mw1-in", "mw2-in", "mw2-out", "mw1-out"]
-        );
-    }
-
-    #[tokio::test]
-    async fn router_layer_scopes_middleware_to_its_routes() {
-        let hits = Arc::new(AtomicUsize::new(0));
-
-        let mut scoped = Router::new();
-        let counter = Arc::clone(&hits);
-        scoped.layer(move |req: Request, next: Next| {
-            let counter = Arc::clone(&counter);
-            async move {
-                counter.fetch_add(1, Ordering::SeqCst);
-                next(req).await
-            }
-        });
-        scoped.get("/thing", |_r: Request| Response::send("scoped"));
-
-        let mut app = App::new();
-        app.get("/", |_r: Request| Response::send("root"));
-        app.mount("/api", scoped);
-
-        // A request under the mount runs the scoped middleware.
-        let mut req = dummy_request("");
-        req.path = "/api/thing".to_string();
-        let res = app.dispatch(req).await;
-        assert_eq!(res.body, "scoped");
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
-
-        // A request outside the mount does not.
-        let res = app.dispatch(dummy_request("")).await;
-        assert_eq!(res.body, "root");
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn app_static_files_serves_files_with_content_type() {
-        let root = std::env::temp_dir().join(format!(
-            "rustrest-static-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("app.css"), "body { color: red; }").unwrap();
-
-        let mut app = App::new();
-        app.static_files("/assets", &root);
-
-        let res = app
-            .dispatch(request_with_method("GET", "/assets/app.css"))
-            .await;
-
-        assert_eq!(res.status, 200);
-        assert_eq!(res.body, "body { color: red; }");
-        assert_eq!(res.content_type, "text/css; charset=utf-8");
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn static_files_rejects_path_traversal() {
-        let root = std::env::temp_dir().join(format!(
-            "rustrest-static-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&root).unwrap();
-
-        let mut app = App::new();
-        app.static_files("/assets", &root);
-
-        let res = app
-            .dispatch(request_with_method("GET", "/assets/../secret.txt"))
-            .await;
-
-        assert_eq!(res.status, 400);
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn response_streams_body_chunks() {
-        let chunks = stream::iter(vec![
-            Ok(Bytes::from_static(b"hola ")),
-            Ok(Bytes::from_static(b"stream")),
-        ]);
-        let res = Response::stream(chunks)
-            .content_type("text/plain; charset=utf-8")
-            .into_hyper();
-        let body = res.into_body().collect().await.unwrap().to_bytes();
-
-        assert_eq!(&body[..], b"hola stream");
-    }
-
-    #[tokio::test]
-    async fn handle_strips_body_for_head_requests() {
-        let mut app = App::new();
-        app.head("/", |_r: Request| Response::send("sin cuerpo"));
-
-        let res = app.dispatch(request_with_method("HEAD", "/")).await;
-
-        assert_eq!(res.status, 200);
-        assert_eq!(res.body, "");
-    }
-}
+mod tests;
