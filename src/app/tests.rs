@@ -20,6 +20,7 @@ fn dummy_request(body: &str) -> Request {
         body: body.to_string(),
         params: HashMap::new(),
         state: StateStore::default(),
+        upgrade: None,
     }
 }
 
@@ -81,13 +82,13 @@ async fn http_errors_keep_status_and_can_use_global_error_handler() {
         .status(err.status())
     });
     app.get("/", |_req: Request| -> Result<Response, HttpError> {
-        Err(HttpError::bad_request("Nombre invalido"))
+        Err(HttpError::bad_request("Invalid name"))
     });
 
     let res = app.dispatch(dummy_request("")).await;
 
     assert_eq!(res.status, 400);
-    assert_eq!(res.body, r#"{"error":"Nombre invalido","status":400}"#);
+    assert_eq!(res.body, r#"{"error":"Invalid name","status":400}"#);
 }
 
 #[tokio::test]
@@ -98,7 +99,7 @@ async fn builtin_middlewares_add_cors_request_id_gzip_and_tracing() {
     app.layer(middleware::cors());
     app.layer(middleware::gzip());
     app.get("/", |req: Request| {
-        Response::send(req.header("x-request-id").unwrap_or("sin-id"))
+        Response::send(req.header("x-request-id").unwrap_or("no-id"))
     });
 
     let mut req = dummy_request("");
@@ -130,7 +131,7 @@ async fn builtin_middlewares_add_cors_request_id_gzip_and_tracing() {
 async fn router_guards_block_requests_and_scoped_fallbacks_handle_misses() {
     let mut api = Router::new();
     api.guard(|req: &Request| req.header("x-api-key") == Some("secret"));
-    api.get("/private", |_req: Request| Response::send("privado"));
+    api.get("/private", |_req: Request| Response::send("private"));
     api.fallback(|_req: Request| Response::send("fallback api").status(404));
 
     let mut app = App::new();
@@ -146,9 +147,9 @@ async fn router_guards_block_requests_and_scoped_fallbacks_handle_misses() {
         .headers
         .insert("x-api-key".to_string(), "secret".to_string());
     let allowed = app.dispatch(allowed_req).await;
-    assert_eq!(allowed.body, "privado");
+    assert_eq!(allowed.body, "private");
 
-    let mut fallback_req = request_with_method("GET", "/api/no-existe");
+    let mut fallback_req = request_with_method("GET", "/api/not-found");
     fallback_req
         .headers
         .insert("x-api-key".to_string(), "secret".to_string());
@@ -160,8 +161,8 @@ async fn router_guards_block_requests_and_scoped_fallbacks_handle_misses() {
 #[tokio::test]
 async fn response_formats_sse_events() {
     let events = stream::iter(vec![
-        SseEvent::new("hola").event("saludo").id("1"),
-        SseEvent::new("adios"),
+        SseEvent::new("hello").event("greeting").id("1"),
+        SseEvent::new("goodbye"),
     ]);
     let res = Response::sse(events).into_hyper();
 
@@ -173,7 +174,7 @@ async fn response_formats_sse_events() {
     let body = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(
         String::from_utf8_lossy(&body),
-        "id: 1\nevent: saludo\ndata: hola\n\ndata: adios\n\n"
+        "id: 1\nevent: greeting\ndata: hello\n\ndata: goodbye\n\n"
     );
 }
 
@@ -203,6 +204,32 @@ fn websocket_handshake_sets_upgrade_headers() {
     );
 }
 
+#[tokio::test]
+async fn gzip_middleware_skips_websocket_upgrade_responses() {
+    let mut app = App::new();
+    app.layer(middleware::gzip());
+    app.get("/ws", |req: Request| Response::websocket(&req).unwrap());
+
+    let mut req = request_with_method("GET", "/ws");
+    req.headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    req.headers
+        .insert("upgrade".to_string(), "websocket".to_string());
+    req.headers
+        .insert("connection".to_string(), "Upgrade".to_string());
+    req.headers.insert(
+        "sec-websocket-key".to_string(),
+        "dGhlIHNhbXBsZSBub25jZQ==".to_string(),
+    );
+    req.headers
+        .insert("sec-websocket-version".to_string(), "13".to_string());
+
+    let res = app.dispatch(req).await.into_hyper();
+
+    assert_eq!(res.status(), 101);
+    assert!(res.headers().get(CONTENT_ENCODING).is_none());
+}
+
 fn request_with_method(method: &str, path: &str) -> Request {
     let mut req = dummy_request("");
     req.method = method.to_string();
@@ -212,9 +239,9 @@ fn request_with_method(method: &str, path: &str) -> Request {
 
 #[test]
 fn send_sets_text_plain_and_200() {
-    let res = Response::send("hola");
+    let res = Response::send("hello");
     assert_eq!(res.status, 200);
-    assert_eq!(res.body, "hola");
+    assert_eq!(res.body, "hello");
     assert_eq!(res.content_type, "text/plain; charset=utf-8");
 }
 
@@ -222,7 +249,7 @@ fn send_sets_text_plain_and_200() {
 fn not_found_sets_404() {
     let res = Response::not_found();
     assert_eq!(res.status, 404);
-    assert_eq!(res.body, "404 No encontrado");
+    assert_eq!(res.body, "404 Not Found");
 }
 
 #[test]
@@ -302,23 +329,26 @@ fn response_cookie_appends_set_cookie_headers() {
 
 #[test]
 fn query_params_are_parsed_and_url_decoded() {
-    let query = parse_query("q=rust+rest&tag=web&tag=api&empty=&flag&encoded=hola%20mundo");
+    let query = parse_query("q=rust+rest&tag=web&tag=api&empty=&flag&encoded=hello%20world");
     let req = Request {
         method: "GET".to_string(),
         path: "/buscar".to_string(),
-        raw_query: Some("q=rust+rest&tag=web&tag=api&empty=&flag&encoded=hola%20mundo".to_string()),
+        raw_query: Some(
+            "q=rust+rest&tag=web&tag=api&empty=&flag&encoded=hello%20world".to_string(),
+        ),
         query,
         headers: HashMap::new(),
         cookies: HashMap::new(),
         body: String::new(),
         params: HashMap::new(),
         state: StateStore::default(),
+        upgrade: None,
     };
 
     assert_eq!(req.query("q"), Some("rust rest"));
     assert_eq!(req.query("empty"), Some(""));
     assert_eq!(req.query("flag"), Some(""));
-    assert_eq!(req.query("encoded"), Some("hola mundo"));
+    assert_eq!(req.query("encoded"), Some("hello world"));
     assert_eq!(req.query_all("tag"), vec!["web", "api"]);
 }
 
@@ -642,7 +672,7 @@ async fn static_files_rejects_path_traversal() {
 #[tokio::test]
 async fn response_streams_body_chunks() {
     let chunks = stream::iter(vec![
-        Ok(Bytes::from_static(b"hola ")),
+        Ok(Bytes::from_static(b"hello ")),
         Ok(Bytes::from_static(b"stream")),
     ]);
     let res = Response::stream(chunks)
@@ -650,13 +680,13 @@ async fn response_streams_body_chunks() {
         .into_hyper();
     let body = res.into_body().collect().await.unwrap().to_bytes();
 
-    assert_eq!(&body[..], b"hola stream");
+    assert_eq!(&body[..], b"hello stream");
 }
 
 #[tokio::test]
 async fn handle_strips_body_for_head_requests() {
     let mut app = App::new();
-    app.head("/", |_r: Request| Response::send("sin cuerpo"));
+    app.head("/", |_r: Request| Response::send("no body"));
 
     let res = app.dispatch(request_with_method("HEAD", "/")).await;
 

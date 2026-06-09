@@ -20,7 +20,7 @@ where
     fn from_request(req: &Request) -> Result<Self, HttpError> {
         req.json()
             .map(Json)
-            .map_err(|err| HttpError::bad_request(format!("JSON invalido: {}", err)))
+            .map_err(|err| HttpError::bad_request(format!("Invalid JSON: {}", err)))
     }
 }
 
@@ -29,12 +29,11 @@ where
     T: DeserializeOwned,
 {
     fn from_request(req: &Request) -> Result<Self, HttpError> {
-        let encoded = serde_urlencoded::to_string(&req.params).map_err(|err| {
-            HttpError::bad_request(format!("Parametros de ruta invalidos: {}", err))
-        })?;
+        let encoded = serde_urlencoded::to_string(&req.params)
+            .map_err(|err| HttpError::bad_request(format!("Invalid path parameters: {}", err)))?;
         serde_urlencoded::from_str(&encoded)
             .map(Path)
-            .map_err(|err| HttpError::bad_request(format!("Parametros de ruta invalidos: {}", err)))
+            .map_err(|err| HttpError::bad_request(format!("Invalid path parameters: {}", err)))
     }
 }
 
@@ -45,7 +44,7 @@ where
     fn from_request(req: &Request) -> Result<Self, HttpError> {
         serde_html_form::from_str(req.raw_query.as_deref().unwrap_or(""))
             .map(Query)
-            .map_err(|err| HttpError::bad_request(format!("Query invalida: {}", err)))
+            .map_err(|err| HttpError::bad_request(format!("Invalid query string: {}", err)))
     }
 }
 
@@ -56,6 +55,6 @@ where
     fn from_request(req: &Request) -> Result<Self, HttpError> {
         req.state::<T>()
             .map(State)
-            .ok_or_else(|| HttpError::internal_server_error("Estado no encontrado"))
+            .ok_or_else(|| HttpError::internal_server_error("State not found"))
     }
 }

@@ -53,7 +53,11 @@ pub fn gzip() -> Middleware {
                 .is_some_and(|value| value.split(',').any(|part| part.trim() == "gzip"));
             let mut res = next(req).await;
 
-            if !accepts_gzip || res.headers.contains_key(CONTENT_ENCODING) {
+            if !accepts_gzip
+                || res.status == 101
+                || res.body.is_empty()
+                || res.headers.contains_key(CONTENT_ENCODING)
+            {
                 return res;
             }
 
@@ -62,13 +66,13 @@ pub fn gzip() -> Middleware {
                     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
                     encoder.write_all(body).map_err(|err| {
                         HttpError::internal_server_error(format!(
-                            "No se pudo comprimir la respuesta: {}",
+                            "Could not compress response: {}",
                             err
                         ))
                     })?;
                     encoder.finish().map_err(|err| {
                         HttpError::internal_server_error(format!(
-                            "No se pudo finalizar gzip: {}",
+                            "Could not finish gzip encoding: {}",
                             err
                         ))
                     })

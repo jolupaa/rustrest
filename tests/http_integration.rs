@@ -1,11 +1,14 @@
-use rustrest::app::{App, Request, Response};
+use futures_util::{SinkExt, StreamExt};
+use rustrest::app::{App, Request, Response, WebSocketEvent};
+use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::tungstenite::Message;
 
 #[tokio::test]
 async fn app_serves_real_http_requests() {
     let mut app = App::new();
-    app.get("/hola", |_req: Request| Response::send("hola http"));
+    app.get("/hello", |_req: Request| Response::send("hello http"));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -13,7 +16,7 @@ async fn app_serves_real_http_requests() {
 
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream
-        .write_all(b"GET /hola HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .write_all(b"GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .await
         .unwrap();
 
@@ -23,5 +26,47 @@ async fn app_serves_real_http_requests() {
 
     assert!(response.starts_with("HTTP/1.1 200 OK"));
     assert!(response.contains("content-type: text/plain; charset=utf-8"));
-    assert!(response.ends_with("hola http"));
+    assert!(response.ends_with("hello http"));
+}
+
+#[tokio::test]
+async fn websocket_routes_exchange_messages_and_events() {
+    let mut app = App::new();
+    app.websocket("/ws", |mut socket| async move {
+        while let Some(message) = socket.recv().await.unwrap() {
+            if message.is_text() {
+                let text = message.into_text().unwrap().to_string();
+                socket.send_text(&format!("echo:{}", text)).await.unwrap();
+                socket
+                    .send_event("server:echo", &json!({ "text": text }))
+                    .await
+                    .unwrap();
+                socket.close().await.unwrap();
+                break;
+            }
+        }
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(app.serve(listener));
+
+    let (mut client, _response) = tokio_tungstenite::connect_async(format!("ws://{}/ws", addr))
+        .await
+        .unwrap();
+
+    client.send(Message::Text("hello".into())).await.unwrap();
+
+    let text = client.next().await.unwrap().unwrap();
+    assert_eq!(text.into_text().unwrap(), "echo:hello");
+
+    let event = client.next().await.unwrap().unwrap();
+    let event: WebSocketEvent<serde_json::Value> =
+        serde_json::from_str(event.to_text().unwrap()).unwrap();
+    assert_eq!(event.event, "server:echo");
+    assert_eq!(event.data, json!({ "text": "hello" }));
+
+    let close = client.next().await.unwrap().unwrap();
+    assert!(close.is_close());
+    server.abort();
 }

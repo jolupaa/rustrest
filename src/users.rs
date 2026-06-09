@@ -1,7 +1,7 @@
 //! Users routes, defined as a standalone `Router` so they can live in their
 //! own file and be mounted wherever needed.
 
-use crate::app::{Request, Response, Router};
+use rustrest::{Request, Response, Router};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -32,7 +32,7 @@ pub fn router() -> Router {
     // GET /:id -> one (path param)
     router.get("/:id", |req: Request| {
         let id = req.param("id").unwrap_or("?");
-        Response::send(&format!("Usuario solicitado: {}", id))
+        Response::send(&format!("Requested user: {}", id))
     });
 
     // POST / -> create (JSON body)
@@ -56,7 +56,7 @@ pub fn router() -> Router {
     // DELETE /:id -> delete (path param)
     router.delete("/:id", |req: Request| {
         let id = req.param("id").unwrap_or("?");
-        Response::send(&format!("Usuario {} eliminado", id))
+        Response::send(&format!("User {} deleted", id))
     });
 
     router

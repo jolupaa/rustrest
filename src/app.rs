@@ -21,6 +21,7 @@ use hyper::header::{
 };
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
+use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -31,10 +32,15 @@ mod error;
 mod extract;
 pub mod middleware;
 mod sse;
+mod websocket;
 
 pub use error::{HttpError, IntoHttpError};
 pub use extract::{FromRequest, Json, Path, Query, State};
 pub use sse::SseEvent;
+pub use websocket::{
+    IntoWebSocketHandler, WebSocket, WebSocketError, WebSocketEvent, WebSocketHandler,
+    WebSocketMessage,
+};
 
 /// Maximum request body we will buffer into memory (64 KB).
 const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -202,6 +208,30 @@ fn parse_cookies(header: &str) -> HashMap<String, String> {
     cookies
 }
 
+fn is_websocket_upgrade_request(req: &hyper::Request<Incoming>) -> bool {
+    req.method().as_str().eq_ignore_ascii_case("GET")
+        && req
+            .headers()
+            .get(UPGRADE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+        && req
+            .headers()
+            .get(CONNECTION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+            })
+        && req.headers().contains_key(SEC_WEBSOCKET_KEY)
+        && req
+            .headers()
+            .get(SEC_WEBSOCKET_VERSION)
+            .and_then(|value| value.to_str().ok())
+            == Some("13")
+}
+
 #[derive(Clone, Default)]
 pub struct StateStore {
     values: Arc<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
@@ -243,6 +273,7 @@ pub struct Request {
     /// yields `{"id": "42"}`.
     pub params: HashMap<String, String>,
     state: StateStore,
+    upgrade: Option<OnUpgrade>,
 }
 
 impl Request {
@@ -385,7 +416,7 @@ impl Response {
 
     pub fn not_found() -> Self {
         Self::bytes(
-            Bytes::from_static(b"404 No encontrado"),
+            Bytes::from_static(b"404 Not Found"),
             "text/plain; charset=utf-8",
         )
         .status(404)
@@ -393,16 +424,14 @@ impl Response {
 
     pub fn bad_request() -> Self {
         Self::bytes(
-            Bytes::from_static(b"400 Peticion incorrecta"),
+            Bytes::from_static(b"400 Bad Request"),
             "text/plain; charset=utf-8",
         )
         .status(400)
     }
 
     pub fn internal_server_error() -> Self {
-        Self::from_error(HttpError::internal_server_error(
-            "Error interno del servidor",
-        ))
+        Self::from_error(HttpError::internal_server_error("Internal Server Error"))
     }
 
     pub fn from_error(error: HttpError) -> Self {
@@ -453,12 +482,12 @@ impl Response {
 
     pub fn websocket(req: &Request) -> Result<Self, HttpError> {
         if !req.is_websocket_upgrade() {
-            return Err(HttpError::bad_request("Upgrade WebSocket invalido"));
+            return Err(HttpError::bad_request("Invalid WebSocket upgrade"));
         }
 
         let key = req
             .header(SEC_WEBSOCKET_KEY.as_str())
-            .ok_or_else(|| HttpError::bad_request("Falta Sec-WebSocket-Key"))?;
+            .ok_or_else(|| HttpError::bad_request("Missing Sec-WebSocket-Key"))?;
         let mut hasher = Sha1::new();
         hasher.update(key.as_bytes());
         hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
@@ -578,7 +607,7 @@ where
             Ok(response) => response,
             Err(err) => {
                 let err = err.into_http_error();
-                eprintln!("Handler devolvió error: {}", err);
+                eprintln!("Handler returned error: {}", err);
                 Response::from_error(err)
             }
         }
@@ -639,7 +668,7 @@ where
 }
 
 fn panic_response() -> Response {
-    eprintln!("Un handler o middleware lanzó panic; devolviendo 500.");
+    eprintln!("A handler or middleware panicked; returning 500.");
     Response::internal_server_error()
 }
 
@@ -739,6 +768,26 @@ impl Router {
         self.add(METHOD_ALL, path, handler);
     }
 
+    pub fn websocket<F, Fut>(&mut self, path: &str, handler: F)
+    where
+        F: Fn(WebSocket) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let handler: WebSocketHandler = Arc::new(move |socket| Box::pin(handler(socket)));
+        self.get(path, move |req: Request| {
+            let handler = Arc::clone(&handler);
+            req.websocket(handler)
+        });
+    }
+
+    pub fn ws<F, Fut>(&mut self, path: &str, handler: F)
+    where
+        F: Fn(WebSocket) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.websocket(path, handler);
+    }
+
     /// Adds a middleware scoped to this router: it wraps every route in this
     /// router (and routers mounted into it), and nothing else. Applied when
     /// the router is mounted.
@@ -757,7 +806,7 @@ impl Router {
                 if guard(&req) {
                     next(req).await
                 } else {
-                    Response::from_error(HttpError::forbidden("Acceso denegado"))
+                    Response::from_error(HttpError::forbidden("Access denied"))
                 }
             }
         });
@@ -1018,6 +1067,22 @@ impl App {
         self.router.all(path, handler);
     }
 
+    pub fn websocket<F, Fut>(&mut self, path: &str, handler: F)
+    where
+        F: Fn(WebSocket) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.router.websocket(path, handler);
+    }
+
+    pub fn ws<F, Fut>(&mut self, path: &str, handler: F)
+    where
+        F: Fn(WebSocket) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.router.ws(path, handler);
+    }
+
     /// Mounts a router under `prefix` (Express-style sub-routes).
     pub fn mount(&mut self, prefix: &str, router: Router) {
         self.router.mount(prefix, router);
@@ -1062,7 +1127,7 @@ impl App {
             .await
             .expect("Unable to start server");
 
-        println!("Servidor escuchando en http://{}", address);
+        println!("Server listening at http://{}", address);
         self.serve(listener).await;
     }
 
@@ -1085,8 +1150,12 @@ impl App {
                     async move { Ok::<_, Infallible>(app.handle(req).await) }
                 });
 
-                if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
-                    eprintln!("Error sirviendo la conexión: {:?}", err);
+                if let Err(err) = http1::Builder::new()
+                    .serve_connection(io, service)
+                    .with_upgrades()
+                    .await
+                {
+                    eprintln!("Error serving connection: {:?}", err);
                 }
             });
         }
@@ -1094,12 +1163,17 @@ impl App {
 
     /// Translates a hyper request into a [`Request`] (method, path, query,
     /// headers, size-bounded body), dispatches it, and converts the result.
-    async fn handle(&self, req: hyper::Request<Incoming>) -> hyper::Response<ResponseBody> {
+    async fn handle(&self, mut req: hyper::Request<Incoming>) -> hyper::Response<ResponseBody> {
         // Read everything that only needs a borrow before consuming the body.
         let method = req.method().as_str().to_string();
         let path = req.uri().path().to_string();
         let raw_query = req.uri().query().map(|q| q.to_string());
         let query = raw_query.as_deref().map(parse_query).unwrap_or_default();
+        let upgrade = if is_websocket_upgrade_request(&req) {
+            Some(hyper::upgrade::on(&mut req))
+        } else {
+            None
+        };
         let headers = req
             .headers()
             .iter()
@@ -1137,6 +1211,7 @@ impl App {
             body,
             params: HashMap::new(),
             state: self.state.clone(),
+            upgrade,
         };
 
         self.dispatch(request).await.into_hyper()
