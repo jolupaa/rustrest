@@ -8,29 +8,30 @@ The goal is to provide a small, direct, easy-to-understand API for building HTTP
 
 ## Features
 
-- HTTP server built on `hyper` 1.x and `tokio`.
+- HTTP/1.1 and HTTP/2 server built on `hyper` 1.x and `tokio`.
 - Synchronous and asynchronous handlers.
 - Route helpers for `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`, and `HEAD`.
+- Automatic `405 Method Not Allowed` (+`Allow`), auto-`HEAD` from `GET`, and auto-`OPTIONS`.
 - Mountable `Router` with nested prefixes.
-- Route parameters with `:id`.
-- Route wildcards with `*path`.
-- Global and router-scoped onion middleware with `next`.
-- Router guards.
-- App and router fallbacks.
-- Parsed query strings.
-- Request and response cookies.
-- Arbitrary response headers.
-- `Result<Response, HttpError>` handlers.
-- Global error handler.
+- Route parameters with `:id` and wildcards with `*path`.
+- Global, router-scoped, and per-route onion middleware with `next`.
+- Router guards; app and router fallbacks.
+- Graceful shutdown (`listen_with_shutdown` / `serve_with_shutdown`) and a panic-proof accept loop.
+- Configurable body limit (413), request timeout (408), and header-read timeout.
+- Binary-safe request bodies: `req.bytes()`, `req.text()`, `req.json::<T>()`, `req.form::<T>()`, and `req.multipart()`.
+- Client address via `req.remote_addr()`; duplicate headers via `req.headers_all()`.
+- Parsed query strings; request and response cookies (plus a `Cookie` builder with `SameSite`/`Secure`/`Max-Age`).
+- Signed values (HMAC-SHA256) and a minimal in-memory `Sessions` middleware.
+- `Result<Response, HttpError>` handlers and a global error handler that also formats 404/405.
 - Typed shared state.
-- Extractors: `Json<T>`, `Path<T>`, `Query<T>`, `State<T>`.
-- Static files with extension-based content types.
-- Response streaming.
-- Server-Sent Events.
-- WebSocket routes with frame send/receive helpers.
-- JSON WebSocket events with `{ "event": "...", "data": ... }` envelopes.
-- Built-in middleware: CORS, request id, gzip, and tracing.
-- Unit tests and a real HTTP integration test.
+- Extractors: `Json<T>`, `Form<T>`, `Path<T>` (structs or scalars), `Query<T>`, `State<T>`, `Cookies<T>`, `Headers<T>`, `Bytes`, `String`, plus `Option`/`Result` wrappers.
+- Static files with streaming bodies, `ETag`/`Last-Modified` (304), and `Range` (206) support.
+- Response streaming and Server-Sent Events.
+- WebSocket routes with frame send/receive helpers and `{ "event": ..., "data": ... }` JSON envelopes.
+- Built-in middleware: configurable `Cors` (with preflight), compression negotiation (gzip/deflate, optional brotli), request id, gzip, and tracing.
+- An in-process `TestClient` and public `Request::builder()` for testing handlers without TCP.
+- Optional cargo features: `tls` (rustls HTTPS), `tracing` (structured spans), `brotli`.
+- Unit tests plus real HTTP and HTTPS integration tests.
 
 ## Installation
 
@@ -64,6 +65,20 @@ serde = { version = "1", features = ["derive"] }
 ```
 
 RustRest uses Rust edition 2024 and requires Rust `1.85` or newer.
+
+### Cargo features
+
+All optional, disabled by default:
+
+| Feature   | Adds                                                                  |
+| --------- | --------------------------------------------------------------------- |
+| `tls`     | HTTPS via rustls: `app.listen_tls(...)` + `rustrest::tls::config_from_pem` |
+| `tracing` | `middleware::trace()` emitting structured spans/events per request    |
+| `brotli`  | Brotli as the preferred encoding in `middleware::compression()`       |
+
+```toml
+rustrest = { version = "0.2", features = ["tls", "tracing"] }
+```
 
 ## Quick Start
 
@@ -824,28 +839,40 @@ src/
   main.rs                # Demo server for cargo run
   api.rs                 # Demo router used by main.rs
   users.rs               # Demo router used by main.rs
-  app.rs                 # Core: App, Router, Request, Response
+  app.rs                 # Module wiring + public re-exports
   app/
+    server.rs            # App, ServerConfig, listen/serve/dispatch
+    router.rs            # Router, RouteHandle, matching, static files
+    request.rs           # Request + RequestBuilder
+    response.rs          # Response + IntoResponse
+    handler.rs           # Handler/Next/Middleware plumbing
+    extract.rs           # Json, Form, Path, Query, State, Cookies, Headers, ...
+    form.rs              # Form bodies + multipart parser
+    cookie.rs            # Cookie builder + sign/verify helpers
+    session.rs           # Minimal in-memory Sessions middleware
+    middleware.rs        # Built-in middleware (Cors, compression, ...)
     error.rs             # HttpError and IntoHttpError
-    extract.rs           # Json, Path, Query, State
-    middleware.rs        # Built-in middleware
+    state.rs             # Type-keyed StateStore
+    testing.rs           # In-process TestClient
+    tls.rs               # HTTPS via rustls (feature `tls`)
     sse.rs               # SseEvent
+    websocket.rs         # WebSocket support
     tests.rs             # Framework unit tests
 examples/
   basic.rs               # Minimal example
   api.rs                 # Full API example
   websocket.rs           # WebSocket and browser client example
 tests/
-  http_integration.rs    # Real HTTP integration test
+  http_integration.rs    # Real HTTP integration tests
+  tls_integration.rs     # Real HTTPS integration test (feature `tls`)
 ```
 
 ## Current Limitations
 
-- Request bodies are fully buffered with a 64 KB limit.
-- Request streaming is not implemented yet.
-- TLS is not integrated; use a proxy or external listener if you need HTTPS.
+- Request bodies are fully buffered (configurable limit, 64 KB by default; oversized bodies get `413`).
+- Request streaming is not implemented yet (responses do stream).
 - Routing is registration-order based, without specificity ranking.
-- Built-in CORS is permissive; customize it for stricter policies.
+- Sessions are in-memory only (single process); use your own store for multi-instance deployments.
 - Handler argument macros are not implemented; extractors are used through `req.extract::<T>()`.
 
 ## License
