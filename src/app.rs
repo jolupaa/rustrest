@@ -6,6 +6,7 @@
 
 mod error;
 mod extract;
+mod form;
 mod handler;
 pub mod middleware;
 mod request;
@@ -18,7 +19,8 @@ mod testing;
 mod websocket;
 
 pub use error::{HttpError, IntoHttpError};
-pub use extract::{FromRequest, Json, Path, Query, State};
+pub use extract::{Form, FromRequest, Json, Path, Query, State};
+pub use form::MultipartPart;
 pub use handler::{ErrorHandler, Handler, IntoHandler, IntoMiddleware, Middleware, Next};
 pub use request::{Request, RequestBuilder};
 pub use response::{IntoResponse, Response};

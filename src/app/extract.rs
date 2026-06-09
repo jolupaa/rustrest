@@ -9,9 +9,19 @@ pub trait FromRequest: Sized {
 }
 
 pub struct Json<T>(pub T);
+pub struct Form<T>(pub T);
 pub struct Path<T>(pub T);
 pub struct Query<T>(pub T);
 pub struct State<T>(pub Arc<T>);
+
+impl<T> FromRequest for Form<T>
+where
+    T: DeserializeOwned,
+{
+    fn from_request(req: &Request) -> Result<Self, HttpError> {
+        req.form().map(Form)
+    }
+}
 
 impl<T> FromRequest for Json<T>
 where

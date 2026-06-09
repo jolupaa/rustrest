@@ -518,6 +518,68 @@ fn request_json_errors_on_invalid_body() {
 }
 
 #[test]
+fn request_form_parses_urlencoded_body() {
+    #[derive(Deserialize)]
+    struct Login {
+        user: String,
+        tags: Vec<String>,
+    }
+
+    let req = Request::builder()
+        .method("POST")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("user=ada+lovelace&tags=a&tags=b")
+        .build();
+
+    let form: Login = req.form().unwrap();
+    assert_eq!(form.user, "ada lovelace");
+    assert_eq!(form.tags, vec!["a", "b"]);
+
+    let Form(extracted) = req.extract::<Form<Login>>().unwrap();
+    assert_eq!(extracted.user, "ada lovelace");
+
+    let bad = dummy_request("%%%not-a-form=%zz");
+    assert!(bad.form::<Login>().is_err());
+}
+
+#[test]
+fn request_multipart_parses_fields_and_binary_files() {
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        b"--XBOUND\r\ncontent-disposition: form-data; name=\"campo\"\r\n\r\nhola\r\n",
+    );
+    body.extend_from_slice(
+        b"--XBOUND\r\ncontent-disposition: form-data; name=\"archivo\"; filename=\"a.bin\"\r\ncontent-type: application/octet-stream\r\n\r\n",
+    );
+    body.extend_from_slice(&[0xFF, 0x00, 0xFE]);
+    body.extend_from_slice(b"\r\n--XBOUND--\r\n");
+
+    let req = Request::builder()
+        .method("POST")
+        .header("content-type", "multipart/form-data; boundary=XBOUND")
+        .body(body)
+        .build();
+
+    let parts = req.multipart().unwrap();
+    assert_eq!(parts.len(), 2);
+
+    assert_eq!(parts[0].name, "campo");
+    assert_eq!(parts[0].filename, None);
+    assert_eq!(parts[0].text(), "hola");
+
+    assert_eq!(parts[1].name, "archivo");
+    assert_eq!(parts[1].filename.as_deref(), Some("a.bin"));
+    assert_eq!(
+        parts[1].content_type.as_deref(),
+        Some("application/octet-stream")
+    );
+    assert_eq!(&parts[1].data[..], &[0xFF, 0x00, 0xFE]);
+
+    // Without a multipart content type the call fails cleanly.
+    assert!(dummy_request("x").multipart().is_err());
+}
+
+#[test]
 fn request_body_bytes_preserve_non_utf8_and_text_is_lossy() {
     // Bytes that are not valid UTF-8 must survive intact through `bytes()`,
     // while `text()` exposes a lossy view for text consumers.
