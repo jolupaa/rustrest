@@ -101,6 +101,31 @@ pub fn tracing() -> Middleware {
     })
 }
 
+/// Structured logging via the `tracing` crate (requires the `tracing`
+/// feature): wraps each request in an info span (method + path) and emits an
+/// event with the status and latency when it completes.
+#[cfg(feature = "tracing")]
+pub fn trace() -> Middleware {
+    use tracing::Instrument;
+
+    Arc::new(|req: Request, next: Next| {
+        let span = tracing::info_span!("request", method = %req.method, path = %req.path);
+        Box::pin(
+            async move {
+                let start = std::time::Instant::now();
+                let res = next(req).await;
+                tracing::info!(
+                    status = res.status,
+                    latency_ms = start.elapsed().as_millis() as u64,
+                    "request served"
+                );
+                res
+            }
+            .instrument(span),
+        )
+    })
+}
+
 /// Bodies smaller than this are not worth compressing.
 const COMPRESSION_MIN_BYTES: usize = 1024;
 

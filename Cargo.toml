@@ -14,9 +14,11 @@ exclude = ["AGENTS.md", "CLAUDE.md"]
 [features]
 default = []
 brotli = ["dep:brotli"]
+tracing = ["dep:tracing"]
 
 [dependencies]
 brotli = { version = "7", optional = true }
+tracing = { version = "0.1", optional = true }
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }

@@ -176,6 +176,43 @@ async fn builtin_middlewares_add_cors_request_id_gzip_and_tracing() {
     assert_eq!(decoded, "req-123");
 }
 
+#[cfg(feature = "tracing")]
+#[tokio::test]
+async fn trace_middleware_emits_events_and_passes_response_through() {
+    use tracing::instrument::WithSubscriber;
+
+    struct CountingSubscriber(Arc<AtomicUsize>);
+    impl tracing::Subscriber for CountingSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    let events = Arc::new(AtomicUsize::new(0));
+    let subscriber = CountingSubscriber(Arc::clone(&events));
+
+    let mut app = App::new();
+    app.layer(middleware::trace());
+    app.get("/ping", |_r: Request| Response::send("pong"));
+    let client = TestClient::new(app);
+
+    let res = client.get("/ping").send().with_subscriber(subscriber).await;
+
+    assert_eq!(res.status, 200);
+    assert_eq!(res.body_text(), "pong");
+    assert!(events.load(Ordering::SeqCst) >= 1, "expected trace events");
+}
+
 #[tokio::test]
 async fn compression_negotiates_encoding_and_skips_small_bodies() {
     let mut app = App::new();
