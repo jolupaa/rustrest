@@ -325,7 +325,7 @@ impl App {
 
     /// Translates a hyper request into a [`Request`] (method, path, query,
     /// headers, size-bounded body), dispatches it, and converts the result.
-    async fn handle(
+    pub(crate) async fn handle(
         &self,
         mut req: hyper::Request<Incoming>,
         remote_addr: Option<SocketAddr>,

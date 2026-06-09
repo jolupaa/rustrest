@@ -22,6 +22,8 @@
 
 pub mod app;
 
+#[cfg(feature = "tls")]
+pub use app::tls;
 pub use app::{
     App, Cookie, Cookies, ErrorHandler, Form, FromRequest, Handler, Headers, HttpError,
     IntoHandler, IntoHttpError, IntoMiddleware, IntoResponse, IntoWebSocketHandler, Json,

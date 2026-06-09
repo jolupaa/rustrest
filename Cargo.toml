@@ -15,10 +15,13 @@ exclude = ["AGENTS.md", "CLAUDE.md"]
 default = []
 brotli = ["dep:brotli"]
 tracing = ["dep:tracing"]
+tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
 
 [dependencies]
 brotli = { version = "7", optional = true }
 tracing = { version = "0.1", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2", optional = true }
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
@@ -35,3 +38,6 @@ hmac = "0.12"
 sha2 = "0.10"
 httpdate = "1"
 tokio-tungstenite = "0.29"
+
+[dev-dependencies]
+rcgen = "0.13"
