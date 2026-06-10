@@ -3,6 +3,7 @@ pub struct SseEvent {
     event: Option<String>,
     id: Option<String>,
     retry: Option<u64>,
+    comment: Option<String>,
 }
 
 impl SseEvent {
@@ -12,6 +13,19 @@ impl SseEvent {
             event: None,
             id: None,
             retry: None,
+            comment: None,
+        }
+    }
+
+    /// A comment-only event (`: text`). Browsers ignore it; it keeps the
+    /// connection alive through proxies (see `Response::sse_with_heartbeat`).
+    pub fn comment(text: impl Into<String>) -> Self {
+        Self {
+            data: String::new(),
+            event: None,
+            id: None,
+            retry: None,
+            comment: Some(text.into()),
         }
     }
 
@@ -32,6 +46,13 @@ impl SseEvent {
 
     pub(super) fn format(&self) -> String {
         let mut out = String::new();
+        if let Some(comment) = &self.comment {
+            out.push_str(": ");
+            out.push_str(comment);
+            out.push('\n');
+            out.push('\n');
+            return out;
+        }
         if let Some(id) = &self.id {
             out.push_str("id: ");
             out.push_str(id);

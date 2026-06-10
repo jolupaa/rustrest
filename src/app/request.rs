@@ -89,6 +89,12 @@ impl Request {
             .collect()
     }
 
+    /// The `Last-Event-ID` header an SSE client sends when reconnecting, so
+    /// handlers can resume the stream after the last event it received.
+    pub fn last_event_id(&self) -> Option<&str> {
+        self.header("last-event-id")
+    }
+
     /// Returns the client's socket address, if known (set by the server).
     pub fn remote_addr(&self) -> Option<SocketAddr> {
         self.remote_addr

@@ -73,6 +73,23 @@ impl Response {
             .header(CONNECTION.as_str(), "keep-alive")
     }
 
+    /// Like [`Response::sse`], but whenever `events` stays quiet for
+    /// `heartbeat` a `: keep-alive` comment is emitted so proxies do not drop
+    /// the idle connection. The stream still ends when `events` ends.
+    pub fn sse_with_heartbeat<S>(events: S, heartbeat: std::time::Duration) -> Self
+    where
+        S: Stream<Item = SseEvent> + Send + 'static,
+    {
+        let merged = futures_util::stream::unfold(Box::pin(events), move |mut events| async move {
+            match tokio::time::timeout(heartbeat, events.next()).await {
+                Ok(Some(event)) => Some((event, events)),
+                Ok(None) => None,
+                Err(_) => Some((SseEvent::comment("keep-alive"), events)),
+            }
+        });
+        Self::sse(merged)
+    }
+
     /// Serializes `value` to JSON. If serialization fails, degrades to a 500.
     pub fn json<T: Serialize>(value: &T) -> Self {
         match serde_json::to_string(value) {

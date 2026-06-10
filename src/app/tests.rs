@@ -507,6 +507,58 @@ async fn response_formats_sse_events() {
 }
 
 #[test]
+fn sse_comment_events_format_as_comments() {
+    assert_eq!(SseEvent::comment("keep-alive").format(), ": keep-alive\n\n");
+    // Regular events keep their existing shape.
+    assert_eq!(
+        SseEvent::new("hola").id("1").format(),
+        "id: 1\ndata: hola\n\n"
+    );
+}
+
+#[test]
+fn request_exposes_last_event_id() {
+    let mut req = dummy_request("");
+    assert!(req.last_event_id().is_none());
+    req.headers
+        .insert("last-event-id".to_string(), "42".to_string());
+    assert_eq!(req.last_event_id(), Some("42"));
+}
+
+#[tokio::test]
+async fn sse_with_heartbeat_fills_idle_gaps_and_ends_with_source() {
+    // One immediate event, then a gap several heartbeats long.
+    let events = stream::unfold(0, |state| async move {
+        match state {
+            0 => Some((SseEvent::new("primero"), 1)),
+            1 => {
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                Some((SseEvent::new("segundo"), 2))
+            }
+            _ => None,
+        }
+    });
+    let res = Response::sse_with_heartbeat(events, std::time::Duration::from_millis(40));
+    assert_eq!(res.content_type, "text/event-stream");
+
+    // Collecting returns only because the merged stream ends with the source.
+    let body = res
+        .into_hyper()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("data: primero"), "body: {text}");
+    assert!(
+        text.contains(": keep-alive"),
+        "expected heartbeat in {text}"
+    );
+    assert!(text.contains("data: segundo"), "body: {text}");
+}
+
+#[test]
 fn websocket_handshake_sets_upgrade_headers() {
     let mut req = dummy_request("");
     req.method = "GET".to_string();
