@@ -29,6 +29,6 @@ pub use app::{
     IntoHandler, IntoHttpError, IntoMiddleware, IntoResponse, IntoWebSocketHandler, Json,
     Middleware, MultipartPart, Next, Path, Query, Request, RequestBuilder, Response, RouteHandle,
     RouteInfo, Router, SameSite, Sessions, SseEvent, State, StateStore, TestClient, TestRequest,
-    TrailingSlash, WebSocket, WebSocketError, WebSocketEvent, WebSocketHandler, WebSocketMessage,
-    middleware, sign_value, verify_value,
+    TrailingSlash, WebSocket, WebSocketConfig, WebSocketError, WebSocketEvent, WebSocketHandler,
+    WebSocketMessage, WsBroadcast, middleware, sign_value, verify_value,
 };

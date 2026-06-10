@@ -242,6 +242,16 @@ impl App {
         self.router.ws(path, handler);
     }
 
+    /// Like [`App::websocket`], with subprotocols, message size limits, and
+    /// keepalive pings from `config`.
+    pub fn websocket_with<F, Fut>(&mut self, path: &str, config: super::WebSocketConfig, handler: F)
+    where
+        F: Fn(super::WebSocket) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.router.websocket_with(path, config, handler);
+    }
+
     /// Mounts a router under `prefix` (Express-style sub-routes).
     pub fn mount(&mut self, prefix: &str, router: Router) {
         self.router.mount(prefix, router);

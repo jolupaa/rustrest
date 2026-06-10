@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use hyper::upgrade::OnUpgrade;
@@ -13,6 +14,61 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 use super::{HttpError, Request, Response};
 
 pub use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
+
+/// Per-route WebSocket options: subprotocol negotiation, incoming message
+/// size limit, and automatic keepalive pings. Pass to
+/// [`Request::websocket_with`] or `websocket_with` on `App`/`Router`.
+#[derive(Clone, Default)]
+pub struct WebSocketConfig {
+    protocols: Vec<String>,
+    max_message_size: Option<usize>,
+    ping_interval: Option<Duration>,
+}
+
+impl WebSocketConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Declares the subprotocols the server supports. The first
+    /// client-offered protocol in this list is selected and echoed in the
+    /// `Sec-WebSocket-Protocol` response header.
+    pub fn protocols(mut self, protocols: &[&str]) -> Self {
+        self.protocols = protocols.iter().map(|p| p.to_string()).collect();
+        self
+    }
+
+    /// Caps the size of incoming messages; larger ones error the connection.
+    pub fn max_message_size(mut self, bytes: usize) -> Self {
+        self.max_message_size = Some(bytes);
+        self
+    }
+
+    /// Sends a Ping whenever the connection has been idle in
+    /// [`WebSocket::recv`] for `interval`, keeping intermediaries from
+    /// dropping quiet connections.
+    pub fn ping_interval(mut self, interval: Duration) -> Self {
+        self.ping_interval = Some(interval);
+        self
+    }
+
+    /// Picks the first client-offered subprotocol the server supports.
+    pub(super) fn negotiate(&self, req: &Request) -> Option<String> {
+        for raw in req.headers_all("sec-websocket-protocol") {
+            for candidate in raw.split(',') {
+                let candidate = candidate.trim();
+                if self
+                    .protocols
+                    .iter()
+                    .any(|supported| supported.eq_ignore_ascii_case(candidate))
+                {
+                    return Some(candidate.to_string());
+                }
+            }
+        }
+        None
+    }
+}
 
 type WebSocketInner = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 
@@ -76,18 +132,46 @@ pub struct WebSocketEvent<T = serde_json::Value> {
 
 pub struct WebSocket {
     inner: WebSocketInner,
+    protocol: Option<String>,
+    ping_interval: Option<Duration>,
 }
 
 impl WebSocket {
-    pub(super) fn new(inner: WebSocketInner) -> Self {
-        Self { inner }
+    pub(super) fn new(
+        inner: WebSocketInner,
+        protocol: Option<String>,
+        ping_interval: Option<Duration>,
+    ) -> Self {
+        Self {
+            inner,
+            protocol,
+            ping_interval,
+        }
+    }
+
+    /// The subprotocol negotiated during the handshake, if any.
+    pub fn protocol(&self) -> Option<&str> {
+        self.protocol.as_deref()
     }
 
     pub async fn recv(&mut self) -> Result<Option<WebSocketMessage>, WebSocketError> {
-        match self.inner.next().await {
-            Some(Ok(message)) => Ok(Some(message)),
-            Some(Err(err)) => Err(err.into()),
-            None => Ok(None),
+        loop {
+            let next = match self.ping_interval {
+                Some(interval) => match tokio::time::timeout(interval, self.inner.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        // Idle for a full interval: ping and keep waiting.
+                        self.ping(hyper::body::Bytes::new()).await?;
+                        continue;
+                    }
+                },
+                None => self.inner.next().await,
+            };
+            return match next {
+                Some(Ok(message)) => Ok(Some(message)),
+                Some(Err(err)) => Err(err.into()),
+                None => Ok(None),
+            };
         }
     }
 
@@ -169,33 +253,94 @@ impl Request {
     where
         H: IntoWebSocketHandler,
     {
-        match self.into_websocket_response(handler.into_websocket_handler()) {
+        self.websocket_with(WebSocketConfig::default(), handler)
+    }
+
+    /// Like [`Request::websocket`], with subprotocol negotiation, message
+    /// size limits, and keepalive pings from `config`.
+    pub fn websocket_with<H>(self, config: WebSocketConfig, handler: H) -> Response
+    where
+        H: IntoWebSocketHandler,
+    {
+        match self.into_websocket_response(config, handler.into_websocket_handler()) {
             Ok(response) => response,
             Err(err) => Response::from_error(err),
         }
     }
 
-    fn into_websocket_response(self, handler: WebSocketHandler) -> Result<Response, HttpError> {
-        let response = Response::websocket(&self)?;
+    fn into_websocket_response(
+        self,
+        config: WebSocketConfig,
+        handler: WebSocketHandler,
+    ) -> Result<Response, HttpError> {
+        let protocol = config.negotiate(&self);
+        let mut response = Response::websocket(&self)?;
+        if let Some(protocol) = &protocol {
+            response = response.header("sec-websocket-protocol", protocol);
+        }
         let upgrade = self
             .upgrade
             .ok_or_else(|| HttpError::bad_request("WebSocket upgrade is not available"))?;
-        spawn_websocket(upgrade, handler);
+        spawn_websocket(upgrade, config, protocol, handler);
         Ok(response)
     }
 }
 
-fn spawn_websocket(upgrade: OnUpgrade, handler: WebSocketHandler) {
+fn spawn_websocket(
+    upgrade: OnUpgrade,
+    config: WebSocketConfig,
+    protocol: Option<String>,
+    handler: WebSocketHandler,
+) {
     tokio::spawn(async move {
         match upgrade.await {
             Ok(upgraded) => {
                 let io = TokioIo::new(upgraded);
-                let stream = WebSocketStream::from_raw_socket(io, Role::Server, None).await;
-                handler(WebSocket::new(stream)).await;
+                let stream_config = config.max_message_size.map(|bytes| {
+                    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+                        .max_message_size(Some(bytes))
+                });
+                let stream =
+                    WebSocketStream::from_raw_socket(io, Role::Server, stream_config).await;
+                handler(WebSocket::new(stream, protocol, config.ping_interval)).await;
             }
             Err(err) => {
                 eprintln!("WebSocket upgrade failed: {}", err);
             }
         }
     });
+}
+
+/// A clonable fan-out channel for WebSocket rooms: handlers `subscribe()`
+/// and forward received messages to their socket, while any holder of the
+/// `WsBroadcast` can `send` to every current subscriber. Backed by
+/// `tokio::sync::broadcast` (lagging subscribers skip the oldest messages).
+#[derive(Clone)]
+pub struct WsBroadcast {
+    sender: tokio::sync::broadcast::Sender<WebSocketMessage>,
+}
+
+impl WsBroadcast {
+    /// Creates a channel buffering up to `capacity` in-flight messages.
+    pub fn new(capacity: usize) -> Self {
+        let (sender, _) = tokio::sync::broadcast::channel(capacity);
+        Self { sender }
+    }
+
+    /// Sends to every current subscriber, returning how many received it.
+    pub fn send(&self, message: WebSocketMessage) -> usize {
+        self.sender.send(message).unwrap_or(0)
+    }
+
+    pub fn send_text(&self, text: &str) -> usize {
+        self.send(WebSocketMessage::text(text))
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<WebSocketMessage> {
+        self.sender.subscribe()
+    }
+
+    pub fn receiver_count(&self) -> usize {
+        self.sender.receiver_count()
+    }
 }

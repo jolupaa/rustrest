@@ -38,8 +38,8 @@ pub use sse::SseEvent;
 pub use state::StateStore;
 pub use testing::{TestClient, TestRequest};
 pub use websocket::{
-    IntoWebSocketHandler, WebSocket, WebSocketError, WebSocketEvent, WebSocketHandler,
-    WebSocketMessage,
+    IntoWebSocketHandler, WebSocket, WebSocketConfig, WebSocketError, WebSocketEvent,
+    WebSocketHandler, WebSocketMessage, WsBroadcast,
 };
 
 // Crate-internal helpers shared across submodules.

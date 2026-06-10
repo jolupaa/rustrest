@@ -15,7 +15,7 @@ use super::decode_component;
 use super::trie::RouteIndex;
 use super::{
     Handler, HttpError, IntoHandler, IntoMiddleware, Middleware, Next, Request, Response,
-    WebSocket, WebSocketHandler,
+    WebSocket, WebSocketConfig, WebSocketHandler,
 };
 
 pub(crate) const METHOD_ALL: &str = "*";
@@ -210,6 +210,20 @@ impl Router {
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.websocket(path, handler);
+    }
+
+    /// Like [`Router::websocket`], with subprotocols, message size limits,
+    /// and keepalive pings from `config`.
+    pub fn websocket_with<F, Fut>(&mut self, path: &str, config: WebSocketConfig, handler: F)
+    where
+        F: Fn(WebSocket) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let handler: WebSocketHandler = Arc::new(move |socket| Box::pin(handler(socket)));
+        self.get(path, move |req: Request| {
+            let handler = Arc::clone(&handler);
+            req.websocket_with(config.clone(), handler)
+        });
     }
 
     /// Adds a middleware scoped to this router: it wraps every route in this
