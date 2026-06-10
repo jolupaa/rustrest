@@ -65,13 +65,21 @@ pub(crate) fn is_valid_websocket_key(value: &str) -> bool {
         .is_ok_and(|decoded| decoded.len() == 16)
 }
 
-fn request_header_contains_token(req: &Request, name: &str, expected: &str) -> bool {
+pub(crate) fn request_header_contains_token(req: &Request, name: &str, expected: &str) -> bool {
     req.headers_all(name)
         .into_iter()
         .any(|value| header_value_contains_token(value, expected))
         || req
             .header(name)
             .is_some_and(|value| header_value_contains_token(value, expected))
+}
+
+pub(crate) fn singleton_header<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
+    let values = req.headers_all(name);
+    match values.as_slice() {
+        [value] => Some(*value),
+        _ => None,
+    }
 }
 
 fn negotiate_protocol(req: &Request, protocols: &[String]) -> Option<String> {
@@ -108,14 +116,18 @@ pub(crate) fn validate_handshake(
             "La actualizacion WebSocket requiere HTTP/1.1",
         ));
     }
-    let hosts = req.headers_all("host");
-    if hosts.len() != 1 || hosts[0].trim().is_empty() {
+    let Some(host) = singleton_header(req, "host").map(str::trim) else {
+        return Err(HandshakeRejection::new(
+            400,
+            "La cabecera Host debe aparecer exactamente una vez y no estar vacia",
+        ));
+    };
+    if host.is_empty() {
         return Err(HandshakeRejection::new(
             400,
             "La cabecera Host debe aparecer exactamente una vez y no estar vacia",
         ));
     }
-    let host = hosts[0].trim();
     if !req.method.eq_ignore_ascii_case("GET") {
         return Err(HandshakeRejection::new(
             400,
@@ -134,27 +146,25 @@ pub(crate) fn validate_handshake(
             "La cabecera Connection debe incluir Upgrade",
         ));
     }
-    let versions = req.headers_all("sec-websocket-version");
-    if versions.len() != 1 {
+    let Some(version) = singleton_header(req, "sec-websocket-version") else {
         return Err(HandshakeRejection::new(
             400,
             "Sec-WebSocket-Version debe aparecer exactamente una vez",
         ));
-    }
-    if versions[0].trim() != "13" {
+    };
+    if version.trim() != "13" {
         return Err(
             HandshakeRejection::new(426, "La version WebSocket debe ser 13")
                 .with_header("sec-websocket-version", "13"),
         );
     }
-    let keys = req.headers_all("sec-websocket-key");
-    if keys.len() != 1 {
+    let Some(key) = singleton_header(req, "sec-websocket-key") else {
         return Err(HandshakeRejection::new(
             400,
             "Sec-WebSocket-Key debe aparecer exactamente una vez",
         ));
-    }
-    if !is_valid_websocket_key(keys[0]) {
+    };
+    if !is_valid_websocket_key(key) {
         return Err(HandshakeRejection::new(
             400,
             "Sec-WebSocket-Key debe codificar exactamente 16 bytes",

@@ -40,6 +40,29 @@ fn websocket_handshake_sets_upgrade_headers() {
 }
 
 #[test]
+fn websocket_upgrade_predicate_rejects_duplicates_and_trims_version() {
+    let whitespace_version = Request::builder()
+        .method("GET")
+        .header("host", "localhost")
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", " 13 ")
+        .build();
+    assert!(whitespace_version.is_websocket_upgrade());
+
+    let duplicate_key = handshake_request()
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .build();
+    assert!(!duplicate_key.is_websocket_upgrade());
+
+    let duplicate_version = handshake_request()
+        .header("sec-websocket-version", "13")
+        .build();
+    assert!(!duplicate_version.is_websocket_upgrade());
+}
+
+#[test]
 fn websocket_handshake_parses_upgrade_headers_as_tokens() {
     let req = Request::builder()
         .method("GET")

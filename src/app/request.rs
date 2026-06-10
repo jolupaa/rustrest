@@ -133,18 +133,25 @@ impl Request {
     }
 
     pub fn is_websocket_upgrade(&self) -> bool {
+        let Some(host) = super::websocket::singleton_header(self, "host") else {
+            return false;
+        };
+        let Some(key) = super::websocket::singleton_header(self, SEC_WEBSOCKET_KEY.as_str()) else {
+            return false;
+        };
+        let Some(version) =
+            super::websocket::singleton_header(self, SEC_WEBSOCKET_VERSION.as_str())
+        else {
+            return false;
+        };
+
         self.version == hyper::Version::HTTP_11
             && self.method.eq_ignore_ascii_case("GET")
-            && self.header("upgrade").is_some_and(|value| {
-                super::websocket::header_value_contains_token(value, "websocket")
-            })
-            && self.header("connection").is_some_and(|value| {
-                super::websocket::header_value_contains_token(value, "upgrade")
-            })
-            && self
-                .header(SEC_WEBSOCKET_KEY.as_str())
-                .is_some_and(super::websocket::is_valid_websocket_key)
-            && self.header(SEC_WEBSOCKET_VERSION.as_str()) == Some("13")
+            && !host.trim().is_empty()
+            && super::websocket::request_header_contains_token(self, "upgrade", "websocket")
+            && super::websocket::request_header_contains_token(self, "connection", "upgrade")
+            && super::websocket::is_valid_websocket_key(key)
+            && version.trim() == "13"
     }
 
     /// Returns the raw request body bytes (binary-safe).
