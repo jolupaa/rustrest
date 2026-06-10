@@ -214,6 +214,26 @@ async fn trace_middleware_emits_events_and_passes_response_through() {
 }
 
 #[tokio::test]
+async fn timeout_middleware_cuts_off_slow_handlers() {
+    let mut app = App::new();
+    app.get("/slow", |_r: Request| async {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        Response::send("late")
+    })
+    .layer(middleware::timeout(std::time::Duration::from_millis(40)));
+    app.get("/fast", |_r: Request| Response::send("quick"))
+        .layer(middleware::timeout(std::time::Duration::from_millis(40)));
+
+    let slow = app.dispatch(request_with_method("GET", "/slow")).await;
+    assert_eq!(slow.status, 408);
+
+    // Fast handlers under the same budget are untouched.
+    let fast = app.dispatch(request_with_method("GET", "/fast")).await;
+    assert_eq!(fast.status, 200);
+    assert_eq!(fast.body_text(), "quick");
+}
+
+#[tokio::test]
 async fn rate_limit_middleware_throttles_per_ip_and_recovers() {
     fn request_from(addr: &str) -> Request {
         let mut req = dummy_request("");

@@ -241,6 +241,21 @@ pub fn compression_with_min_size(min_size: usize) -> Middleware {
     })
 }
 
+/// Cuts off everything it wraps (handler plus inner middleware) after
+/// `duration`, answering `408 Request Timeout` (formatted by the app's error
+/// handler when one is registered). Scope it per route or per router to give
+/// slow endpoints their own budget alongside the global `request_timeout`.
+pub fn timeout(duration: Duration) -> Middleware {
+    Arc::new(move |req: Request, next: Next| {
+        Box::pin(async move {
+            match tokio::time::timeout(duration, next(req)).await {
+                Ok(res) => res,
+                Err(_) => Response::from_error(HttpError::new(408, "Request Timeout")),
+            }
+        })
+    })
+}
+
 /// Fixed-window, per-client-IP rate limiting: at most `max_requests` per
 /// `window` from one IP (requests without a peer address — e.g. from the test
 /// client — share a single bucket). Over the limit the middleware
