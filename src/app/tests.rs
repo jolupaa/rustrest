@@ -11,7 +11,7 @@ use std::io::Read;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn dummy_request(body: &str) -> Request {
     Request {
@@ -28,6 +28,71 @@ fn dummy_request(body: &str) -> Request {
         remote_addr: None,
         header_pairs: Vec::new(),
     }
+}
+
+#[test]
+fn websocket_config_rejects_unbounded_or_inconsistent_values() {
+    assert!(
+        WebSocketConfig::new()
+            .outbound_capacity(0)
+            .validate()
+            .is_err()
+    );
+    assert!(
+        WebSocketConfig::new()
+            .inbound_capacity(0)
+            .validate()
+            .is_err()
+    );
+    assert!(
+        WebSocketConfig::new()
+            .write_buffer_size(1024)
+            .max_write_buffer_size(1024)
+            .validate()
+            .is_err()
+    );
+    assert!(
+        WebSocketConfig::new()
+            .ping_interval(Duration::from_secs(30))
+            .pong_timeout(Duration::from_secs(30))
+            .validate()
+            .is_err()
+    );
+}
+
+#[test]
+fn websocket_origin_policy_normalizes_default_ports() {
+    let policy = OriginPolicy::allow(["https://app.example.com"]);
+    assert!(policy.allows(Some("https://app.example.com:443"), "app.example.com"));
+    assert!(!policy.allows(Some("https://evil.example"), "app.example.com"));
+
+    let same_host = OriginPolicy::same_host().allow_missing(false);
+    assert!(same_host.allows(Some("http://localhost:3000"), "localhost:3000"));
+    assert!(!same_host.allows(None, "localhost:3000"));
+}
+
+#[test]
+fn websocket_origin_policy_rejects_invalid_explicit_ports() {
+    let policy = OriginPolicy::any();
+    assert!(!policy.allows(
+        Some("https://app.example.com:not-a-port"),
+        "app.example.com"
+    ));
+
+    let config = WebSocketConfig::new()
+        .origin_policy(OriginPolicy::allow(["https://app.example.com:not-a-port"]));
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn existing_websocket_error_remains_exhaustive() {
+    fn classify(error: WebSocketError) -> &'static str {
+        match error {
+            WebSocketError::Protocol(_) => "protocol",
+            WebSocketError::Json(_) => "json",
+        }
+    }
+    let _ = classify as fn(WebSocketError) -> &'static str;
 }
 
 #[test]

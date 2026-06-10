@@ -12,11 +12,13 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 
 use super::{HttpError, Request, Response};
 
-pub use config::WebSocketConfig;
-pub use error::WebSocketError;
+pub(crate) use config::ResolvedWebSocketConfig;
+pub use config::{BackpressurePolicy, OriginPolicy, WebSocketConfig};
+pub use error::{WebSocketCapacityError, WebSocketError, WebSocketTimeout, WsError};
 pub use socket::{
     IntoWebSocketHandler, WebSocket, WebSocketEvent, WebSocketHandler, WebSocketMessage,
 };
+pub use types::WebSocketErrorCategory;
 
 impl Request {
     pub fn websocket<H>(self, handler: H) -> Response
@@ -62,16 +64,17 @@ fn spawn_websocket(
     protocol: Option<String>,
     handler: WebSocketHandler,
 ) {
+    let config = ResolvedWebSocketConfig::from_layers(&WebSocketConfig::default(), &config);
     tokio::spawn(async move {
         match upgrade.await {
             Ok(upgraded) => {
                 let io = TokioIo::new(upgraded);
-                let stream_config = config.max_message_size.map(|bytes| {
-                    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
-                        .max_message_size(Some(bytes))
-                });
-                let stream =
-                    WebSocketStream::from_raw_socket(io, Role::Server, stream_config).await;
+                let stream = WebSocketStream::from_raw_socket(
+                    io,
+                    Role::Server,
+                    Some(config.tungstenite_config()),
+                )
+                .await;
                 handler(WebSocket::new(stream, protocol, config.ping_interval)).await;
             }
             Err(err) => {

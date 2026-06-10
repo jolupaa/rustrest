@@ -25,10 +25,11 @@ pub mod app;
 #[cfg(feature = "tls")]
 pub use app::tls;
 pub use app::{
-    App, Cookie, Cookies, ErrorHandler, Form, FromRequest, Handler, Headers, HttpError,
-    IntoHandler, IntoHttpError, IntoMiddleware, IntoResponse, IntoWebSocketHandler, Json,
-    Middleware, MultipartPart, Next, Path, Query, Request, RequestBuilder, Response, RouteHandle,
-    RouteInfo, Router, SameSite, Sessions, SseEvent, State, StateStore, TestClient, TestRequest,
-    TrailingSlash, WebSocket, WebSocketConfig, WebSocketError, WebSocketEvent, WebSocketHandler,
-    WebSocketMessage, WsBroadcast, middleware, sign_value, verify_value,
+    App, BackpressurePolicy, Cookie, Cookies, ErrorHandler, Form, FromRequest, Handler, Headers,
+    HttpError, IntoHandler, IntoHttpError, IntoMiddleware, IntoResponse, IntoWebSocketHandler,
+    Json, Middleware, MultipartPart, Next, OriginPolicy, Path, Query, Request, RequestBuilder,
+    Response, RouteHandle, RouteInfo, Router, SameSite, Sessions, SseEvent, State, StateStore,
+    TestClient, TestRequest, TrailingSlash, WebSocket, WebSocketCapacityError, WebSocketConfig,
+    WebSocketError, WebSocketErrorCategory, WebSocketEvent, WebSocketHandler, WebSocketMessage,
+    WebSocketTimeout, WsBroadcast, WsError, middleware, sign_value, verify_value,
 };
