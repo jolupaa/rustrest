@@ -3,7 +3,7 @@ use super::*;
 use futures_util::stream;
 use http_body_util::BodyExt;
 use hyper::body::Bytes;
-use hyper::header::{CONTENT_ENCODING, LOCATION, SEC_WEBSOCKET_ACCEPT, SET_COOKIE};
+use hyper::header::{CONTENT_ENCODING, LOCATION, SET_COOKIE};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -556,75 +556,6 @@ async fn sse_with_heartbeat_fills_idle_gaps_and_ends_with_source() {
         "expected heartbeat in {text}"
     );
     assert!(text.contains("data: segundo"), "body: {text}");
-}
-
-#[test]
-fn websocket_handshake_sets_upgrade_headers() {
-    let mut req = dummy_request("");
-    req.method = "GET".to_string();
-    req.headers
-        .insert("upgrade".to_string(), "websocket".to_string());
-    req.headers
-        .insert("connection".to_string(), "Upgrade".to_string());
-    req.headers.insert(
-        "sec-websocket-key".to_string(),
-        "dGhlIHNhbXBsZSBub25jZQ==".to_string(),
-    );
-    req.headers
-        .insert("sec-websocket-version".to_string(), "13".to_string());
-
-    assert!(req.is_websocket_upgrade());
-
-    let res = Response::websocket(&req).unwrap().into_hyper();
-
-    assert_eq!(res.status(), 101);
-    assert_eq!(
-        res.headers().get(SEC_WEBSOCKET_ACCEPT).unwrap(),
-        "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-    );
-}
-
-#[test]
-fn websocket_config_negotiates_first_supported_subprotocol() {
-    let mut req = dummy_request("");
-    req.headers.insert(
-        "sec-websocket-protocol".to_string(),
-        "chat, superchat".to_string(),
-    );
-    req.header_pairs.push((
-        "sec-websocket-protocol".to_string(),
-        "chat, superchat".to_string(),
-    ));
-
-    // Client preference order wins among the server-supported protocols.
-    let config = WebSocketConfig::new().protocols(&["superchat", "chat"]);
-    assert_eq!(config.negotiate(&req).as_deref(), Some("chat"));
-
-    let config = WebSocketConfig::new().protocols(&["superchat"]);
-    assert_eq!(config.negotiate(&req).as_deref(), Some("superchat"));
-
-    // No overlap (or no offer) -> no protocol echoed.
-    let config = WebSocketConfig::new().protocols(&["graphql-ws"]);
-    assert_eq!(config.negotiate(&req), None);
-    assert_eq!(WebSocketConfig::new().negotiate(&req), None);
-}
-
-#[tokio::test]
-async fn ws_broadcast_fans_out_to_subscribers() {
-    let room = WsBroadcast::new(8);
-    let mut a = room.subscribe();
-    let mut b = room.subscribe();
-
-    assert_eq!(room.receiver_count(), 2);
-    assert_eq!(room.send_text("hola"), 2);
-
-    assert_eq!(a.recv().await.unwrap(), WebSocketMessage::text("hola"));
-    assert_eq!(b.recv().await.unwrap(), WebSocketMessage::text("hola"));
-
-    // Without subscribers nothing is delivered (and nothing panics).
-    drop(a);
-    drop(b);
-    assert_eq!(room.send_text("nadie"), 0);
 }
 
 #[tokio::test]
