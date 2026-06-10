@@ -214,6 +214,37 @@ async fn trace_middleware_emits_events_and_passes_response_through() {
 }
 
 #[tokio::test]
+async fn rate_limit_middleware_throttles_per_ip_and_recovers() {
+    fn request_from(addr: &str) -> Request {
+        let mut req = dummy_request("");
+        req.remote_addr = Some(addr.parse().unwrap());
+        req
+    }
+
+    let mut app = App::new();
+    app.layer(middleware::rate_limit(
+        2,
+        std::time::Duration::from_millis(80),
+    ));
+    app.get("/", |_r: Request| Response::send("ok"));
+
+    // Two requests from the same IP pass; the third is throttled. The port
+    // must not matter — limiting is per IP.
+    assert_eq!(app.dispatch(request_from("1.1.1.1:1000")).await.status, 200);
+    assert_eq!(app.dispatch(request_from("1.1.1.1:1001")).await.status, 200);
+    let throttled = app.dispatch(request_from("1.1.1.1:1002")).await;
+    assert_eq!(throttled.status, 429);
+    assert!(throttled.headers.get("retry-after").is_some());
+
+    // A different client is unaffected.
+    assert_eq!(app.dispatch(request_from("2.2.2.2:1000")).await.status, 200);
+
+    // Once the window expires the client is admitted again.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(app.dispatch(request_from("1.1.1.1:1003")).await.status, 200);
+}
+
+#[tokio::test]
 async fn compression_negotiates_encoding_and_skips_small_bodies() {
     let mut app = App::new();
     app.layer(middleware::compression());

@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::io::Write;
-use std::sync::Arc;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flate2::Compression;
 use flate2::write::{GzEncoder, ZlibEncoder};
@@ -235,6 +237,41 @@ pub fn compression_with_min_size(min_size: usize) -> Middleware {
                     .append_header(VARY.as_str(), "Accept-Encoding");
             }
             res
+        })
+    })
+}
+
+/// Fixed-window, per-client-IP rate limiting: at most `max_requests` per
+/// `window` from one IP (requests without a peer address — e.g. from the test
+/// client — share a single bucket). Over the limit the middleware
+/// short-circuits with `429 Too Many Requests` and a `Retry-After` header in
+/// seconds. The 429 is returned directly rather than through the error
+/// handler so `Retry-After` is always preserved.
+pub fn rate_limit(max_requests: u32, window: Duration) -> Middleware {
+    /// Per-client window state: window start and requests seen in it. The
+    /// `None` key holds clients with no known peer address.
+    type RateBuckets = HashMap<Option<IpAddr>, (Instant, u32)>;
+    let buckets: Arc<Mutex<RateBuckets>> = Arc::new(Mutex::new(HashMap::new()));
+    Arc::new(move |req: Request, next: Next| {
+        let buckets = Arc::clone(&buckets);
+        Box::pin(async move {
+            let key = req.remote_addr().map(|addr| addr.ip());
+            let now = Instant::now();
+            let over_limit = {
+                let mut buckets = buckets.lock().expect("rate limit lock");
+                // Expired windows are dropped wholesale so the map only ever
+                // holds clients seen within the current window.
+                buckets.retain(|_, (start, _)| now.duration_since(*start) < window);
+                let (start, count) = buckets.entry(key).or_insert((now, 0));
+                *count += 1;
+                (*count > max_requests).then(|| window.saturating_sub(now.duration_since(*start)))
+            };
+            match over_limit {
+                Some(remaining) => Response::send("Too Many Requests")
+                    .status(429)
+                    .header("retry-after", &remaining.as_secs().max(1).to_string()),
+                None => next(req).await,
+            }
         })
     })
 }
