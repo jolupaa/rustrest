@@ -677,19 +677,16 @@ async fn gzip_middleware_skips_websocket_upgrade_responses() {
     app.layer(middleware::gzip());
     app.get("/ws", |req: Request| Response::websocket(&req).unwrap());
 
-    let mut req = request_with_method("GET", "/ws");
-    req.headers
-        .insert("accept-encoding".to_string(), "gzip".to_string());
-    req.headers
-        .insert("upgrade".to_string(), "websocket".to_string());
-    req.headers
-        .insert("connection".to_string(), "Upgrade".to_string());
-    req.headers.insert(
-        "sec-websocket-key".to_string(),
-        "dGhlIHNhbXBsZSBub25jZQ==".to_string(),
-    );
-    req.headers
-        .insert("sec-websocket-version".to_string(), "13".to_string());
+    let req = Request::builder()
+        .method("GET")
+        .path("/ws")
+        .header("host", "localhost")
+        .header("accept-encoding", "gzip")
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .build();
 
     let res = app.dispatch(req).await.into_hyper();
 

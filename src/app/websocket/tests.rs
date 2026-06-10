@@ -1,16 +1,32 @@
 use hyper::header::SEC_WEBSOCKET_ACCEPT;
 
+use crate::RequestBuilder;
+
 use super::*;
 
-#[test]
-fn websocket_handshake_sets_upgrade_headers() {
-    let req = Request::builder()
+fn handshake_request_without_host() -> RequestBuilder {
+    Request::builder()
         .method("GET")
         .header("upgrade", "websocket")
         .header("connection", "Upgrade")
         .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
         .header("sec-websocket-version", "13")
-        .build();
+}
+
+fn handshake_request() -> RequestBuilder {
+    handshake_request_without_host().header("host", "localhost")
+}
+
+fn assert_websocket_error_status(req: &Request, expected: u16) {
+    let error = Response::websocket(req)
+        .err()
+        .expect("the handshake should be rejected");
+    assert_eq!(error.status(), expected);
+}
+
+#[test]
+fn websocket_handshake_sets_upgrade_headers() {
+    let req = handshake_request().build();
 
     assert!(req.is_websocket_upgrade());
 
@@ -27,13 +43,56 @@ fn websocket_handshake_sets_upgrade_headers() {
 fn websocket_handshake_parses_upgrade_headers_as_tokens() {
     let req = Request::builder()
         .method("GET")
-        .header("upgrade", "h2c, WebSocket")
+        .header("host", "localhost")
+        .header("upgrade", "h2c")
+        .header("upgrade", "WebSocket")
+        .header("connection", "keep-alive")
         .header("connection", "keep-alive, UpGrAdE")
         .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
         .header("sec-websocket-version", "13")
         .build();
 
     assert!(Response::websocket(&req).is_ok());
+}
+
+#[test]
+fn websocket_handshake_requires_one_non_empty_host() {
+    let missing = handshake_request_without_host().build();
+    assert_websocket_error_status(&missing, 400);
+
+    let empty = handshake_request_without_host().header("host", "").build();
+    assert_websocket_error_status(&empty, 400);
+
+    let duplicate = handshake_request().header("host", "example.com").build();
+    assert_websocket_error_status(&duplicate, 400);
+}
+
+#[test]
+fn websocket_handshake_rejects_duplicate_key() {
+    let req = handshake_request()
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .build();
+
+    assert_websocket_error_status(&req, 400);
+}
+
+#[test]
+fn websocket_handshake_rejects_duplicate_version() {
+    let req = handshake_request()
+        .header("sec-websocket-version", "13")
+        .build();
+
+    assert_websocket_error_status(&req, 400);
+}
+
+#[test]
+fn websocket_handshake_rejects_duplicate_origin() {
+    let req = handshake_request()
+        .header("origin", "https://app.example.com")
+        .header("origin", "https://app.example.com")
+        .build();
+
+    assert_websocket_error_status(&req, 400);
 }
 
 #[test]
@@ -58,12 +117,7 @@ fn websocket_with_rejects_disallowed_origin_with_403() {
 
 #[test]
 fn websocket_with_requires_subprotocol_overlap_when_configured() {
-    let req = Request::builder()
-        .method("GET")
-        .header("upgrade", "websocket")
-        .header("connection", "Upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
+    let req = handshake_request()
         .header("sec-websocket-protocol", "graphql-ws")
         .build();
     let config = WebSocketConfig::new()
@@ -78,6 +132,7 @@ fn websocket_with_requires_subprotocol_overlap_when_configured() {
 #[test]
 fn websocket_config_negotiates_first_supported_subprotocol() {
     let req = Request::builder()
+        .header("sec-websocket-protocol", "other")
         .header("sec-websocket-protocol", "chat, superchat")
         .build();
 

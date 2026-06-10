@@ -108,6 +108,14 @@ pub(crate) fn validate_handshake(
             "La actualizacion WebSocket requiere HTTP/1.1",
         ));
     }
+    let hosts = req.headers_all("host");
+    if hosts.len() != 1 || hosts[0].trim().is_empty() {
+        return Err(HandshakeRejection::new(
+            400,
+            "La cabecera Host debe aparecer exactamente una vez y no estar vacia",
+        ));
+    }
+    let host = hosts[0].trim();
     if !req.method.eq_ignore_ascii_case("GET") {
         return Err(HandshakeRejection::new(
             400,
@@ -126,29 +134,44 @@ pub(crate) fn validate_handshake(
             "La cabecera Connection debe incluir Upgrade",
         ));
     }
-    if req
-        .header("sec-websocket-version")
-        .is_none_or(|version| version.trim() != "13")
-    {
+    let versions = req.headers_all("sec-websocket-version");
+    if versions.len() != 1 {
+        return Err(HandshakeRejection::new(
+            400,
+            "Sec-WebSocket-Version debe aparecer exactamente una vez",
+        ));
+    }
+    if versions[0].trim() != "13" {
         return Err(
             HandshakeRejection::new(426, "La version WebSocket debe ser 13")
                 .with_header("sec-websocket-version", "13"),
         );
     }
-    if req
-        .header("sec-websocket-key")
-        .is_none_or(|key| !is_valid_websocket_key(key))
-    {
+    let keys = req.headers_all("sec-websocket-key");
+    if keys.len() != 1 {
+        return Err(HandshakeRejection::new(
+            400,
+            "Sec-WebSocket-Key debe aparecer exactamente una vez",
+        ));
+    }
+    if !is_valid_websocket_key(keys[0]) {
         return Err(HandshakeRejection::new(
             400,
             "Sec-WebSocket-Key debe codificar exactamente 16 bytes",
         ));
     }
-    if !config.origin_policy.allows_for_transport(
-        req.header("origin"),
-        req.header("host").unwrap_or(""),
-        req.is_secure(),
-    ) {
+
+    let origins = req.headers_all("origin");
+    if origins.len() > 1 {
+        return Err(HandshakeRejection::new(
+            400,
+            "La cabecera Origin no puede aparecer mas de una vez",
+        ));
+    }
+    if !config
+        .origin_policy
+        .allows_for_transport(origins.first().copied(), host, req.is_secure())
+    {
         return Err(HandshakeRejection::new(
             403,
             "El origen WebSocket no esta permitido",
