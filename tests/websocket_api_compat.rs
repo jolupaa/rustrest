@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use rustrest::{
-    App, Request, Router, WebSocket, WebSocketConfig, WebSocketError, WebSocketMessage, WsBroadcast,
+    App, IntoWebSocketHandler, Request, Response, Router, WebSocket, WebSocketConfig,
+    WebSocketError, WebSocketEvent, WebSocketHandler, WebSocketMessage, WsBroadcast,
 };
 
 fn exhaustive_existing_error(error: WebSocketError) -> &'static str {
@@ -16,19 +17,26 @@ fn accepts_websocket(_: WebSocket) {}
 #[test]
 fn existing_websocket_surface_still_compiles() {
     let mut app = App::new();
-    app.websocket("/ws", |mut socket| async move {
-        let _ = socket.protocol();
-        let _ = socket.send_text("hola").await;
-        let _ = socket.send_binary([1_u8, 2, 3].as_slice()).await;
-        let _ = socket.send_json(&serde_json::json!({ "ok": true })).await;
-        let _ = socket.send_event("ready", &true).await;
-        let _ = socket.ping(Vec::<u8>::new()).await;
-        let _ = socket.pong(Vec::<u8>::new()).await;
-        let _ = socket.close().await;
-    });
+    let handler: WebSocketHandler = (|mut socket: WebSocket| async move {
+        let _: Option<&str> = socket.protocol();
+        let _: Result<Option<WebSocketMessage>, WebSocketError> = socket.recv().await;
+        let _: Result<(), WebSocketError> = socket.send(WebSocketMessage::text("directo")).await;
+        let _: Result<(), WebSocketError> = socket.send_text("hola").await;
+        let _: Result<(), WebSocketError> = socket.send_binary([1_u8, 2, 3].as_slice()).await;
+        let _: Result<(), WebSocketError> =
+            socket.send_json(&serde_json::json!({ "ok": true })).await;
+        let _: Result<Option<serde_json::Value>, WebSocketError> = socket.recv_json().await;
+        let _: Result<(), WebSocketError> = socket.send_event("ready", &true).await;
+        let _: Result<Option<WebSocketEvent<bool>>, WebSocketError> = socket.recv_event().await;
+        let _: Result<(), WebSocketError> = socket.ping(Vec::<u8>::new()).await;
+        let _: Result<(), WebSocketError> = socket.pong(Vec::<u8>::new()).await;
+        let _: Result<(), WebSocketError> = socket.close().await;
+    })
+    .into_websocket_handler();
+    let _: () = app.websocket("/ws", |_socket| async move {});
 
-    app.ws("/short", |_socket| async move {});
-    app.websocket_with(
+    let _: () = app.ws("/short", |_socket| async move {});
+    let _: () = app.websocket_with(
         "/configured",
         WebSocketConfig::new()
             .protocols(&["chat"])
@@ -38,24 +46,33 @@ fn existing_websocket_surface_still_compiles() {
     );
 
     let mut router = Router::new();
-    router.websocket("/nested", |_socket| async move {});
-    router.ws("/nested-short", |_socket| async move {});
-    router.websocket_with(
+    let _: () = router.websocket("/nested", |_socket| async move {});
+    let _: () = router.ws("/nested-short", |_socket| async move {});
+    let _: () = router.websocket_with(
         "/nested-configured",
         WebSocketConfig::new(),
         |_socket| async move {},
     );
 
     let request = Request::builder().path("/ws").build();
-    let _response = request.websocket(|_socket| async move {});
+    let _response: Response = request.websocket(|_socket| async move {});
+    let request = Request::builder().path("/configured").build();
+    let _response: Response = request.websocket_with(WebSocketConfig::new(), handler.clone());
 
-    let broadcast = WsBroadcast::new(8);
-    let mut receiver = broadcast.subscribe();
-    assert_eq!(broadcast.send_text("hola"), 1);
-    let _ = broadcast.receiver_count();
+    let broadcast: WsBroadcast = WsBroadcast::new(8);
+    let mut receiver: tokio::sync::broadcast::Receiver<WebSocketMessage> = broadcast.subscribe();
+    let delivered: usize = broadcast.send_text("hola");
+    assert_eq!(delivered, 1);
+    let delivered: usize = broadcast.send(WebSocketMessage::text("directo"));
+    assert_eq!(delivered, 1);
+    let _receiver_count: usize = broadcast.receiver_count();
     drop(receiver.try_recv());
 
-    let _message = WebSocketMessage::text("hola");
+    let _message: WebSocketMessage = WebSocketMessage::text("hola");
+    let _event: WebSocketEvent<bool> = WebSocketEvent {
+        event: "ready".to_string(),
+        data: true,
+    };
     let _error_match: fn(WebSocketError) -> &'static str = exhaustive_existing_error;
     let _socket_consumer: fn(WebSocket) = accepts_websocket;
 }
