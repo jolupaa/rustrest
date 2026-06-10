@@ -325,6 +325,18 @@ impl Router {
         ))
     }
 
+    /// Lists every registered route (method + pattern) in registration order,
+    /// with mounted prefixes already applied. `all()` routes report `*`.
+    pub fn routes(&self) -> Vec<RouteInfo> {
+        self.routes
+            .iter()
+            .map(|route| RouteInfo {
+                method: route.method.clone(),
+                path: render_pattern(&route.pattern),
+            })
+            .collect()
+    }
+
     /// Returns the distinct concrete methods registered for routes whose
     /// pattern matches `path` (ignoring the request method), in registration
     /// order. Used to build the `Allow` header for 405/OPTIONS responses.
@@ -353,6 +365,38 @@ pub(crate) fn allow_header_value(allowed: &[String]) -> String {
         methods.push("OPTIONS".to_string());
     }
     methods.join(", ")
+}
+
+/// One entry of a route listing, as returned by [`Router::routes`] /
+/// `App::routes`: the HTTP method (`*` for `all()` routes) and the route
+/// pattern with `:param` / `*wildcard` placeholders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteInfo {
+    pub method: String,
+    pub path: String,
+}
+
+/// Renders a parsed pattern back to its `/users/:id` string form.
+fn render_pattern(pattern: &[Segment]) -> String {
+    if pattern.is_empty() {
+        return "/".to_string();
+    }
+    let mut out = String::new();
+    for segment in pattern {
+        out.push('/');
+        match segment {
+            Segment::Static(s) => out.push_str(s),
+            Segment::Param(name) => {
+                out.push(':');
+                out.push_str(name);
+            }
+            Segment::Wildcard(name) => {
+                out.push('*');
+                out.push_str(name);
+            }
+        }
+    }
+    out
 }
 
 /// A handle to a just-registered route, returned by the route methods so that

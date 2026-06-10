@@ -997,6 +997,69 @@ async fn router_prefers_exact_method_over_all_on_same_path() {
 }
 
 #[test]
+fn app_lists_registered_routes_for_introspection() {
+    let mut app = App::new();
+    app.get("/", |_r: Request| Response::send("root"));
+    app.post("/users", |_r: Request| Response::send("create"));
+    app.get("/users/:id", |_r: Request| Response::send("show"));
+    let mut files = Router::new();
+    files.get("/*path", |_r: Request| Response::send("file"));
+    app.mount("/files", files);
+
+    let listed: Vec<(String, String)> = app
+        .routes()
+        .iter()
+        .map(|route| (route.method.clone(), route.path.clone()))
+        .collect();
+
+    assert!(listed.contains(&("GET".to_string(), "/".to_string())));
+    assert!(listed.contains(&("POST".to_string(), "/users".to_string())));
+    assert!(listed.contains(&("GET".to_string(), "/users/:id".to_string())));
+    assert!(listed.contains(&("GET".to_string(), "/files/*path".to_string())));
+}
+
+#[tokio::test]
+async fn trailing_slash_policy_controls_non_canonical_paths() {
+    // Default (Ignore): a trailing slash still matches.
+    let mut app = App::new();
+    app.get("/users", |_r: Request| Response::send("list"));
+    let res = app.dispatch(request_with_method("GET", "/users/")).await;
+    assert_eq!(res.status, 200);
+
+    // Strict: non-canonical paths 404; canonical ones and "/" are untouched.
+    let mut app = App::new();
+    app.trailing_slash(TrailingSlash::Strict);
+    app.get("/users", |_r: Request| Response::send("list"));
+    app.get("/", |_r: Request| Response::send("root"));
+    assert_eq!(
+        app.dispatch(request_with_method("GET", "/users/"))
+            .await
+            .status,
+        404
+    );
+    assert_eq!(
+        app.dispatch(request_with_method("GET", "/users"))
+            .await
+            .status,
+        200
+    );
+    assert_eq!(
+        app.dispatch(request_with_method("GET", "/")).await.status,
+        200
+    );
+
+    // Redirect: 308 to the canonical path, preserving the query string.
+    let mut app = App::new();
+    app.trailing_slash(TrailingSlash::Redirect);
+    app.get("/users", |_r: Request| Response::send("list"));
+    let mut req = request_with_method("GET", "/users/");
+    req.raw_query = Some("page=2".to_string());
+    let res = app.dispatch(req).await;
+    assert_eq!(res.status, 308);
+    assert_eq!(res.headers.get("location").unwrap(), "/users?page=2");
+}
+
+#[test]
 fn router_index_refreshes_after_mount() {
     let mut root = Router::new();
     // Force a lookup (and any lazy index build) before mounting.

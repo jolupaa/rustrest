@@ -28,7 +28,7 @@ pub use app::{
     App, Cookie, Cookies, ErrorHandler, Form, FromRequest, Handler, Headers, HttpError,
     IntoHandler, IntoHttpError, IntoMiddleware, IntoResponse, IntoWebSocketHandler, Json,
     Middleware, MultipartPart, Next, Path, Query, Request, RequestBuilder, Response, RouteHandle,
-    Router, SameSite, Sessions, SseEvent, State, StateStore, TestClient, TestRequest, WebSocket,
-    WebSocketError, WebSocketEvent, WebSocketHandler, WebSocketMessage, middleware, sign_value,
-    verify_value,
+    RouteInfo, Router, SameSite, Sessions, SseEvent, State, StateStore, TestClient, TestRequest,
+    TrailingSlash, WebSocket, WebSocketError, WebSocketEvent, WebSocketHandler, WebSocketMessage,
+    middleware, sign_value, verify_value,
 };

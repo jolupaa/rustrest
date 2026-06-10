@@ -29,12 +29,28 @@ use super::{
 /// Default maximum request body we will buffer into memory (64 KB).
 const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
 
+/// How request paths with a trailing slash (`/users/`) are treated relative
+/// to the canonical, slash-less route (`/users`). The root path `/` is always
+/// canonical.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TrailingSlash {
+    /// Trailing slashes are ignored: `/users/` matches `/users` (default).
+    #[default]
+    Ignore,
+    /// Non-canonical paths do not match anything and fall through to 404.
+    Strict,
+    /// Non-canonical paths get a `308 Permanent Redirect` to the canonical
+    /// path, preserving the query string.
+    Redirect,
+}
+
 /// Server-wide limits and timeouts, configured via builder methods on [`App`].
 #[derive(Clone, Copy)]
 pub struct ServerConfig {
     pub(crate) max_body_size: usize,
     pub(crate) request_timeout: Option<Duration>,
     pub(crate) header_read_timeout: Option<Duration>,
+    pub(crate) trailing_slash: TrailingSlash,
 }
 
 impl Default for ServerConfig {
@@ -43,6 +59,7 @@ impl Default for ServerConfig {
             max_body_size: DEFAULT_MAX_BODY_BYTES,
             request_timeout: None,
             header_read_timeout: None,
+            trailing_slash: TrailingSlash::default(),
         }
     }
 }
@@ -109,6 +126,25 @@ impl App {
     pub fn header_read_timeout(&mut self, timeout: Duration) -> &mut Self {
         self.config.header_read_timeout = Some(timeout);
         self
+    }
+
+    /// Sets the trailing-slash policy (default: [`TrailingSlash::Ignore`]).
+    pub fn trailing_slash(&mut self, policy: TrailingSlash) -> &mut Self {
+        self.config.trailing_slash = policy;
+        self
+    }
+
+    /// Lists every registered route in registration order (see
+    /// [`Router::routes`]).
+    pub fn routes(&self) -> Vec<super::RouteInfo> {
+        self.router.routes()
+    }
+
+    /// Prints the registered routes, one per line, method first.
+    pub fn print_routes(&self) {
+        for route in self.routes() {
+            println!("{:<7} {}", route.method, route.path);
+        }
     }
 
     pub fn get<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
@@ -443,16 +479,45 @@ impl App {
         }
     }
 
+    /// Applies the trailing-slash policy to a non-canonical request path,
+    /// returning the substitute handler (404 or 308 redirect) that should run
+    /// through the middleware onion instead of route lookup.
+    fn trailing_slash_miss(&self, request: &Request) -> Option<Handler> {
+        if request.path.len() <= 1 || !request.path.ends_with('/') {
+            return None;
+        }
+        match self.config.trailing_slash {
+            TrailingSlash::Ignore => None,
+            TrailingSlash::Strict => Some(not_found_handler()),
+            TrailingSlash::Redirect => {
+                let mut location = request.path.trim_end_matches('/').to_string();
+                if location.is_empty() {
+                    location.push('/');
+                }
+                if let Some(query) = &request.raw_query {
+                    location.push('?');
+                    location.push_str(query);
+                }
+                Some(Arc::new(move |_req| {
+                    let location = location.clone();
+                    Box::pin(async move { Response::redirect_with_status(&location, 308) })
+                }))
+            }
+        }
+    }
+
     /// Routes the request (capturing path params), then runs it through the
     /// middleware onion ending at the matched handler (or a 404 handler).
     pub(crate) async fn dispatch(&self, mut request: Request) -> Response {
         request.state = self.state.clone();
         let is_head = request.method == "HEAD";
-        let (handler, route_middlewares, params) =
-            match self.router.route(&request.method, &request.path) {
+        let (handler, route_middlewares, params) = match self.trailing_slash_miss(&request) {
+            Some(handler) => (handler, Vec::new(), HashMap::new()),
+            None => match self.router.route(&request.method, &request.path) {
                 Some(found) => found,
                 None => self.resolve_miss(&request.method, &request.path),
-            };
+            },
+        };
         request.params = params;
 
         // Innermost layer: the matched handler.
