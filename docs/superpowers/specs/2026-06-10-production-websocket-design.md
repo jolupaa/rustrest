@@ -299,7 +299,7 @@ When `serve_with_shutdown` or its TLS equivalent receives the shutdown signal:
 
 1. The listener stops accepting new TCP connections.
 2. The runtime rejects pending upgrade attempts with 503.
-3. Every active WebSocket receives Close 1001 with reason `server shutdown`.
+3. Every active WebSocket receives Close 1001 with reason `apagado del servidor`.
 4. Drivers wait for peers until the configured WebSocket shutdown grace
    period expires.
 5. Remaining driver and handler tasks are aborted.
@@ -400,6 +400,8 @@ code.
 Optional lifecycle hooks cover connect, close, and error. A per-message hook
 receives metadata only, not payloads. Hooks cannot mutate protocol state and
 must not run on the driver's critical polling path if they can block.
+These hooks are delivered through `WebSocketObserver`; there is no second
+callback registry with separate ordering or failure semantics.
 
 ## Broker Extensibility
 
@@ -552,6 +554,11 @@ config.validate()?;
 
 `OriginPolicy` provides `any`, `same_host`, and `allow` constructors plus a
 builder controlling whether a missing `Origin` is accepted.
+
+Optional App defaults can be explicitly disabled per route with
+`disable_ping`, `disable_idle_timeout`, `disable_max_connection_lifetime`,
+`disable_max_connections_per_ip`, and `disable_message_rate_limit`. An unset
+route option inherits; a disabled option does not.
 
 `listen`, `serve`, and their TLS variants validate every registered WebSocket
 configuration before accepting connections and return `io::ErrorKind::InvalidInput`
@@ -778,6 +785,16 @@ pub enum WsBrokerTarget {
 pub enum WsBrokerPayload {
     Text(String),
     Binary(Bytes),
+}
+
+impl WsNodeId {
+    pub const fn new(value: u64) -> Self;
+    pub const fn get(self) -> u64;
+}
+
+impl WsPublicationId {
+    pub const fn new(value: u64) -> Self;
+    pub const fn get(self) -> u64;
 }
 ```
 
