@@ -214,6 +214,51 @@ async fn trace_middleware_emits_events_and_passes_response_through() {
 }
 
 #[tokio::test]
+async fn etag_middleware_sets_validator_and_answers_304() {
+    let mut app = App::new();
+    app.layer(middleware::etag());
+    app.get("/doc", |_r: Request| Response::send("contenido estable"));
+
+    let client = TestClient::new(app);
+
+    let first = client.get("/doc").send().await;
+    assert_eq!(first.status, 200);
+    let tag = first
+        .headers
+        .get("etag")
+        .expect("etag set")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        tag.starts_with('"') && tag.ends_with('"'),
+        "strong quoted etag, got {tag}"
+    );
+
+    // A matching validator gets 304 with no body but the ETag preserved.
+    let revalidated = client
+        .get("/doc")
+        .header("if-none-match", &tag)
+        .send()
+        .await;
+    assert_eq!(revalidated.status, 304);
+    assert_eq!(revalidated.body_text(), "");
+    assert_eq!(
+        revalidated.headers.get("etag").unwrap().to_str().unwrap(),
+        tag
+    );
+
+    // A stale validator gets the full response again.
+    let stale = client
+        .get("/doc")
+        .header("if-none-match", "\"nope\"")
+        .send()
+        .await;
+    assert_eq!(stale.status, 200);
+    assert_eq!(stale.body_text(), "contenido estable");
+}
+
+#[tokio::test]
 async fn timeout_middleware_cuts_off_slow_handlers() {
     let mut app = App::new();
     app.get("/slow", |_r: Request| async {

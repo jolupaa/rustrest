@@ -241,6 +241,66 @@ pub fn compression_with_min_size(min_size: usize) -> Middleware {
     })
 }
 
+/// Strong-ETag validation for buffered 200 responses: hashes the body
+/// (SHA-1), sets `ETag` when the handler did not set one, and answers a
+/// matching `If-None-Match` on GET/HEAD with `304 Not Modified` (headers
+/// kept, body dropped). Streaming bodies and non-200 responses pass through
+/// untouched.
+pub fn etag() -> Middleware {
+    Arc::new(|req: Request, next: Next| {
+        let if_none_match = matches!(req.method.as_str(), "GET" | "HEAD")
+            .then(|| req.header("if-none-match").map(str::to_string))
+            .flatten();
+        Box::pin(async move {
+            let mut res = next(req).await;
+            if res.status != 200 {
+                return res;
+            }
+            let tag = match res
+                .headers
+                .get("etag")
+                .and_then(|value| value.to_str().ok())
+            {
+                Some(existing) => existing.to_string(),
+                None => {
+                    let Some(body) = res.body_bytes() else {
+                        return res;
+                    };
+                    if body.is_empty() {
+                        return res;
+                    }
+                    let tag = format!("\"{}\"", sha1_hex(body));
+                    res = res.header("etag", &tag);
+                    tag
+                }
+            };
+            let revalidated = if_none_match.is_some_and(|raw| {
+                raw.split(',').any(|candidate| {
+                    let candidate = candidate.trim().trim_start_matches("W/");
+                    candidate == "*" || candidate == tag
+                })
+            });
+            if revalidated {
+                res.clear_body();
+                res = res.status(304);
+            }
+            res
+        })
+    })
+}
+
+fn sha1_hex(data: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    use sha1::{Digest, Sha1};
+    let digest = Sha1::digest(data);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(out, "{:02x}", byte);
+    }
+    out
+}
+
 /// Cuts off everything it wraps (handler plus inner middleware) after
 /// `duration`, answering `408 Request Timeout` (formatted by the app's error
 /// handler when one is registered). Scope it per route or per router to give
