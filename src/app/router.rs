@@ -38,6 +38,16 @@ struct Route {
     pattern: Vec<Segment>,
     handler: Handler,
     middlewares: Vec<Middleware>,
+    meta: RouteMeta,
+}
+
+/// Optional documentation attached to a route via [`RouteHandle`], surfaced
+/// in [`RouteInfo`] and the generated OpenAPI document.
+#[derive(Clone, Default)]
+pub(crate) struct RouteMeta {
+    summary: Option<String>,
+    description: Option<String>,
+    tags: Vec<String>,
 }
 
 /// Splits a path into non-empty segments (trailing/duplicate slashes ignored).
@@ -252,6 +262,7 @@ impl Router {
             pattern: parse_pattern(path),
             handler: handler.into_handler(),
             middlewares: Vec::new(),
+            meta: RouteMeta::default(),
         });
         self.index.take();
         let index = self.routes.len() - 1;
@@ -274,6 +285,7 @@ impl Router {
             pattern: parse_pattern(path),
             handler,
             middlewares: Vec::new(),
+            meta: RouteMeta::default(),
         });
         self.index.take();
     }
@@ -297,6 +309,7 @@ impl Router {
                 pattern,
                 handler: route.handler,
                 middlewares,
+                meta: route.meta,
             });
         }
         self.index.take();
@@ -333,6 +346,9 @@ impl Router {
             .map(|route| RouteInfo {
                 method: route.method.clone(),
                 path: render_pattern(&route.pattern),
+                summary: route.meta.summary.clone(),
+                description: route.meta.description.clone(),
+                tags: route.meta.tags.clone(),
             })
             .collect()
     }
@@ -368,12 +384,16 @@ pub(crate) fn allow_header_value(allowed: &[String]) -> String {
 }
 
 /// One entry of a route listing, as returned by [`Router::routes`] /
-/// `App::routes`: the HTTP method (`*` for `all()` routes) and the route
-/// pattern with `:param` / `*wildcard` placeholders.
+/// `App::routes`: the HTTP method (`*` for `all()` routes), the route pattern
+/// with `:param` / `*wildcard` placeholders, and any documentation attached
+/// through [`RouteHandle`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteInfo {
     pub method: String,
     pub path: String,
+    pub summary: Option<String>,
+    pub description: Option<String>,
+    pub tags: Vec<String>,
 }
 
 /// Renders a parsed pattern back to its `/users/:id` string form.
@@ -414,6 +434,27 @@ impl RouteHandle<'_> {
         self.router.routes[self.index]
             .middlewares
             .push(middleware.into_middleware());
+        self
+    }
+
+    /// Sets a one-line summary for this route (route listings + OpenAPI).
+    pub fn summary(self, summary: &str) -> Self {
+        self.router.routes[self.index].meta.summary = Some(summary.to_string());
+        self
+    }
+
+    /// Sets a longer description for this route (OpenAPI).
+    pub fn description(self, description: &str) -> Self {
+        self.router.routes[self.index].meta.description = Some(description.to_string());
+        self
+    }
+
+    /// Adds a tag to this route (repeatable; groups operations in OpenAPI).
+    pub fn tag(self, tag: &str) -> Self {
+        self.router.routes[self.index]
+            .meta
+            .tags
+            .push(tag.to_string());
         self
     }
 }

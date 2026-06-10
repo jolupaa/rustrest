@@ -10,6 +10,7 @@ mod extract;
 mod form;
 mod handler;
 pub mod middleware;
+mod openapi;
 mod request;
 mod response;
 mod router;

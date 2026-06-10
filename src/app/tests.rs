@@ -1155,6 +1155,46 @@ async fn trailing_slash_policy_controls_non_canonical_paths() {
     assert_eq!(res.headers.get("location").unwrap(), "/users?page=2");
 }
 
+#[tokio::test]
+async fn openapi_document_and_docs_routes_are_served() {
+    let mut app = App::new();
+    app.get("/users", |_r: Request| Response::send("list"))
+        .summary("Lista usuarios")
+        .tag("users");
+    app.post("/users", |_r: Request| Response::send("create"));
+    app.get("/users/:id", |_r: Request| Response::send("show"));
+    app.all("/health", |_r: Request| Response::send("ok"));
+    app.serve_docs("/docs", "Mi API", "0.2.0");
+
+    let doc = app.openapi("Mi API", "0.2.0");
+    assert_eq!(doc["openapi"], "3.0.3");
+    assert_eq!(doc["info"]["title"], "Mi API");
+    assert_eq!(doc["info"]["version"], "0.2.0");
+    assert!(doc["paths"]["/users"]["get"].is_object());
+    assert!(doc["paths"]["/users"]["post"].is_object());
+    assert_eq!(doc["paths"]["/users"]["get"]["summary"], "Lista usuarios");
+    assert_eq!(doc["paths"]["/users"]["get"]["tags"][0], "users");
+    let param = &doc["paths"]["/users/{id}"]["get"]["parameters"][0];
+    assert_eq!(param["name"], "id");
+    assert_eq!(param["in"], "path");
+    assert_eq!(param["required"], true);
+    // `all()` routes have no single HTTP method and are not listed.
+    assert!(doc["paths"]["/health"].is_null());
+
+    let client = TestClient::new(app);
+
+    let spec = client.get("/docs/openapi.json").send().await;
+    assert_eq!(spec.status, 200);
+    assert_eq!(spec.content_type, "application/json");
+    let body: serde_json::Value = serde_json::from_slice(spec.body_bytes().unwrap()).unwrap();
+    assert!(body["paths"]["/users/{id}"]["get"].is_object());
+
+    let ui = client.get("/docs").send().await;
+    assert_eq!(ui.status, 200);
+    assert!(ui.content_type.starts_with("text/html"));
+    assert!(ui.body_text().contains("/docs/openapi.json"));
+}
+
 #[test]
 fn router_index_refreshes_after_mount() {
     let mut root = Router::new();

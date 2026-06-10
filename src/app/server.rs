@@ -147,6 +147,27 @@ impl App {
         }
     }
 
+    /// Builds an OpenAPI 3.0 document (as JSON) describing the routes
+    /// registered so far. See [`App::serve_docs`] for serving it.
+    pub fn openapi(&self, title: &str, version: &str) -> serde_json::Value {
+        super::openapi::build_document(title, version, &self.routes())
+    }
+
+    /// Registers `GET {prefix}/openapi.json` (the OpenAPI document) and
+    /// `GET {prefix}` (Swagger UI reading it). The document is a snapshot of
+    /// the routes registered so far — call this after registering them.
+    pub fn serve_docs(&mut self, prefix: &str, title: &str, version: &str) {
+        let prefix = format!("/{}", prefix.trim_matches('/'));
+        let spec_url = format!("{}/openapi.json", prefix.trim_end_matches('/'));
+        let document = self.openapi(title, version);
+        let html = super::openapi::swagger_ui_html(title, &spec_url);
+
+        self.get(&spec_url, move |_req: Request| Response::json(&document));
+        self.get(&prefix, move |_req: Request| {
+            Response::send(html.as_str()).content_type("text/html; charset=utf-8")
+        });
+    }
+
     pub fn get<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
     where
         H: IntoHandler<M>,
