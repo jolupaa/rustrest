@@ -13,6 +13,7 @@ use super::{FromRequest, HttpError, StateStore};
 /// handler-facing API; some demo handlers ignore them.
 #[allow(dead_code)]
 pub struct Request {
+    pub(crate) version: hyper::Version,
     pub method: String,
     pub path: String,
     /// Raw query string, if any: `/users?id=1` -> `Some("id=1")`.
@@ -26,9 +27,11 @@ pub struct Request {
     /// Captured path parameters, e.g. `/users/:id` matching `/users/42`
     /// yields `{"id": "42"}`.
     pub params: HashMap<String, String>,
+    pub(crate) route_pattern: Option<String>,
     pub(crate) state: StateStore,
     pub(crate) upgrade: Option<OnUpgrade>,
     pub(crate) remote_addr: Option<SocketAddr>,
+    pub(crate) secure_transport: bool,
     /// All inbound header (lowercased-name, value) pairs in arrival order,
     /// preserving duplicates that the convenience `headers` map collapses.
     pub(crate) header_pairs: Vec<(String, String)>,
@@ -100,6 +103,20 @@ impl Request {
         self.remote_addr
     }
 
+    /// Returns the HTTP version used by the client request.
+    pub fn version(&self) -> hyper::Version {
+        self.version
+    }
+
+    /// Returns whether the request arrived over a secure transport.
+    pub fn is_secure(&self) -> bool {
+        self.secure_transport
+    }
+
+    pub(crate) fn route_pattern(&self) -> Option<&str> {
+        self.route_pattern.as_deref()
+    }
+
     /// Returns shared application state by type.
     pub fn state<T>(&self) -> Option<std::sync::Arc<T>>
     where
@@ -116,16 +133,17 @@ impl Request {
     }
 
     pub fn is_websocket_upgrade(&self) -> bool {
-        self.method.eq_ignore_ascii_case("GET")
-            && self
-                .header("upgrade")
-                .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
-            && self.header("connection").is_some_and(|value| {
-                value
-                    .split(',')
-                    .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+        self.version == hyper::Version::HTTP_11
+            && self.method.eq_ignore_ascii_case("GET")
+            && self.header("upgrade").is_some_and(|value| {
+                super::websocket::header_value_contains_token(value, "websocket")
             })
-            && self.header(SEC_WEBSOCKET_KEY.as_str()).is_some()
+            && self.header("connection").is_some_and(|value| {
+                super::websocket::header_value_contains_token(value, "upgrade")
+            })
+            && self
+                .header(SEC_WEBSOCKET_KEY.as_str())
+                .is_some_and(super::websocket::is_valid_websocket_key)
             && self.header(SEC_WEBSOCKET_VERSION.as_str()) == Some("13")
     }
 
@@ -149,6 +167,7 @@ impl Request {
 /// how the real server normalizes them; a path given as `/x?a=1` is split into
 /// path + query automatically.
 pub struct RequestBuilder {
+    version: hyper::Version,
     method: String,
     path: String,
     raw_query: Option<String>,
@@ -158,11 +177,13 @@ pub struct RequestBuilder {
     state: StateStore,
     body: Bytes,
     remote_addr: Option<SocketAddr>,
+    secure_transport: bool,
 }
 
 impl RequestBuilder {
     pub fn new() -> Self {
         Self {
+            version: hyper::Version::HTTP_11,
             method: "GET".to_string(),
             path: "/".to_string(),
             raw_query: None,
@@ -172,6 +193,7 @@ impl RequestBuilder {
             state: StateStore::default(),
             body: Bytes::new(),
             remote_addr: None,
+            secure_transport: false,
         }
     }
 
@@ -241,6 +263,11 @@ impl RequestBuilder {
         self
     }
 
+    pub fn secure(mut self, secure: bool) -> Self {
+        self.secure_transport = secure;
+        self
+    }
+
     pub fn build(self) -> Request {
         let query = self
             .raw_query
@@ -259,6 +286,7 @@ impl RequestBuilder {
         }
 
         Request {
+            version: self.version,
             method: self.method,
             path: self.path,
             raw_query: self.raw_query,
@@ -267,9 +295,11 @@ impl RequestBuilder {
             cookies,
             body: self.body,
             params: self.params,
+            route_pattern: None,
             state: self.state,
             upgrade: None,
             remote_addr: self.remote_addr,
+            secure_transport: self.secure_transport,
             header_pairs: self.headers,
         }
     }

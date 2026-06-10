@@ -41,6 +41,13 @@ struct Route {
     meta: RouteMeta,
 }
 
+pub(crate) struct MatchedRoute {
+    pub handler: Handler,
+    pub middlewares: Vec<Middleware>,
+    pub params: HashMap<String, String>,
+    pub pattern: String,
+}
+
 /// Optional documentation attached to a route via [`RouteHandle`], surfaced
 /// in [`RouteInfo`] and the generated OpenAPI document.
 #[derive(Clone, Default)]
@@ -335,21 +342,18 @@ impl Router {
     /// which beat trailing `*wildcards` (backtracking across branches); on the
     /// same path an exact-method route beats an `all()` route; remaining ties
     /// go to the first-registered route.
-    pub(crate) fn route(
-        &self,
-        method: &str,
-        path: &str,
-    ) -> Option<(Handler, Vec<Middleware>, HashMap<String, String>)> {
+    pub(crate) fn route(&self, method: &str, path: &str) -> Option<MatchedRoute> {
         let segments = path_segments(path);
         let route = &self.routes[self.index().find(method, &segments)?];
         // The index only returns routes whose pattern matches these segments,
         // so the capture pass cannot fail.
         let params = match_pattern(&route.pattern, &segments)?;
-        Some((
-            Arc::clone(&route.handler),
-            route.middlewares.clone(),
+        Some(MatchedRoute {
+            handler: Arc::clone(&route.handler),
+            middlewares: route.middlewares.clone(),
             params,
-        ))
+            pattern: render_pattern(&route.pattern),
+        })
     }
 
     /// Lists every registered route (method + pattern) in registration order,

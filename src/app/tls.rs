@@ -20,6 +20,7 @@ use tokio_rustls::TlsAcceptor;
 pub use tokio_rustls::rustls::ServerConfig;
 
 use super::App;
+use super::server::TransportSecurity;
 
 /// Builds a rustls [`ServerConfig`] from PEM certificate-chain and private-key
 /// files, with ALPN advertising HTTP/2 and HTTP/1.1.
@@ -99,18 +100,20 @@ impl App {
                 match acceptor.accept(stream).await {
                     Ok(tls_stream) => {
                         let io = TokioIo::new(tls_stream);
-                        let connection =
-                            builder
-                                .serve_connection_with_upgrades(
-                                    io,
-                                    service_fn(move |req: hyper::Request<Incoming>| {
-                                        let app = Arc::clone(&app);
-                                        async move {
-                                            Ok::<_, Infallible>(app.handle(req, Some(peer)).await)
-                                        }
-                                    }),
-                                )
-                                .into_owned();
+                        let connection = builder
+                            .serve_connection_with_upgrades(
+                                io,
+                                service_fn(move |req: hyper::Request<Incoming>| {
+                                    let app = Arc::clone(&app);
+                                    async move {
+                                        Ok::<_, Infallible>(
+                                            app.handle(req, Some(peer), TransportSecurity::Tls)
+                                                .await,
+                                        )
+                                    }
+                                }),
+                            )
+                            .into_owned();
                         if let Err(err) = watcher.watch(connection).await {
                             eprintln!("Error serving TLS connection: {:?}", err);
                         }

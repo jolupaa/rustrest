@@ -5,6 +5,7 @@ mod socket;
 mod tests;
 mod types;
 
+use base64::Engine;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use tokio_tungstenite::WebSocketStream;
@@ -20,6 +21,151 @@ pub use socket::{
 };
 pub use types::WebSocketErrorCategory;
 
+pub(crate) struct HandshakeRejection {
+    status: u16,
+    message: &'static str,
+    headers: Vec<(&'static str, &'static str)>,
+}
+
+impl HandshakeRejection {
+    fn new(status: u16, message: &'static str) -> Self {
+        Self {
+            status,
+            message,
+            headers: Vec::new(),
+        }
+    }
+
+    fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
+        self.headers.push((name, value));
+        self
+    }
+
+    fn into_response(self) -> Response {
+        self.headers.into_iter().fold(
+            Response::send(self.message).status(self.status),
+            |response, (name, value)| response.header(name, value),
+        )
+    }
+
+    pub(crate) fn into_http_error(self) -> HttpError {
+        HttpError::new(self.status, self.message)
+    }
+}
+
+pub(crate) fn header_value_contains_token(value: &str, expected: &str) -> bool {
+    value
+        .split(',')
+        .any(|token| token.trim().eq_ignore_ascii_case(expected))
+}
+
+pub(crate) fn is_valid_websocket_key(value: &str) -> bool {
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .is_ok_and(|decoded| decoded.len() == 16)
+}
+
+fn request_header_contains_token(req: &Request, name: &str, expected: &str) -> bool {
+    req.headers_all(name)
+        .into_iter()
+        .any(|value| header_value_contains_token(value, expected))
+        || req
+            .header(name)
+            .is_some_and(|value| header_value_contains_token(value, expected))
+}
+
+fn negotiate_protocol(req: &Request, protocols: &[String]) -> Option<String> {
+    for raw in req.headers_all("sec-websocket-protocol") {
+        for candidate in raw.split(',') {
+            let candidate = candidate.trim();
+            if protocols
+                .iter()
+                .any(|supported| supported.eq_ignore_ascii_case(candidate))
+            {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+
+    req.header("sec-websocket-protocol").and_then(|raw| {
+        raw.split(',').find_map(|candidate| {
+            let candidate = candidate.trim();
+            protocols
+                .iter()
+                .any(|supported| supported.eq_ignore_ascii_case(candidate))
+                .then(|| candidate.to_string())
+        })
+    })
+}
+
+pub(crate) fn validate_handshake(
+    req: &Request,
+    config: &ResolvedWebSocketConfig,
+) -> Result<Option<String>, HandshakeRejection> {
+    if req.version() != hyper::Version::HTTP_11 {
+        return Err(HandshakeRejection::new(
+            400,
+            "La actualizacion WebSocket requiere HTTP/1.1",
+        ));
+    }
+    if !req.method.eq_ignore_ascii_case("GET") {
+        return Err(HandshakeRejection::new(
+            400,
+            "La actualizacion WebSocket requiere el metodo GET",
+        ));
+    }
+    if !request_header_contains_token(req, "upgrade", "websocket") {
+        return Err(HandshakeRejection::new(
+            400,
+            "La cabecera Upgrade debe incluir websocket",
+        ));
+    }
+    if !request_header_contains_token(req, "connection", "upgrade") {
+        return Err(HandshakeRejection::new(
+            400,
+            "La cabecera Connection debe incluir Upgrade",
+        ));
+    }
+    if req
+        .header("sec-websocket-version")
+        .is_none_or(|version| version.trim() != "13")
+    {
+        return Err(
+            HandshakeRejection::new(426, "La version WebSocket debe ser 13")
+                .with_header("sec-websocket-version", "13"),
+        );
+    }
+    if req
+        .header("sec-websocket-key")
+        .is_none_or(|key| !is_valid_websocket_key(key))
+    {
+        return Err(HandshakeRejection::new(
+            400,
+            "Sec-WebSocket-Key debe codificar exactamente 16 bytes",
+        ));
+    }
+    if !config.origin_policy.allows_for_transport(
+        req.header("origin"),
+        req.header("host").unwrap_or(""),
+        req.is_secure(),
+    ) {
+        return Err(HandshakeRejection::new(
+            403,
+            "El origen WebSocket no esta permitido",
+        ));
+    }
+
+    let protocol = negotiate_protocol(req, &config.protocols);
+    if config.require_protocol && protocol.is_none() {
+        return Err(HandshakeRejection::new(
+            400,
+            "Se requiere un subprotocolo WebSocket compatible",
+        ));
+    }
+
+    Ok(protocol)
+}
+
 impl Request {
     pub fn websocket<H>(self, handler: H) -> Response
     where
@@ -34,7 +180,13 @@ impl Request {
     where
         H: IntoWebSocketHandler,
     {
-        match self.into_websocket_response(config, handler.into_websocket_handler()) {
+        let config = ResolvedWebSocketConfig::from_layers(&WebSocketConfig::default(), &config);
+        let protocol = match validate_handshake(&self, &config) {
+            Ok(protocol) => protocol,
+            Err(rejection) => return rejection.into_response(),
+        };
+
+        match self.into_websocket_response(config, protocol, handler.into_websocket_handler()) {
             Ok(response) => response,
             Err(err) => Response::from_error(err),
         }
@@ -42,17 +194,17 @@ impl Request {
 
     fn into_websocket_response(
         self,
-        config: WebSocketConfig,
+        config: ResolvedWebSocketConfig,
+        protocol: Option<String>,
         handler: WebSocketHandler,
     ) -> Result<Response, HttpError> {
-        let protocol = config.negotiate(&self);
         let mut response = Response::websocket(&self)?;
         if let Some(protocol) = &protocol {
             response = response.header("sec-websocket-protocol", protocol);
         }
-        let upgrade = self
-            .upgrade
-            .ok_or_else(|| HttpError::bad_request("WebSocket upgrade is not available"))?;
+        let upgrade = self.upgrade.ok_or_else(|| {
+            HttpError::bad_request("La actualizacion WebSocket no esta disponible")
+        })?;
         spawn_websocket(upgrade, config, protocol, handler);
         Ok(response)
     }
@@ -60,11 +212,10 @@ impl Request {
 
 fn spawn_websocket(
     upgrade: OnUpgrade,
-    config: WebSocketConfig,
+    config: ResolvedWebSocketConfig,
     protocol: Option<String>,
     handler: WebSocketHandler,
 ) {
-    let config = ResolvedWebSocketConfig::from_layers(&WebSocketConfig::default(), &config);
     tokio::spawn(async move {
         match upgrade.await {
             Ok(upgraded) => {

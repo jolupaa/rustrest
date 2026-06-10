@@ -83,13 +83,40 @@ impl OriginPolicy {
             return false;
         };
 
+        let host_default_port = origin.scheme.default_port();
+        self.allows_normalized(origin, host, host_default_port)
+    }
+
+    pub(crate) fn allows_for_transport(
+        &self,
+        origin: Option<&str>,
+        host: &str,
+        secure_transport: bool,
+    ) -> bool {
+        let Some(origin) = origin else {
+            return self.allows_missing();
+        };
+        let Some(origin) = NormalizedOrigin::parse(origin) else {
+            return false;
+        };
+
+        let host_default_port = if secure_transport { 443 } else { 80 };
+        self.allows_normalized(origin, host, host_default_port)
+    }
+
+    fn allows_normalized(
+        &self,
+        origin: NormalizedOrigin,
+        host: &str,
+        host_default_port: u16,
+    ) -> bool {
         match self {
             Self::Any { .. } => true,
-            Self::SameHost { .. } => {
-                normalize_host(host, origin.scheme).is_some_and(|(expected_host, expected_port)| {
+            Self::SameHost { .. } => normalize_host(host, host_default_port).is_some_and(
+                |(expected_host, expected_port)| {
                     expected_host == origin.host && expected_port == origin.port
-                })
-            }
+                },
+            ),
             Self::AllowList { origins, .. } => origins.iter().any(|allowed| {
                 NormalizedOrigin::parse(allowed).is_some_and(|allowed| allowed == origin)
             }),
@@ -137,15 +164,6 @@ impl OriginScheme {
         }
     }
 
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Http => "http",
-            Self::Https => "https",
-            Self::Ws => "ws",
-            Self::Wss => "wss",
-        }
-    }
-
     fn default_port(self) -> u16 {
         match self {
             Self::Http | Self::Ws => 80,
@@ -182,15 +200,13 @@ impl NormalizedOrigin {
         Some(Self {
             scheme,
             host: host.to_ascii_lowercase(),
-            port: effective_port(authority, scheme)?,
+            port: effective_port(authority, scheme.default_port())?,
         })
     }
 }
 
-fn normalize_host(host: &str, scheme: OriginScheme) -> Option<(String, u16)> {
-    let uri = format!("{}://{host}", scheme.as_str())
-        .parse::<Uri>()
-        .ok()?;
+fn normalize_host(host: &str, default_port: u16) -> Option<(String, u16)> {
+    let uri = format!("http://{host}").parse::<Uri>().ok()?;
     let authority = uri.authority()?;
     if authority.as_str().contains('@') {
         return None;
@@ -206,11 +222,11 @@ fn normalize_host(host: &str, scheme: OriginScheme) -> Option<(String, u16)> {
     }
     Some((
         host.to_ascii_lowercase(),
-        effective_port(authority, scheme)?,
+        effective_port(authority, default_port)?,
     ))
 }
 
-fn effective_port(authority: &Authority, scheme: OriginScheme) -> Option<u16> {
+fn effective_port(authority: &Authority, default_port: u16) -> Option<u16> {
     if let Some(port) = authority.port_u16() {
         return Some(port);
     }
@@ -221,7 +237,7 @@ fn effective_port(authority: &Authority, scheme: OriginScheme) -> Option<u16> {
     } else {
         raw.contains(':')
     };
-    (!has_explicit_port).then(|| scheme.default_port())
+    (!has_explicit_port).then_some(default_port)
 }
 
 #[derive(Clone, Debug)]
@@ -414,18 +430,7 @@ impl WebSocketConfig {
     /// Picks the first client-offered subprotocol the server supports.
     pub(super) fn negotiate(&self, req: &Request) -> Option<String> {
         let protocols = self.protocols.as_deref().unwrap_or_default();
-        for raw in req.headers_all("sec-websocket-protocol") {
-            for candidate in raw.split(',') {
-                let candidate = candidate.trim();
-                if protocols
-                    .iter()
-                    .any(|supported| supported.eq_ignore_ascii_case(candidate))
-                {
-                    return Some(candidate.to_string());
-                }
-            }
-        }
-        None
+        super::negotiate_protocol(req, protocols)
     }
 }
 

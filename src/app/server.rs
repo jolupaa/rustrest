@@ -17,6 +17,8 @@ use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::{TcpListener, ToSocketAddrs};
 
+use super::router::MatchedRoute;
+use super::websocket::{header_value_contains_token, is_valid_websocket_key};
 use super::{
     ErrorHandler, HttpError, IntoHandler, IntoMiddleware, Middleware, Next, Request, Response,
     RouteHandle, Router, StateStore,
@@ -65,27 +67,40 @@ impl Default for ServerConfig {
 }
 
 fn is_websocket_upgrade_request(req: &hyper::Request<Incoming>) -> bool {
-    req.method().as_str().eq_ignore_ascii_case("GET")
+    req.version() == hyper::Version::HTTP_11
+        && req.method().as_str().eq_ignore_ascii_case("GET")
+        && req.headers().get_all(UPGRADE).iter().any(|value| {
+            value
+                .to_str()
+                .is_ok_and(|value| header_value_contains_token(value, "websocket"))
+        })
+        && req.headers().get_all(CONNECTION).iter().any(|value| {
+            value
+                .to_str()
+                .is_ok_and(|value| header_value_contains_token(value, "upgrade"))
+        })
         && req
             .headers()
-            .get(UPGRADE)
+            .get(SEC_WEBSOCKET_KEY)
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
-        && req
-            .headers()
-            .get(CONNECTION)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value
-                    .split(',')
-                    .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
-            })
-        && req.headers().contains_key(SEC_WEBSOCKET_KEY)
+            .is_some_and(is_valid_websocket_key)
         && req
             .headers()
             .get(SEC_WEBSOCKET_VERSION)
             .and_then(|value| value.to_str().ok())
             == Some("13")
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum TransportSecurity {
+    Plain,
+    Tls,
+}
+
+impl TransportSecurity {
+    fn is_secure(self) -> bool {
+        matches!(self, Self::Tls)
+    }
 }
 
 pub struct App {
@@ -365,7 +380,11 @@ impl App {
                     io,
                     service_fn(move |req: hyper::Request<Incoming>| {
                         let app = Arc::clone(&app);
-                        async move { Ok::<_, Infallible>(app.handle(req, Some(peer)).await) }
+                        async move {
+                            Ok::<_, Infallible>(
+                                app.handle(req, Some(peer), TransportSecurity::Plain).await,
+                            )
+                        }
                     }),
                 )
                 .into_owned();
@@ -396,8 +415,10 @@ impl App {
         &self,
         mut req: hyper::Request<Incoming>,
         remote_addr: Option<SocketAddr>,
+        transport_security: TransportSecurity,
     ) -> hyper::Response<ResponseBody> {
         // Read everything that only needs a borrow before consuming the body.
+        let version = req.version();
         let method = req.method().as_str().to_string();
         let path = req.uri().path().to_string();
         let raw_query = req.uri().query().map(|q| q.to_string());
@@ -442,6 +463,7 @@ impl App {
         };
 
         let request = Request {
+            version,
             method,
             path,
             raw_query,
@@ -450,9 +472,11 @@ impl App {
             cookies,
             body,
             params: HashMap::new(),
+            route_pattern: None,
             state: self.state.clone(),
             upgrade,
             remote_addr,
+            secure_transport: transport_security.is_secure(),
             header_pairs,
         };
 
@@ -483,30 +507,33 @@ impl App {
     /// Resolves a request that did not directly match a route: auto-serves
     /// HEAD from a matching GET, auto-answers OPTIONS with `Allow`, returns 405
     /// when the path exists for other methods, or falls through to 404.
-    fn resolve_miss(
-        &self,
-        method: &str,
-        path: &str,
-    ) -> (Handler, Vec<Middleware>, HashMap<String, String>) {
+    fn resolve_miss(&self, method: &str, path: &str) -> MatchedRoute {
         let allowed = self.router.allowed_methods(path);
         if allowed.is_empty() {
-            (not_found_handler(), Vec::new(), HashMap::new())
+            MatchedRoute {
+                handler: not_found_handler(),
+                middlewares: Vec::new(),
+                params: HashMap::new(),
+                pattern: path.to_string(),
+            }
         } else if method == "HEAD" && allowed.iter().any(|m| m == "GET") {
             self.router
                 .route("GET", path)
                 .expect("GET route present per allowed_methods")
         } else if method == "OPTIONS" {
-            (
-                options_handler(allow_header_value(&allowed)),
-                Vec::new(),
-                HashMap::new(),
-            )
+            MatchedRoute {
+                handler: options_handler(allow_header_value(&allowed)),
+                middlewares: Vec::new(),
+                params: HashMap::new(),
+                pattern: path.to_string(),
+            }
         } else {
-            (
-                method_not_allowed_handler(allow_header_value(&allowed)),
-                Vec::new(),
-                HashMap::new(),
-            )
+            MatchedRoute {
+                handler: method_not_allowed_handler(allow_header_value(&allowed)),
+                middlewares: Vec::new(),
+                params: HashMap::new(),
+                pattern: path.to_string(),
+            }
         }
     }
 
@@ -542,14 +569,26 @@ impl App {
     pub(crate) async fn dispatch(&self, mut request: Request) -> Response {
         request.state = self.state.clone();
         let is_head = request.method == "HEAD";
-        let (handler, route_middlewares, params) = match self.trailing_slash_miss(&request) {
-            Some(handler) => (handler, Vec::new(), HashMap::new()),
+        let matched = match self.trailing_slash_miss(&request) {
+            Some(handler) => MatchedRoute {
+                handler,
+                middlewares: Vec::new(),
+                params: HashMap::new(),
+                pattern: request.path.clone(),
+            },
             None => match self.router.route(&request.method, &request.path) {
                 Some(found) => found,
                 None => self.resolve_miss(&request.method, &request.path),
             },
         };
+        let MatchedRoute {
+            handler,
+            middlewares: route_middlewares,
+            params,
+            pattern,
+        } = matched;
         request.params = params;
+        request.route_pattern = Some(pattern);
 
         // Innermost layer: the matched handler.
         let mut next: Next = Box::new(move |req| (*handler)(req));

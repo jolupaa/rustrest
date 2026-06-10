@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn dummy_request(body: &str) -> Request {
     Request {
+        version: hyper::Version::HTTP_11,
         method: "GET".to_string(),
         path: "/".to_string(),
         raw_query: None,
@@ -23,9 +24,11 @@ fn dummy_request(body: &str) -> Request {
         cookies: HashMap::new(),
         body: Bytes::from(body.to_string()),
         params: HashMap::new(),
+        route_pattern: None,
         state: StateStore::default(),
         upgrade: None,
         remote_addr: None,
+        secure_transport: false,
         header_pairs: Vec::new(),
     }
 }
@@ -82,6 +85,51 @@ fn websocket_origin_policy_rejects_invalid_explicit_ports() {
     let config = WebSocketConfig::new()
         .origin_policy(OriginPolicy::allow(["https://app.example.com:not-a-port"]));
     assert!(config.validate().is_err());
+}
+
+#[test]
+fn websocket_same_host_origin_uses_transport_default_port() {
+    let policy = OriginPolicy::same_host().allow_missing(false);
+
+    assert!(policy.allows_for_transport(Some("http://app.example.com"), "app.example.com", false,));
+    assert!(!policy.allows_for_transport(
+        Some("https://app.example.com"),
+        "app.example.com",
+        false,
+    ));
+    assert!(policy.allows_for_transport(Some("https://app.example.com"), "app.example.com", true,));
+    assert!(!policy.allows_for_transport(Some("http://app.example.com"), "app.example.com", true,));
+}
+
+#[test]
+fn request_builder_defaults_to_http_11_and_can_mark_secure_transport() {
+    let plain = Request::builder().build();
+    assert_eq!(plain.version(), hyper::Version::HTTP_11);
+    assert!(!plain.is_secure());
+
+    let secure = Request::builder().secure(true).build();
+    assert!(secure.is_secure());
+}
+
+#[tokio::test]
+async fn mounted_websocket_request_records_normalized_route_pattern() {
+    let mut chat = Router::new();
+    chat.websocket("/:channel", |_socket| async move {});
+
+    let mut api = Router::new();
+    api.mount("/chat", chat);
+
+    let mut app = App::new();
+    app.mount("/api", api);
+    app.layer(|req: Request, _next: Next| async move {
+        Response::send(req.route_pattern().unwrap_or("missing"))
+    });
+
+    let response = app
+        .dispatch(request_with_method("GET", "/api/chat/42"))
+        .await;
+
+    assert_eq!(response.body_text(), "/api/chat/:channel");
 }
 
 #[test]
@@ -928,6 +976,7 @@ async fn sessions_middleware_assigns_and_persists_session() {
 fn query_params_are_parsed_and_url_decoded() {
     let query = parse_query("q=rust+rest&tag=web&tag=api&empty=&flag&encoded=hello%20world");
     let req = Request {
+        version: hyper::Version::HTTP_11,
         method: "GET".to_string(),
         path: "/buscar".to_string(),
         raw_query: Some(
@@ -938,9 +987,11 @@ fn query_params_are_parsed_and_url_decoded() {
         cookies: HashMap::new(),
         body: Bytes::new(),
         params: HashMap::new(),
+        route_pattern: None,
         state: StateStore::default(),
         upgrade: None,
         remote_addr: None,
+        secure_transport: false,
         header_pairs: Vec::new(),
     };
 
@@ -1081,8 +1132,8 @@ fn router_matches_method_and_path_param() {
     assert!(router.route("POST", "/users").is_none());
     assert!(router.route("GET", "/nope/extra").is_none());
 
-    let (_handler, _mws, params) = router.route("GET", "/users/42").expect("should match");
-    assert_eq!(params.get("id").map(String::as_str), Some("42"));
+    let matched = router.route("GET", "/users/42").expect("should match");
+    assert_eq!(matched.params.get("id").map(String::as_str), Some("42"));
 }
 
 #[test]
@@ -1113,8 +1164,8 @@ fn mount_concatenates_prefixes_across_nesting() {
     let mut root = Router::new();
     root.mount("/api", api);
 
-    let (_handler, _mws, params) = root.route("GET", "/api/users/42").expect("should match");
-    assert_eq!(params.get("id").map(String::as_str), Some("42"));
+    let matched = root.route("GET", "/api/users/42").expect("should match");
+    assert_eq!(matched.params.get("id").map(String::as_str), Some("42"));
     // Only `/:id` was registered, so the bare collection path does not match.
     assert!(root.route("GET", "/api/users").is_none());
 }
@@ -1128,13 +1179,19 @@ fn router_prefers_static_over_param_regardless_of_registration_order() {
     });
     router.get("/users/me", |_r: Request| Response::send("me"));
 
-    let (_h, _m, params) = router.route("GET", "/users/me").expect("should match");
+    let params = router
+        .route("GET", "/users/me")
+        .expect("should match")
+        .params;
     assert!(
         params.is_empty(),
         "static /users/me should win over /users/:id, captured {params:?}"
     );
 
-    let (_h, _m, params) = router.route("GET", "/users/42").expect("should match");
+    let params = router
+        .route("GET", "/users/42")
+        .expect("should match")
+        .params;
     assert_eq!(params.get("id").map(String::as_str), Some("42"));
 }
 
@@ -1145,11 +1202,17 @@ fn router_prefers_param_over_wildcard_and_backtracks_across_branches() {
     router.get("/files/*rest", |_r: Request| Response::send("wild"));
     router.get("/files/:name", |_r: Request| Response::send("param"));
 
-    let (_h, _m, params) = router.route("GET", "/files/readme").expect("should match");
+    let params = router
+        .route("GET", "/files/readme")
+        .expect("should match")
+        .params;
     assert_eq!(params.get("name").map(String::as_str), Some("readme"));
 
     // Deeper paths only the wildcard can absorb.
-    let (_h, _m, params) = router.route("GET", "/files/a/b").expect("should match");
+    let params = router
+        .route("GET", "/files/a/b")
+        .expect("should match")
+        .params;
     assert_eq!(params.get("rest").map(String::as_str), Some("a/b"));
 
     // A static branch that dead-ends must backtrack to the param route
@@ -1158,14 +1221,23 @@ fn router_prefers_param_over_wildcard_and_backtracks_across_branches() {
     router.get("/users/:id", |req: Request| {
         Response::send(req.param("id").unwrap_or("?"))
     });
-    let (_h, _m, params) = router.route("GET", "/users/me").expect("should match");
+    let params = router
+        .route("GET", "/users/me")
+        .expect("should match")
+        .params;
     assert_eq!(params.get("id").map(String::as_str), Some("me"));
 
     // Method-aware backtracking: POST /users/me must not shadow GET.
     router.post("/users/me", |_r: Request| Response::send("post me"));
-    let (_h, _m, params) = router.route("GET", "/users/me").expect("should match");
+    let params = router
+        .route("GET", "/users/me")
+        .expect("should match")
+        .params;
     assert_eq!(params.get("id").map(String::as_str), Some("me"));
-    let (_h, _m, params) = router.route("POST", "/users/me").expect("should match");
+    let params = router
+        .route("POST", "/users/me")
+        .expect("should match")
+        .params;
     assert!(params.is_empty());
 }
 
@@ -1176,11 +1248,17 @@ async fn router_prefers_exact_method_over_all_on_same_path() {
     router.all("/health", |_r: Request| Response::send("all"));
     router.get("/health", |_r: Request| Response::send("get"));
 
-    let (handler, _m, _p) = router.route("GET", "/health").expect("should match");
-    assert_eq!(handler(dummy_request("")).await.body_text(), "get");
+    let matched = router.route("GET", "/health").expect("should match");
+    assert_eq!(
+        (matched.handler)(dummy_request("")).await.body_text(),
+        "get"
+    );
 
-    let (handler, _m, _p) = router.route("DELETE", "/health").expect("should match");
-    assert_eq!(handler(dummy_request("")).await.body_text(), "all");
+    let matched = router.route("DELETE", "/health").expect("should match");
+    assert_eq!(
+        (matched.handler)(dummy_request("")).await.body_text(),
+        "all"
+    );
 }
 
 #[test]

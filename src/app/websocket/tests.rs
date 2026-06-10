@@ -24,6 +24,58 @@ fn websocket_handshake_sets_upgrade_headers() {
 }
 
 #[test]
+fn websocket_handshake_parses_upgrade_headers_as_tokens() {
+    let req = Request::builder()
+        .method("GET")
+        .header("upgrade", "h2c, WebSocket")
+        .header("connection", "keep-alive, UpGrAdE")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .build();
+
+    assert!(Response::websocket(&req).is_ok());
+}
+
+#[test]
+fn websocket_with_rejects_disallowed_origin_with_403() {
+    let req = Request::builder()
+        .method("GET")
+        .header("host", "app.example.com")
+        .header("origin", "https://evil.example.com")
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .secure(true)
+        .build();
+    let config =
+        WebSocketConfig::new().origin_policy(OriginPolicy::same_host().allow_missing(false));
+
+    let response = req.websocket_with(config, |_socket| async move {});
+
+    assert_eq!(response.status, 403);
+}
+
+#[test]
+fn websocket_with_requires_subprotocol_overlap_when_configured() {
+    let req = Request::builder()
+        .method("GET")
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-protocol", "graphql-ws")
+        .build();
+    let config = WebSocketConfig::new()
+        .protocols(&["chat"])
+        .require_protocol(true);
+
+    let response = req.websocket_with(config, |_socket| async move {});
+
+    assert_eq!(response.status, 400);
+}
+
+#[test]
 fn websocket_config_negotiates_first_supported_subprotocol() {
     let req = Request::builder()
         .header("sec-websocket-protocol", "chat, superchat")
