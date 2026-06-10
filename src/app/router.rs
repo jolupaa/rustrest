@@ -4,7 +4,7 @@ use std::future::Future;
 use std::io::SeekFrom;
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::Stream;
@@ -12,6 +12,7 @@ use hyper::body::Bytes;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use super::decode_component;
+use super::trie::RouteIndex;
 use super::{
     Handler, HttpError, IntoHandler, IntoMiddleware, Middleware, Next, Request, Response,
     WebSocket, WebSocketHandler,
@@ -100,6 +101,10 @@ pub(crate) fn match_pattern(
 pub struct Router {
     routes: Vec<Route>,
     middlewares: Vec<Middleware>,
+    /// Trie index over `routes`, built lazily on first lookup and dropped on
+    /// every mutation (all mutations require `&mut self`, so a stale index can
+    /// never be observed).
+    index: OnceLock<RouteIndex>,
 }
 
 impl Router {
@@ -107,7 +112,18 @@ impl Router {
         Self {
             routes: Vec::new(),
             middlewares: Vec::new(),
+            index: OnceLock::new(),
         }
+    }
+
+    fn index(&self) -> &RouteIndex {
+        self.index.get_or_init(|| {
+            RouteIndex::build(
+                self.routes
+                    .iter()
+                    .map(|route| (route.method.as_str(), route.pattern.as_slice())),
+            )
+        })
     }
 
     pub fn get<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
@@ -237,6 +253,7 @@ impl Router {
             handler: handler.into_handler(),
             middlewares: Vec::new(),
         });
+        self.index.take();
         let index = self.routes.len() - 1;
         RouteHandle {
             router: self,
@@ -258,6 +275,7 @@ impl Router {
             handler,
             middlewares: Vec::new(),
         });
+        self.index.take();
     }
 
     /// Mounts another router under `prefix`, prepending `prefix` to every one
@@ -281,47 +299,42 @@ impl Router {
                 middlewares,
             });
         }
+        self.index.take();
     }
 
-    /// Finds the first registered route matching `method` + `path`, returning
-    /// a clone of its handler, its scoped middleware chain, and any captured
-    /// path parameters. Routes are tried in registration order (register more
-    /// specific routes first).
+    /// Finds the best route for `method` + `path` via the trie index,
+    /// returning a clone of its handler, its scoped middleware chain, and any
+    /// captured path parameters. Precedence: static segments beat `:params`,
+    /// which beat trailing `*wildcards` (backtracking across branches); on the
+    /// same path an exact-method route beats an `all()` route; remaining ties
+    /// go to the first-registered route.
     pub(crate) fn route(
         &self,
         method: &str,
         path: &str,
     ) -> Option<(Handler, Vec<Middleware>, HashMap<String, String>)> {
         let segments = path_segments(path);
-        for route in &self.routes {
-            if route.method != METHOD_ALL && route.method != method {
-                continue;
-            }
-            if let Some(params) = match_pattern(&route.pattern, &segments) {
-                return Some((
-                    Arc::clone(&route.handler),
-                    route.middlewares.clone(),
-                    params,
-                ));
-            }
-        }
-        None
+        let route = &self.routes[self.index().find(method, &segments)?];
+        // The index only returns routes whose pattern matches these segments,
+        // so the capture pass cannot fail.
+        let params = match_pattern(&route.pattern, &segments)?;
+        Some((
+            Arc::clone(&route.handler),
+            route.middlewares.clone(),
+            params,
+        ))
     }
 
     /// Returns the distinct concrete methods registered for routes whose
-    /// pattern matches `path` (ignoring the request method). Used to build the
-    /// `Allow` header for 405/OPTIONS responses. `*` (catch-all) is excluded.
+    /// pattern matches `path` (ignoring the request method), in registration
+    /// order. Used to build the `Allow` header for 405/OPTIONS responses.
+    /// `*` (catch-all) is excluded.
     pub(crate) fn allowed_methods(&self, path: &str) -> Vec<String> {
         let segments = path_segments(path);
         let mut methods = Vec::new();
-        for route in &self.routes {
-            if route.method == METHOD_ALL {
-                continue;
-            }
-            if match_pattern(&route.pattern, &segments).is_some()
-                && !methods.contains(&route.method)
-            {
-                methods.push(route.method.clone());
+        for (_, method) in self.index().matching_methods(&segments) {
+            if method != METHOD_ALL && !methods.contains(&method) {
+                methods.push(method);
             }
         }
         methods

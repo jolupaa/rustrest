@@ -20,6 +20,7 @@ mod state;
 mod testing;
 #[cfg(feature = "tls")]
 pub mod tls;
+mod trie;
 mod websocket;
 
 pub use cookie::{Cookie, SameSite, sign_value, verify_value};

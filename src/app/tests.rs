@@ -932,6 +932,83 @@ fn mount_concatenates_prefixes_across_nesting() {
     assert!(root.route("GET", "/api/users").is_none());
 }
 
+#[test]
+fn router_prefers_static_over_param_regardless_of_registration_order() {
+    let mut router = Router::new();
+    // The param route is registered FIRST; specificity must still win.
+    router.get("/users/:id", |req: Request| {
+        Response::send(req.param("id").unwrap_or("?"))
+    });
+    router.get("/users/me", |_r: Request| Response::send("me"));
+
+    let (_h, _m, params) = router.route("GET", "/users/me").expect("should match");
+    assert!(
+        params.is_empty(),
+        "static /users/me should win over /users/:id, captured {params:?}"
+    );
+
+    let (_h, _m, params) = router.route("GET", "/users/42").expect("should match");
+    assert_eq!(params.get("id").map(String::as_str), Some("42"));
+}
+
+#[test]
+fn router_prefers_param_over_wildcard_and_backtracks_across_branches() {
+    let mut router = Router::new();
+    // Wildcard registered first; the more specific param route must win.
+    router.get("/files/*rest", |_r: Request| Response::send("wild"));
+    router.get("/files/:name", |_r: Request| Response::send("param"));
+
+    let (_h, _m, params) = router.route("GET", "/files/readme").expect("should match");
+    assert_eq!(params.get("name").map(String::as_str), Some("readme"));
+
+    // Deeper paths only the wildcard can absorb.
+    let (_h, _m, params) = router.route("GET", "/files/a/b").expect("should match");
+    assert_eq!(params.get("rest").map(String::as_str), Some("a/b"));
+
+    // A static branch that dead-ends must backtrack to the param route
+    // (also exercises index invalidation after further registration).
+    router.get("/users/me/profile", |_r: Request| Response::send("prof"));
+    router.get("/users/:id", |req: Request| {
+        Response::send(req.param("id").unwrap_or("?"))
+    });
+    let (_h, _m, params) = router.route("GET", "/users/me").expect("should match");
+    assert_eq!(params.get("id").map(String::as_str), Some("me"));
+
+    // Method-aware backtracking: POST /users/me must not shadow GET.
+    router.post("/users/me", |_r: Request| Response::send("post me"));
+    let (_h, _m, params) = router.route("GET", "/users/me").expect("should match");
+    assert_eq!(params.get("id").map(String::as_str), Some("me"));
+    let (_h, _m, params) = router.route("POST", "/users/me").expect("should match");
+    assert!(params.is_empty());
+}
+
+#[tokio::test]
+async fn router_prefers_exact_method_over_all_on_same_path() {
+    let mut router = Router::new();
+    // `.all()` registered first; an exact-method route must still win for GET.
+    router.all("/health", |_r: Request| Response::send("all"));
+    router.get("/health", |_r: Request| Response::send("get"));
+
+    let (handler, _m, _p) = router.route("GET", "/health").expect("should match");
+    assert_eq!(handler(dummy_request("")).await.body_text(), "get");
+
+    let (handler, _m, _p) = router.route("DELETE", "/health").expect("should match");
+    assert_eq!(handler(dummy_request("")).await.body_text(), "all");
+}
+
+#[test]
+fn router_index_refreshes_after_mount() {
+    let mut root = Router::new();
+    // Force a lookup (and any lazy index build) before mounting.
+    assert!(root.route("GET", "/api/ping").is_none());
+
+    let mut api = Router::new();
+    api.get("/ping", |_r: Request| Response::send("pong"));
+    root.mount("/api", api);
+
+    assert!(root.route("GET", "/api/ping").is_some());
+}
+
 #[tokio::test]
 async fn dispatch_runs_sync_handler() {
     let mut app = App::new();
