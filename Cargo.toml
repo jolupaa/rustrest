@@ -1,6 +1,6 @@
 [package]
 name = "rustrest"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A minimal Express-style HTTP framework for Rust, built on hyper and tokio."
@@ -11,10 +11,34 @@ keywords = ["http", "web", "framework", "hyper", "tokio"]
 categories = ["web-programming::http-server", "network-programming"]
 exclude = ["AGENTS.md", "CLAUDE.md"]
 
+[features]
+default = []
+brotli = ["dep:brotli"]
+tracing = ["dep:tracing"]
+tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
+
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-hyper = { version = "1", features = ["full"] }
-hyper-util = { version = "0.1", features = ["full"] }
+brotli = { version = "7", optional = true }
+tracing = { version = "0.1", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = [
+    "http1",
+    "http2",
+    "server-auto",
+    "server-graceful",
+    "tokio",
+] }
 http-body-util = "0.1"
 futures-util = "0.3"
 base64 = "0.22"
@@ -24,4 +48,10 @@ serde_json = "1"
 serde_html_form = "0.2"
 serde_urlencoded = "0.7"
 sha1 = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+httpdate = "1"
 tokio-tungstenite = "0.29"
+
+[dev-dependencies]
+rcgen = "0.13"

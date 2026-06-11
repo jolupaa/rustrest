@@ -2,7 +2,7 @@ use rustrest::App;
 use serde_json::json;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::io::Result<()> {
     let mut app = App::new();
 
     app.websocket("/ws", |mut socket| async move {
@@ -78,5 +78,5 @@ async fn main() {
     });
 
     println!("Open http://127.0.0.1:3000 and click the button.");
-    app.listen("127.0.0.1:3000").await;
+    app.listen("127.0.0.1:3000").await
 }

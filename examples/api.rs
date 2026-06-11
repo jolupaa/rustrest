@@ -65,7 +65,7 @@ fn users_router() -> Router {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::io::Result<()> {
     let mut app = App::new();
 
     app.state(Config {
@@ -83,5 +83,5 @@ async fn main() {
     app.mount("/users", users_router());
     app.fallback(|_req: Request| Response::not_found());
 
-    app.listen("127.0.0.1:3000").await;
+    app.listen("127.0.0.1:3000").await
 }

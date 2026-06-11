@@ -6,24 +6,29 @@
 //! use rustrest::{App, Request, Response};
 //!
 //! #[tokio::main]
-//! async fn main() {
+//! async fn main() -> std::io::Result<()> {
 //!     let mut app = App::new();
 //!
 //!     app.get("/", |_req: Request| {
 //!         Response::send("Hello from RustRest")
 //!     });
 //!
-//!     app.listen("127.0.0.1:3000").await;
+//!     app.listen("127.0.0.1:3000").await
 //! }
 //! ```
 //!
 //! The [`app`] module is also available with the framework's public core types.
+#![forbid(unsafe_code)]
 
 pub mod app;
 
+#[cfg(feature = "tls")]
+pub use app::tls;
 pub use app::{
-    App, ErrorHandler, FromRequest, Handler, HttpError, IntoHandler, IntoHttpError, IntoMiddleware,
-    IntoResponse, IntoWebSocketHandler, Json, Middleware, Next, Path, Query, Request, Response,
-    Router, SseEvent, State, StateStore, WebSocket, WebSocketError, WebSocketEvent,
-    WebSocketHandler, WebSocketMessage, middleware,
+    App, Cookie, Cookies, ErrorHandler, Form, FromRequest, Handler, Headers, HttpError,
+    IntoHandler, IntoHttpError, IntoMiddleware, IntoResponse, IntoWebSocketHandler, Json,
+    Middleware, MultipartPart, Next, Path, Query, Request, RequestBuilder, Response, RouteHandle,
+    RouteInfo, Router, SameSite, Sessions, SseEvent, State, StateStore, TestClient, TestRequest,
+    TrailingSlash, WebSocket, WebSocketConfig, WebSocketError, WebSocketEvent, WebSocketHandler,
+    WebSocketMessage, WsBroadcast, middleware, sign_value, verify_value,
 };

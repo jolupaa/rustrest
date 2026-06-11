@@ -4,33 +4,38 @@ RustRest is a minimal Express-style HTTP framework for Rust, built on top of `hy
 
 The goal is to provide a small, direct, easy-to-understand API for building HTTP servers and APIs without hiding the transport layer completely. RustRest includes routes, mountable routers, onion-style middleware, typed extractors, shared state, JSON responses, static files, SSE, cookies, redirects, and WebSocket routes.
 
-> Status: `0.1.0`. The API is still evolving. It is best suited for learning, prototyping, and controlled framework development.
+> Status: `0.2.0`. The API is still evolving. It is best suited for learning, prototyping, and controlled framework development.
 
 ## Features
 
-- HTTP server built on `hyper` 1.x and `tokio`.
+- HTTP/1.1 and HTTP/2 server built on `hyper` 1.x and `tokio`.
 - Synchronous and asynchronous handlers.
 - Route helpers for `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`, and `HEAD`.
+- Trie-indexed routing (O(path length)) where static segments beat `:params` and `:params` beat `*wildcards`, with backtracking.
+- Automatic `405 Method Not Allowed` (+`Allow`), auto-`HEAD` from `GET`, and auto-`OPTIONS`.
 - Mountable `Router` with nested prefixes.
-- Route parameters with `:id`.
-- Route wildcards with `*path`.
-- Global and router-scoped onion middleware with `next`.
-- Router guards.
-- App and router fallbacks.
-- Parsed query strings.
-- Request and response cookies.
-- Arbitrary response headers.
-- `Result<Response, HttpError>` handlers.
-- Global error handler.
+- Route parameters with `:id` and wildcards with `*path`.
+- Route introspection (`app.routes()` / `app.print_routes()`) and a configurable trailing-slash policy (ignore/strict/308 redirect).
+- OpenAPI 3.0 generation (`app.openapi(...)`) with per-route `.summary/.description/.tag` metadata, plus a Swagger UI route (`app.serve_docs(...)`).
+- Global, router-scoped, and per-route onion middleware with `next`.
+- Router guards; app and router fallbacks.
+- Graceful shutdown (`listen_with_shutdown` / `serve_with_shutdown`) and a panic-proof accept loop.
+- Configurable body limit (413), request timeout (408), and header-read timeout.
+- Binary-safe request bodies: `req.bytes()`, `req.text()`, `req.json::<T>()`, `req.form::<T>()`, and `req.multipart()`.
+- Client address via `req.remote_addr()`; duplicate headers via `req.headers_all()`.
+- Parsed query strings; request and response cookies (plus a `Cookie` builder with `SameSite`/`Secure`/`Max-Age`).
+- Signed values (HMAC-SHA256) and a minimal in-memory `Sessions` middleware.
+- `Result<Response, HttpError>` handlers and a global error handler that also formats 404/405.
 - Typed shared state.
-- Extractors: `Json<T>`, `Path<T>`, `Query<T>`, `State<T>`.
-- Static files with extension-based content types.
-- Response streaming.
-- Server-Sent Events.
-- WebSocket routes with frame send/receive helpers.
-- JSON WebSocket events with `{ "event": "...", "data": ... }` envelopes.
-- Built-in middleware: CORS, request id, gzip, and tracing.
-- Unit tests and a real HTTP integration test.
+- Extractors: `Json<T>`, `Form<T>`, `Path<T>` (structs or scalars), `Query<T>`, `State<T>`, `Cookies<T>`, `Headers<T>`, `Bytes`, `String`, plus `Option`/`Result` wrappers.
+- Static files with streaming bodies, `ETag`/`Last-Modified` (304), and `Range` (206) support.
+- Response streaming and Server-Sent Events, with a heartbeat helper (`Response::sse_with_heartbeat`) and `req.last_event_id()` for resumption.
+- WebSocket routes with frame send/receive helpers and `{ "event": ..., "data": ... }` JSON envelopes.
+- `WebSocketConfig` for subprotocol negotiation, incoming message size limits, and automatic keepalive pings; `WsBroadcast` for fan-out to many sockets.
+- Built-in middleware: configurable `Cors` (with preflight), compression negotiation (gzip/deflate, optional brotli), per-IP rate limiting (429 + `Retry-After`), per-route timeouts (408), `ETag`/conditional GET (304), request id, gzip, and tracing.
+- An in-process `TestClient` and public `Request::builder()` for testing handlers without TCP.
+- Optional cargo features: `tls` (rustls HTTPS), `tracing` (structured spans), `brotli`.
+- Unit tests plus real HTTP and HTTPS integration tests.
 
 ## Installation
 
@@ -58,12 +63,26 @@ After the crate is published:
 
 ```toml
 [dependencies]
-rustrest = "0.1"
+rustrest = "0.2"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
 
 RustRest uses Rust edition 2024 and requires Rust `1.85` or newer.
+
+### Cargo features
+
+All optional, disabled by default:
+
+| Feature   | Adds                                                                  |
+| --------- | --------------------------------------------------------------------- |
+| `tls`     | HTTPS via rustls: `app.listen_tls(...)` + `rustrest::tls::config_from_pem` |
+| `tracing` | `middleware::trace()` emitting structured spans/events per request    |
+| `brotli`  | Brotli as the preferred encoding in `middleware::compression()`       |
+
+```toml
+rustrest = { version = "0.2", features = ["tls", "tracing"] }
+```
 
 ## Quick Start
 
@@ -71,7 +90,7 @@ RustRest uses Rust edition 2024 and requires Rust `1.85` or newer.
 use rustrest::{App, Request, Response};
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::io::Result<()> {
     let mut app = App::new();
 
     app.get("/", |_req: Request| {
@@ -83,7 +102,7 @@ async fn main() {
         Response::send(&format!("Requested user: {}", id))
     });
 
-    app.listen("127.0.0.1:3000").await;
+    app.listen("127.0.0.1:3000").await
 }
 ```
 
@@ -128,7 +147,7 @@ Request flow:
 1. `App::listen` accepts TCP connections.
 2. Hyper receives an HTTP request.
 3. RustRest builds a `Request`.
-4. `Router` finds the first matching route in registration order.
+4. `Router` finds the most specific matching route through a trie index.
 5. RustRest builds the middleware chain.
 6. The handler returns `Response` or `Result<Response, E>`.
 7. `Response` is converted into a Hyper response.
@@ -148,11 +167,29 @@ app.head("/health", |_req: Request| Response::send("ok"));
 app.all("/any", |_req: Request| Response::send("any method"));
 ```
 
-Routes are evaluated in registration order. Register concrete routes before parameterized routes:
+Matching prefers the most specific pattern regardless of registration order: static segments beat `:params`, `:params` beat trailing `*wildcards` (with backtracking across branches), and an exact-method route beats `all()` on the same path. Remaining ties go to the first-registered route.
 
 ```rust
-app.get("/users/me", |_req: Request| Response::send("me"));
 app.get("/users/:id", |_req: Request| Response::send("by id"));
+app.get("/users/me", |_req: Request| Response::send("me")); // still wins for /users/me
+```
+
+### Trailing Slashes
+
+By default `/users/` matches `/users`. The policy is configurable:
+
+```rust
+use rustrest::TrailingSlash;
+
+app.trailing_slash(TrailingSlash::Strict);   // /users/ -> 404
+app.trailing_slash(TrailingSlash::Redirect); // /users/ -> 308 to /users
+```
+
+### Route Listings
+
+```rust
+app.print_routes();              // "GET     /users/:id" per line
+let routes = app.routes();       // Vec<RouteInfo> { method, path, summary, ... }
 ```
 
 ### Path Parameters
@@ -259,8 +296,8 @@ pub struct Request {
     pub query: HashMap<String, Vec<String>>,
     pub headers: HashMap<String, String>,
     pub cookies: HashMap<String, String>,
-    pub body: String,
     pub params: HashMap<String, String>,
+    // body and connection details are private; use the methods below
 }
 ```
 
@@ -271,15 +308,22 @@ req.param("id");
 req.query("page");
 req.query_all("tag");
 req.header("authorization");
+req.headers_all("x-forwarded-for");
 req.cookie("sid");
+req.bytes();              // raw body bytes
+req.text();               // lossy UTF-8 view of the body
 req.json::<MyType>();
+req.form::<MyForm>();
+req.multipart();
 req.extract::<Json<MyType>>();
 req.state::<Config>();
+req.remote_addr();
+req.last_event_id();      // SSE reconnection header
 req.is_websocket_upgrade();
 req.websocket(|socket| async move { ... });
 ```
 
-The request body is fully buffered into a `String`, with an internal 64 KB limit.
+The request body is fully buffered as bytes, capped by `app.max_body_size(...)` (64 KB by default; oversized bodies get `413`).
 
 ## Typed Extractors
 
@@ -486,17 +530,26 @@ That middleware only runs for routes under `/api`.
 
 ```rust
 use rustrest::middleware;
+use std::time::Duration;
 
 app.layer(middleware::tracing());
 app.layer(middleware::request_id());
 app.layer(middleware::cors());
-app.layer(middleware::gzip());
+app.layer(middleware::compression());
+app.layer(middleware::etag());
+app.layer(middleware::rate_limit(100, Duration::from_secs(60)));
+app.get("/slow", slow_handler)
+    .layer(middleware::timeout(Duration::from_secs(5)));
 ```
 
 - `tracing`: prints method, path, and status.
 - `request_id`: propagates or generates `x-request-id`.
-- `cors`: adds permissive CORS headers.
+- `cors`: adds permissive CORS headers (see the configurable `Cors` builder for allowlists, credentials, and preflight).
 - `gzip`: compresses byte responses when the client accepts `gzip`.
+- `compression` / `compression_with_min_size`: content negotiation for gzip/deflate (plus brotli with the `brotli` feature), skipping small bodies.
+- `etag`: strong `ETag` for buffered 200 responses and `304 Not Modified` on matching `If-None-Match`.
+- `rate_limit(max, window)`: fixed-window per-client-IP limiting; over the limit returns `429` with `Retry-After`.
+- `timeout(duration)`: cuts off the wrapped handler with `408`; scope it per route or per router.
 
 ## Guards
 
@@ -588,6 +641,27 @@ app.error_handler(|err: HttpError| {
 });
 ```
 
+## OpenAPI & Docs UI
+
+Routes can carry documentation, and the app can describe itself as OpenAPI 3.0:
+
+```rust
+app.get("/users", list_users)
+    .summary("Lista usuarios")
+    .description("Devuelve todos los usuarios registrados")
+    .tag("users");
+app.get("/users/:id", show_user).tag("users");
+
+// A serde_json::Value with paths, methods, and path parameters:
+let doc = app.openapi("Mi API", "0.2.0");
+
+// Or serve it: GET /docs (Swagger UI) + GET /docs/openapi.json.
+// Snapshot semantics: call after registering the routes.
+app.serve_docs("/docs", "Mi API", "0.2.0");
+```
+
+The generated document covers paths, methods, metadata, and `:param`/`*wildcard` path parameters (typed as strings). Request/response schemas are not introspected. `all()` routes are skipped.
+
 ## Server-Sent Events
 
 ```rust
@@ -605,6 +679,18 @@ app.get("/events", |_req: Request| {
 ```
 
 The response uses `text/event-stream`, `Cache-Control: no-cache`, and `Connection: keep-alive`.
+
+For long-lived streams, `sse_with_heartbeat` emits a `: keep-alive` comment whenever the source stream is idle for the given interval, and `req.last_event_id()` exposes the ID browsers resend when they reconnect:
+
+```rust
+use std::time::Duration;
+
+app.get("/events", |req: Request| {
+    let resume_after = req.last_event_id().map(str::to_string);
+    let events = my_event_stream(resume_after);
+    Response::sse_with_heartbeat(events, Duration::from_secs(15))
+});
+```
 
 ## WebSocket
 
@@ -738,6 +824,59 @@ Socket.IO adds its own protocol on top of HTTP/WebSocket: named events, acknowle
 
 With RustRest, use the browser `WebSocket` API or any WebSocket client. For named events, use `send_event` / `recv_event`, which are plain JSON messages and can be consumed from any language.
 
+### Configuration, Subprotocols, and Keepalive
+
+`websocket_with` accepts a `WebSocketConfig` on `App`, `Router`, and `Request`:
+
+```rust
+use rustrest::WebSocketConfig;
+use std::time::Duration;
+
+let config = WebSocketConfig::new()
+    .protocols(&["superchat", "chat"])         // negotiated + echoed to the client
+    .max_message_size(1024 * 1024)             // larger incoming messages error
+    .ping_interval(Duration::from_secs(30));   // pings while idle in recv()
+
+app.websocket_with("/ws", config, |mut socket| async move {
+    let negotiated = socket.protocol(); // Some("superchat") etc.
+    while let Ok(Some(message)) = socket.recv().await {
+        // ...
+    }
+});
+```
+
+The first client-offered subprotocol the server supports is selected and echoed in `Sec-WebSocket-Protocol`. With `ping_interval`, a Ping frame is sent whenever the connection has been idle inside `recv()` for the interval.
+
+### Broadcast
+
+`WsBroadcast` fans messages out to many sockets (chat rooms, live updates):
+
+```rust
+use rustrest::{WebSocketMessage, WsBroadcast};
+
+let room = WsBroadcast::new(64);
+app.state(room.clone());
+
+app.websocket("/chat", move |mut socket| {
+    let room = room.clone();
+    async move {
+        let mut feed = room.subscribe();
+        loop {
+            tokio::select! {
+                Ok(message) = feed.recv() => {
+                    if socket.send(message).await.is_err() { break; }
+                }
+                received = socket.recv() => match received {
+                    Ok(Some(message)) if message.is_text() => { room.send(message); }
+                    Ok(Some(_)) => {}
+                    _ => break,
+                },
+            }
+        }
+    }
+});
+```
+
 ### Manual Handshake Helper
 
 RustRest includes a handshake helper:
@@ -752,14 +891,25 @@ This validates upgrade headers and returns `101 Switching Protocols` with `Sec-W
 
 ## Serving with an Existing TcpListener
 
-Besides `listen`, you can use `serve` for tests or custom bootstrap code:
+Besides `listen`, you can use `serve` for tests or custom bootstrap code, or
+`serve_with_shutdown` / `listen_with_shutdown` for graceful shutdown:
 
 ```rust
 use tokio::net::TcpListener;
 
 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-app.serve(listener).await;
+
+// Serve until the process is killed.
+app.serve(listener).await?;
+
+// Or stop accepting on a signal and drain in-flight connections:
+// app.serve_with_shutdown(listener, async {
+//     tokio::signal::ctrl_c().await.ok();
+// }).await?;
 ```
+
+`listen`, `serve`, and the `*_with_shutdown` variants all return
+`std::io::Result<()>`.
 
 ## Testing
 
@@ -813,28 +963,43 @@ src/
   main.rs                # Demo server for cargo run
   api.rs                 # Demo router used by main.rs
   users.rs               # Demo router used by main.rs
-  app.rs                 # Core: App, Router, Request, Response
+  app.rs                 # Module wiring + public re-exports
   app/
+    server.rs            # App, ServerConfig, listen/serve/dispatch
+    router.rs            # Router, RouteHandle, RouteInfo, static files
+    trie.rs              # Trie index backing route lookup
+    openapi.rs           # OpenAPI document builder + Swagger UI page
+    request.rs           # Request + RequestBuilder
+    response.rs          # Response + IntoResponse
+    handler.rs           # Handler/Next/Middleware plumbing
+    extract.rs           # Json, Form, Path, Query, State, Cookies, Headers, ...
+    form.rs              # Form bodies + multipart parser
+    cookie.rs            # Cookie builder + sign/verify helpers
+    session.rs           # Minimal in-memory Sessions middleware
+    middleware.rs        # Built-in middleware (Cors, compression, ...)
     error.rs             # HttpError and IntoHttpError
-    extract.rs           # Json, Path, Query, State
-    middleware.rs        # Built-in middleware
+    state.rs             # Type-keyed StateStore
+    testing.rs           # In-process TestClient
+    tls.rs               # HTTPS via rustls (feature `tls`)
     sse.rs               # SseEvent
+    websocket.rs         # WebSocket support
     tests.rs             # Framework unit tests
 examples/
   basic.rs               # Minimal example
   api.rs                 # Full API example
   websocket.rs           # WebSocket and browser client example
 tests/
-  http_integration.rs    # Real HTTP integration test
+  http_integration.rs    # Real HTTP integration tests
+  tls_integration.rs     # Real HTTPS integration test (feature `tls`)
 ```
 
 ## Current Limitations
 
-- Request bodies are fully buffered with a 64 KB limit.
-- Request streaming is not implemented yet.
-- TLS is not integrated; use a proxy or external listener if you need HTTPS.
-- Routing is registration-order based, without specificity ranking.
-- Built-in CORS is permissive; customize it for stricter policies.
+- Request bodies are fully buffered (configurable limit, 64 KB by default; oversized bodies get `413`).
+- Request streaming is not implemented yet (responses do stream).
+- Sessions are in-memory only (single process); use your own store for multi-instance deployments.
+- Rate limiting is in-memory and per process.
+- OpenAPI output covers paths, methods, and path parameters; request/response schemas are not introspected.
 - Handler argument macros are not implemented; extractors are used through `req.extract::<T>()`.
 
 ## License
