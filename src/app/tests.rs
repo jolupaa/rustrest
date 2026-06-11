@@ -25,6 +25,8 @@ fn dummy_request(body: &str) -> Request {
         body: Bytes::from(body.to_string()),
         params: HashMap::new(),
         route_pattern: None,
+        websocket_runtime: WebSocketRuntimeHandle::local(),
+        resolved_websocket_config: None,
         state: StateStore::default(),
         upgrade: None,
         remote_addr: None,
@@ -61,6 +63,44 @@ fn websocket_config_rejects_unbounded_or_inconsistent_values() {
             .validate()
             .is_err()
     );
+}
+
+#[test]
+fn websocket_routes_validate_against_app_defaults_before_serving() {
+    let mut app = App::new();
+    app.websocket_defaults(WebSocketConfig::new().outbound_capacity(0));
+    app.websocket("/ws", |_socket| async move {});
+
+    let error = app
+        .validate_websockets()
+        .expect_err("invalid defaults must reject startup");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[tokio::test]
+async fn websocket_dispatch_uses_app_runtime_and_releases_failed_spawn() {
+    let mut app = App::new();
+    app.websocket("/ws", |_socket| async move {});
+    let runtime = app.websocket_runtime();
+
+    let request = Request::builder()
+        .method("GET")
+        .path("/ws")
+        .header("host", "localhost")
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .remote_addr("127.0.0.1:4501".parse().unwrap())
+        .build();
+
+    let response = app.dispatch(request).await;
+
+    assert_eq!(response.status, 400);
+    assert_eq!(runtime.stats().accepted_connections, 1);
+    assert_eq!(runtime.stats().active_connections, 0);
+    assert_eq!(runtime.stats().closed_connections, 1);
 }
 
 #[test]
@@ -985,6 +1025,8 @@ fn query_params_are_parsed_and_url_decoded() {
         body: Bytes::new(),
         params: HashMap::new(),
         route_pattern: None,
+        websocket_runtime: WebSocketRuntimeHandle::local(),
+        resolved_websocket_config: None,
         state: StateStore::default(),
         upgrade: None,
         remote_addr: None,

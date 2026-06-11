@@ -17,11 +17,11 @@ use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::{TcpListener, ToSocketAddrs};
 
-use super::router::MatchedRoute;
+use super::router::{MatchedRoute, RouteKind};
 use super::websocket::{header_value_contains_token, is_valid_websocket_key};
 use super::{
     ErrorHandler, HttpError, IntoHandler, IntoMiddleware, Middleware, Next, Request, Response,
-    RouteHandle, Router, StateStore,
+    RouteHandle, Router, StateStore, WebSocketConfig, WebSocketObserver, WebSocketRuntimeHandle,
 };
 use super::{
     Handler, ResponseBody, allow_header_value, method_not_allowed_handler, not_found_handler,
@@ -109,6 +109,8 @@ pub struct App {
     state: StateStore,
     error_handler: Option<ErrorHandler>,
     pub(crate) config: ServerConfig,
+    websocket_runtime: WebSocketRuntimeHandle,
+    websocket_defaults: WebSocketConfig,
 }
 
 impl App {
@@ -119,7 +121,29 @@ impl App {
             state: StateStore::default(),
             error_handler: None,
             config: ServerConfig::default(),
+            websocket_runtime: WebSocketRuntimeHandle::local(),
+            websocket_defaults: WebSocketConfig::new(),
         }
+    }
+
+    pub fn websocket_runtime(&self) -> WebSocketRuntimeHandle {
+        self.websocket_runtime.clone()
+    }
+
+    pub fn websocket_defaults(&mut self, config: WebSocketConfig) -> &mut Self {
+        self.websocket_defaults = config;
+        self
+    }
+
+    pub fn websocket_observer(&mut self, observer: Arc<dyn WebSocketObserver>) -> &mut Self {
+        self.websocket_runtime.set_observer(observer);
+        self
+    }
+
+    pub(crate) fn validate_websockets(&self) -> io::Result<()> {
+        self.router
+            .validate_websockets(&self.websocket_defaults)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
     }
 
     /// Sets the maximum request body size buffered into memory. Requests whose
@@ -309,6 +333,7 @@ impl App {
     /// Binds to `address` and serves connections until the process is killed.
     /// Returns an error only if binding fails; accept errors are non-fatal.
     pub async fn listen(self, address: impl ToSocketAddrs) -> io::Result<()> {
+        self.validate_websockets()?;
         let listener = TcpListener::bind(address).await?;
         if let Ok(local) = listener.local_addr() {
             println!("Server listening at http://{}", local);
@@ -323,6 +348,7 @@ impl App {
         address: impl ToSocketAddrs,
         shutdown: impl Future<Output = ()> + Send,
     ) -> io::Result<()> {
+        self.validate_websockets()?;
         let listener = TcpListener::bind(address).await?;
         if let Ok(local) = listener.local_addr() {
             println!("Server listening at http://{}", local);
@@ -345,6 +371,7 @@ impl App {
         listener: TcpListener,
         shutdown: impl Future<Output = ()> + Send,
     ) -> io::Result<()> {
+        self.validate_websockets()?;
         let header_read_timeout = self.config.header_read_timeout;
         let app = Arc::new(self);
         let mut builder = auto::Builder::new(TokioExecutor::new());
@@ -473,6 +500,8 @@ impl App {
             body,
             params: HashMap::new(),
             route_pattern: None,
+            websocket_runtime: self.websocket_runtime.clone(),
+            resolved_websocket_config: None,
             state: self.state.clone(),
             upgrade,
             remote_addr,
@@ -515,6 +544,7 @@ impl App {
                 middlewares: Vec::new(),
                 params: HashMap::new(),
                 pattern: path.to_string(),
+                kind: RouteKind::Http,
             }
         } else if method == "HEAD" && allowed.iter().any(|m| m == "GET") {
             self.router
@@ -526,6 +556,7 @@ impl App {
                 middlewares: Vec::new(),
                 params: HashMap::new(),
                 pattern: path.to_string(),
+                kind: RouteKind::Http,
             }
         } else {
             MatchedRoute {
@@ -533,6 +564,7 @@ impl App {
                 middlewares: Vec::new(),
                 params: HashMap::new(),
                 pattern: path.to_string(),
+                kind: RouteKind::Http,
             }
         }
     }
@@ -568,6 +600,7 @@ impl App {
     /// middleware onion ending at the matched handler (or a 404 handler).
     pub(crate) async fn dispatch(&self, mut request: Request) -> Response {
         request.state = self.state.clone();
+        request.websocket_runtime = self.websocket_runtime.clone();
         let is_head = request.method == "HEAD";
         let matched = match self.trailing_slash_miss(&request) {
             Some(handler) => MatchedRoute {
@@ -575,6 +608,7 @@ impl App {
                 middlewares: Vec::new(),
                 params: HashMap::new(),
                 pattern: request.path.clone(),
+                kind: RouteKind::Http,
             },
             None => match self.router.route(&request.method, &request.path) {
                 Some(found) => found,
@@ -586,9 +620,19 @@ impl App {
             middlewares: route_middlewares,
             params,
             pattern,
+            kind,
         } = matched;
         request.params = params;
         request.route_pattern = Some(pattern);
+        request.resolved_websocket_config = match kind {
+            RouteKind::Http => None,
+            RouteKind::WebSocket(route_config) => {
+                Some(super::websocket::ResolvedWebSocketConfig::from_layers(
+                    &self.websocket_defaults,
+                    &route_config,
+                ))
+            }
+        };
 
         // Innermost layer: the matched handler.
         let mut next: Next = Box::new(move |req| (*handler)(req));

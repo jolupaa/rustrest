@@ -223,6 +223,7 @@ async fn websocket_config_negotiates_protocol_pings_and_limits_message_size() {
     let config = WebSocketConfig::new()
         .protocols(&["superchat"])
         .ping_interval(Duration::from_millis(100))
+        .pong_timeout(Duration::from_millis(50))
         .max_message_size(1024);
     app.websocket_with("/ws", config, |mut socket| async move {
         let protocol = socket.protocol().unwrap_or("none").to_string();

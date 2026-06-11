@@ -1,8 +1,13 @@
 use hyper::header::SEC_WEBSOCKET_ACCEPT;
+use std::net::SocketAddr;
 
 use crate::RequestBuilder;
 
 use super::*;
+
+fn resolved_config(app: WebSocketConfig, route: WebSocketConfig) -> ResolvedWebSocketConfig {
+    ResolvedWebSocketConfig::from_layers(&app, &route)
+}
 
 fn handshake_request_without_host() -> RequestBuilder {
     Request::builder()
@@ -188,4 +193,171 @@ async fn ws_broadcast_fans_out_to_subscribers() {
     drop(a);
     drop(b);
     assert_eq!(room.send_text("nadie"), 0);
+}
+
+#[test]
+fn websocket_runtime_accounts_for_permits() {
+    let runtime = WebSocketRuntimeHandle::local();
+    let config = resolved_config(WebSocketConfig::new(), WebSocketConfig::new());
+    let first_addr: SocketAddr = "127.0.0.1:4001".parse().unwrap();
+    let second_addr: SocketAddr = "127.0.0.2:4002".parse().unwrap();
+
+    let first = runtime
+        .admit("/chat/:room", Some(first_addr), Some("chat"), &config)
+        .unwrap();
+    let first_id = first.id();
+    let _second = runtime
+        .admit("/chat/:room", Some(second_addr), None, &config)
+        .unwrap();
+
+    assert_eq!(runtime.stats().active_connections, 2);
+    let first_snapshot = runtime.connection(first_id).unwrap();
+    assert_eq!(first_snapshot.id.to_string(), "1");
+    assert_eq!(first_snapshot.route, "/chat/:room");
+    assert_eq!(first_snapshot.remote_addr, Some(first_addr));
+    assert_eq!(first_snapshot.protocol.as_deref(), Some("chat"));
+    assert_eq!(runtime.connections().len(), 2);
+    drop(first);
+    assert_eq!(runtime.stats().active_connections, 1);
+    assert_eq!(runtime.stats().accepted_connections, 2);
+}
+
+#[test]
+fn websocket_runtime_rejects_capacity_without_partial_registration() {
+    let process_runtime = WebSocketRuntimeHandle::local();
+    let process_config = resolved_config(
+        WebSocketConfig::new().max_connections(1),
+        WebSocketConfig::new()
+            .max_connections(1)
+            .max_connections_per_ip(1),
+    );
+    let process_permit = process_runtime
+        .admit(
+            "/process",
+            Some("127.0.0.1:4101".parse().unwrap()),
+            None,
+            &process_config,
+        )
+        .unwrap();
+    assert!(matches!(
+        process_runtime.admit(
+            "/process",
+            Some("127.0.0.1:4102".parse().unwrap()),
+            None,
+            &process_config,
+        ),
+        Err(AdmissionError::ProcessCapacity)
+    ));
+    assert_eq!(process_runtime.stats().active_connections, 1);
+    assert_eq!(process_runtime.stats().accepted_connections, 1);
+    assert_eq!(process_runtime.stats().rejected_connections, 1);
+    drop(process_permit);
+
+    let route_runtime = WebSocketRuntimeHandle::local();
+    let route_config = resolved_config(
+        WebSocketConfig::new(),
+        WebSocketConfig::new()
+            .max_connections(1)
+            .max_connections_per_ip(1),
+    );
+    let route_permit = route_runtime
+        .admit(
+            "/route/:id",
+            Some("127.0.0.3:4201".parse().unwrap()),
+            None,
+            &route_config,
+        )
+        .unwrap();
+    assert!(matches!(
+        route_runtime.admit(
+            "/route/:id",
+            Some("127.0.0.3:4202".parse().unwrap()),
+            None,
+            &route_config,
+        ),
+        Err(AdmissionError::RouteCapacity)
+    ));
+    assert_eq!(route_runtime.stats().active_connections, 1);
+    assert_eq!(route_runtime.stats().accepted_connections, 1);
+    assert_eq!(route_runtime.stats().rejected_connections, 1);
+    drop(route_permit);
+
+    let ip_runtime = WebSocketRuntimeHandle::local();
+    let ip_config = resolved_config(
+        WebSocketConfig::new(),
+        WebSocketConfig::new().max_connections_per_ip(1),
+    );
+    let ip_permit = ip_runtime
+        .admit(
+            "/first",
+            Some("127.0.0.5:4301".parse().unwrap()),
+            None,
+            &ip_config,
+        )
+        .unwrap();
+    assert!(matches!(
+        ip_runtime.admit(
+            "/second",
+            Some("127.0.0.5:4302".parse().unwrap()),
+            None,
+            &ip_config,
+        ),
+        Err(AdmissionError::IpCapacity)
+    ));
+    assert_eq!(ip_runtime.stats().active_connections, 1);
+    assert_eq!(ip_runtime.stats().accepted_connections, 1);
+    assert_eq!(ip_runtime.stats().rejected_connections, 1);
+    drop(ip_permit);
+}
+
+#[test]
+fn websocket_runtime_rejects_after_accepting_stops() {
+    let runtime = WebSocketRuntimeHandle::local();
+    let config = resolved_config(WebSocketConfig::new(), WebSocketConfig::new());
+
+    runtime.stop_accepting();
+
+    assert!(matches!(
+        runtime.admit("/ws", None, None, &config),
+        Err(AdmissionError::Shutdown)
+    ));
+    assert_eq!(runtime.stats().active_connections, 0);
+    assert_eq!(runtime.stats().accepted_connections, 0);
+    assert_eq!(runtime.stats().rejected_connections, 1);
+}
+
+#[test]
+fn websocket_runtime_isolates_observer_panics_during_admission() {
+    struct PanickingObserver;
+
+    impl WebSocketObserver for PanickingObserver {
+        fn observe(&self, _event: &WebSocketObservation<'_>) {
+            panic!("observer panic");
+        }
+    }
+
+    let runtime = WebSocketRuntimeHandle::local();
+    runtime.set_observer(std::sync::Arc::new(PanickingObserver));
+    let config = resolved_config(WebSocketConfig::new(), WebSocketConfig::new());
+
+    let permit = runtime.admit("/ws", None, None, &config).unwrap();
+
+    assert_eq!(runtime.stats().active_connections, 1);
+    drop(permit);
+    assert_eq!(runtime.stats().active_connections, 0);
+}
+
+#[test]
+fn websocket_admission_errors_map_before_upgrade() {
+    for error in [
+        AdmissionError::Shutdown,
+        AdmissionError::ProcessCapacity,
+        AdmissionError::RouteCapacity,
+    ] {
+        assert_eq!(error.into_response().status, 503);
+    }
+
+    let response = AdmissionError::IpCapacity.into_response();
+    assert_eq!(response.status, 429);
+    assert_eq!(response.headers.get("retry-after").unwrap(), "1");
 }

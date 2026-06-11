@@ -39,8 +39,10 @@ pub use state::StateStore;
 pub use testing::{TestClient, TestRequest};
 pub use websocket::{
     BackpressurePolicy, IntoWebSocketHandler, OriginPolicy, WebSocket, WebSocketCapacityError,
-    WebSocketConfig, WebSocketError, WebSocketErrorCategory, WebSocketEvent, WebSocketHandler,
-    WebSocketMessage, WebSocketTimeout, WsBroadcast, WsError,
+    WebSocketConfig, WebSocketConnectionSnapshot, WebSocketError, WebSocketErrorCategory,
+    WebSocketEvent, WebSocketHandler, WebSocketId, WebSocketMessage, WebSocketObservation,
+    WebSocketObserver, WebSocketRuntimeHandle, WebSocketStats, WebSocketTimeout, WsBroadcast,
+    WsError,
 };
 
 // Crate-internal helpers shared across submodules.

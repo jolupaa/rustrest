@@ -1,5 +1,6 @@
 mod config;
 mod error;
+mod runtime;
 mod socket;
 #[cfg(test)]
 mod tests;
@@ -16,10 +17,16 @@ use super::{HttpError, Request, Response};
 pub(crate) use config::ResolvedWebSocketConfig;
 pub use config::{BackpressurePolicy, OriginPolicy, WebSocketConfig};
 pub use error::{WebSocketCapacityError, WebSocketError, WebSocketTimeout, WsError};
+pub use runtime::WebSocketRuntimeHandle;
 pub use socket::{
     IntoWebSocketHandler, WebSocket, WebSocketEvent, WebSocketHandler, WebSocketMessage,
 };
-pub use types::WebSocketErrorCategory;
+pub use types::{
+    WebSocketConnectionSnapshot, WebSocketErrorCategory, WebSocketId, WebSocketObservation,
+    WebSocketObserver, WebSocketStats,
+};
+
+pub(crate) use runtime::{AdmissionError, ConnectionPermit};
 
 pub(crate) struct HandshakeRejection {
     status: u16,
@@ -213,16 +220,15 @@ impl Request {
     where
         H: IntoWebSocketHandler,
     {
-        let config = ResolvedWebSocketConfig::from_layers(&WebSocketConfig::default(), &config);
+        let config = self.resolved_websocket_config.clone().unwrap_or_else(|| {
+            ResolvedWebSocketConfig::from_layers(&WebSocketConfig::default(), &config)
+        });
         let protocol = match validate_handshake(&self, &config) {
             Ok(protocol) => protocol,
             Err(rejection) => return rejection.into_response(),
         };
 
-        match self.into_websocket_response(config, protocol, handler.into_websocket_handler()) {
-            Ok(response) => response,
-            Err(err) => Response::from_error(err),
-        }
+        self.into_websocket_response(config, protocol, handler.into_websocket_handler())
     }
 
     fn into_websocket_response(
@@ -230,16 +236,52 @@ impl Request {
         config: ResolvedWebSocketConfig,
         protocol: Option<String>,
         handler: WebSocketHandler,
-    ) -> Result<Response, HttpError> {
-        let mut response = Response::websocket(&self)?;
+    ) -> Response {
+        let route = self.route_pattern().unwrap_or(&self.path).to_string();
+        let permit = match self.websocket_runtime.admit(
+            &route,
+            self.remote_addr,
+            protocol.as_deref(),
+            &config,
+        ) {
+            Ok(permit) => permit,
+            Err(error) => return error.into_response(),
+        };
+        let mut response = match Response::websocket(&self) {
+            Ok(response) => response,
+            Err(error) => return Response::from_error(error),
+        };
         if let Some(protocol) = &protocol {
             response = response.header("sec-websocket-protocol", protocol);
         }
-        let upgrade = self.upgrade.ok_or_else(|| {
-            HttpError::bad_request("La actualizacion WebSocket no esta disponible")
-        })?;
-        spawn_websocket(upgrade, config, protocol, handler);
-        Ok(response)
+        let Some(upgrade) = self.upgrade else {
+            return Response::from_error(HttpError::bad_request(
+                "La actualizacion WebSocket no esta disponible",
+            ));
+        };
+        spawn_websocket(upgrade, config, protocol, handler, permit);
+        response
+    }
+}
+
+impl AdmissionError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Shutdown => Response::send("El runtime WebSocket se esta cerrando").status(503),
+            Self::ProcessCapacity => {
+                Response::send("La capacidad global de conexiones WebSocket esta agotada")
+                    .status(503)
+            }
+            Self::RouteCapacity => {
+                Response::send("La capacidad de conexiones WebSocket para esta ruta esta agotada")
+                    .status(503)
+            }
+            Self::IpCapacity => Response::send(
+                "El limite de conexiones WebSocket para esta direccion IP esta agotado",
+            )
+            .status(429)
+            .header("retry-after", "1"),
+        }
     }
 }
 
@@ -248,8 +290,10 @@ fn spawn_websocket(
     config: ResolvedWebSocketConfig,
     protocol: Option<String>,
     handler: WebSocketHandler,
+    permit: ConnectionPermit,
 ) {
     tokio::spawn(async move {
+        let _permit = permit;
         match upgrade.await {
             Ok(upgraded) => {
                 let io = TokioIo::new(upgraded);

@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use rustrest::App;
+use rustrest::{App, WebSocketConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -144,4 +144,86 @@ async fn websocket_rejects_duplicate_version() {
     .await;
 
     assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+}
+
+#[tokio::test]
+async fn websocket_process_capacity_rejects_before_101() {
+    let (addr, _server) = spawn_app(|app| {
+        app.websocket_defaults(WebSocketConfig::new().max_connections(1));
+        app.websocket("/ws", |_socket| async move {
+            std::future::pending::<()>().await;
+        });
+    })
+    .await;
+    let (_first, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    let response = raw_handshake(
+        addr,
+        &[
+            ("Sec-WebSocket-Version", "13"),
+            ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ],
+    )
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+}
+
+#[tokio::test]
+async fn websocket_route_capacity_rejects_before_101() {
+    let (addr, _server) = spawn_app(|app| {
+        app.websocket_with(
+            "/ws",
+            WebSocketConfig::new().max_connections(1),
+            |_socket| async move {
+                std::future::pending::<()>().await;
+            },
+        );
+    })
+    .await;
+    let (_first, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    let response = raw_handshake(
+        addr,
+        &[
+            ("Sec-WebSocket-Version", "13"),
+            ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ],
+    )
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+}
+
+#[tokio::test]
+async fn websocket_ip_capacity_rejects_with_retry_after_before_101() {
+    let (addr, _server) = spawn_app(|app| {
+        app.websocket_with(
+            "/ws",
+            WebSocketConfig::new().max_connections_per_ip(1),
+            |_socket| async move {
+                std::future::pending::<()>().await;
+            },
+        );
+    })
+    .await;
+    let (_first, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    let response = raw_handshake(
+        addr,
+        &[
+            ("Sec-WebSocket-Version", "13"),
+            ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ],
+    )
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 429"), "{response}");
+    assert!(response.contains("retry-after: 1"), "{response}");
 }

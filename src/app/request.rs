@@ -7,7 +7,8 @@ use hyper::header::{SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION};
 use hyper::upgrade::OnUpgrade;
 use serde::de::DeserializeOwned;
 
-use super::{FromRequest, HttpError, StateStore};
+use super::websocket::ResolvedWebSocketConfig;
+use super::{FromRequest, HttpError, StateStore, WebSocketRuntimeHandle};
 
 /// Request data handed to each route handler. Fields are part of the
 /// handler-facing API; some demo handlers ignore them.
@@ -28,6 +29,8 @@ pub struct Request {
     /// yields `{"id": "42"}`.
     pub params: HashMap<String, String>,
     pub(crate) route_pattern: Option<String>,
+    pub(crate) websocket_runtime: WebSocketRuntimeHandle,
+    pub(crate) resolved_websocket_config: Option<ResolvedWebSocketConfig>,
     pub(crate) state: StateStore,
     pub(crate) upgrade: Option<OnUpgrade>,
     pub(crate) remote_addr: Option<SocketAddr>,
@@ -303,6 +306,8 @@ impl RequestBuilder {
             body: self.body,
             params: self.params,
             route_pattern: None,
+            websocket_runtime: WebSocketRuntimeHandle::local(),
+            resolved_websocket_config: None,
             state: self.state,
             upgrade: None,
             remote_addr: self.remote_addr,

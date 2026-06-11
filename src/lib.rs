@@ -30,6 +30,8 @@ pub use app::{
     Json, Middleware, MultipartPart, Next, OriginPolicy, Path, Query, Request, RequestBuilder,
     Response, RouteHandle, RouteInfo, Router, SameSite, Sessions, SseEvent, State, StateStore,
     TestClient, TestRequest, TrailingSlash, WebSocket, WebSocketCapacityError, WebSocketConfig,
-    WebSocketError, WebSocketErrorCategory, WebSocketEvent, WebSocketHandler, WebSocketMessage,
-    WebSocketTimeout, WsBroadcast, WsError, middleware, sign_value, verify_value,
+    WebSocketConnectionSnapshot, WebSocketError, WebSocketErrorCategory, WebSocketEvent,
+    WebSocketHandler, WebSocketId, WebSocketMessage, WebSocketObservation, WebSocketObserver,
+    WebSocketRuntimeHandle, WebSocketStats, WebSocketTimeout, WsBroadcast, WsError, middleware,
+    sign_value, verify_value,
 };

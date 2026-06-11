@@ -48,6 +48,7 @@ impl App {
         address: impl ToSocketAddrs,
         config: ServerConfig,
     ) -> io::Result<()> {
+        self.validate_websockets()?;
         let listener = TcpListener::bind(address).await?;
         if let Ok(local) = listener.local_addr() {
             println!("Server listening at https://{}", local);
@@ -70,6 +71,7 @@ impl App {
         config: ServerConfig,
         shutdown: impl Future<Output = ()> + Send,
     ) -> io::Result<()> {
+        self.validate_websockets()?;
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let app = Arc::new(self);
         let builder = Arc::new(auto::Builder::new(TokioExecutor::new()));

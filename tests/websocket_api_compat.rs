@@ -1,9 +1,17 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use rustrest::{
     App, IntoWebSocketHandler, Request, Response, Router, WebSocket, WebSocketConfig,
-    WebSocketError, WebSocketEvent, WebSocketHandler, WebSocketMessage, WsBroadcast,
+    WebSocketError, WebSocketEvent, WebSocketHandler, WebSocketMessage, WebSocketObservation,
+    WebSocketObserver, WebSocketRuntimeHandle, WebSocketStats, WsBroadcast,
 };
+
+struct Observer;
+
+impl WebSocketObserver for Observer {
+    fn observe(&self, _event: &WebSocketObservation<'_>) {}
+}
 
 fn exhaustive_existing_error(error: WebSocketError) -> &'static str {
     match error {
@@ -17,6 +25,11 @@ fn accepts_websocket(_: WebSocket) {}
 #[test]
 fn existing_websocket_surface_still_compiles() {
     let mut app = App::new();
+    let runtime: WebSocketRuntimeHandle = app.websocket_runtime();
+    let _stats: WebSocketStats = runtime.stats();
+    let _connections = runtime.connections();
+    let _: &mut App = app.websocket_defaults(WebSocketConfig::new());
+    let _: &mut App = app.websocket_observer(Arc::new(Observer));
     let handler: WebSocketHandler = (|mut socket: WebSocket| async move {
         let _: Option<&str> = socket.protocol();
         let _: Result<Option<WebSocketMessage>, WebSocketError> = socket.recv().await;
