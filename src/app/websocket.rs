@@ -1,4 +1,5 @@
 mod config;
+mod driver;
 mod error;
 mod runtime;
 mod socket;
@@ -6,13 +7,9 @@ mod socket;
 mod tests;
 mod types;
 
+use super::{HttpError, Request, Response};
 use base64::Engine;
 use hyper::upgrade::OnUpgrade;
-use hyper_util::rt::TokioIo;
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::protocol::Role;
-
-use super::{HttpError, Request, Response};
 
 pub(crate) use config::ResolvedWebSocketConfig;
 pub use config::{BackpressurePolicy, OriginPolicy, WebSocketConfig};
@@ -20,10 +17,11 @@ pub use error::{WebSocketCapacityError, WebSocketError, WebSocketTimeout, WsErro
 pub use runtime::WebSocketRuntimeHandle;
 pub use socket::{
     IntoWebSocketHandler, WebSocket, WebSocketEvent, WebSocketHandler, WebSocketMessage,
+    WebSocketReceiver, WebSocketSender,
 };
 pub use types::{
-    WebSocketConnectionSnapshot, WebSocketErrorCategory, WebSocketId, WebSocketObservation,
-    WebSocketObserver, WebSocketStats,
+    WebSocketCloseInfo, WebSocketCloseInitiator, WebSocketConnectionSnapshot,
+    WebSocketErrorCategory, WebSocketId, WebSocketObservation, WebSocketObserver, WebSocketStats,
 };
 
 pub(crate) use runtime::{AdmissionError, ConnectionPermit};
@@ -259,7 +257,15 @@ impl Request {
                 "La actualizacion WebSocket no esta disponible",
             ));
         };
-        spawn_websocket(upgrade, config, protocol, handler, permit);
+        spawn_websocket(
+            upgrade,
+            config,
+            protocol,
+            handler,
+            permit,
+            route,
+            self.remote_addr,
+        );
         response
     }
 }
@@ -291,22 +297,31 @@ fn spawn_websocket(
     protocol: Option<String>,
     handler: WebSocketHandler,
     permit: ConnectionPermit,
+    route: String,
+    remote_addr: Option<std::net::SocketAddr>,
 ) {
     tokio::spawn(async move {
-        let _permit = permit;
         match upgrade.await {
             Ok(upgraded) => {
-                let io = TokioIo::new(upgraded);
-                let stream = WebSocketStream::from_raw_socket(
-                    io,
-                    Role::Server,
-                    Some(config.tungstenite_config()),
-                )
-                .await;
-                handler(WebSocket::new(stream, protocol, config.ping_interval)).await;
+                let runtime = permit.runtime();
+                let id = permit.id();
+                let (socket, internal_sender, channels) = socket::channel_pair(
+                    socket::SocketMetadata {
+                        id,
+                        remote_addr,
+                        route,
+                        protocol,
+                    },
+                    config.inbound_capacity,
+                    config.outbound_capacity,
+                );
+                let driver =
+                    driver::spawn(upgraded, config, handler, socket, channels, permit).await;
+                let registered = runtime.register_driver(id, internal_sender, driver.abort_handle);
+                let _ = driver.start_tx.send(registered);
             }
             Err(err) => {
-                eprintln!("WebSocket upgrade failed: {}", err);
+                eprintln!("La actualizacion WebSocket fallo: {err}");
             }
         }
     });

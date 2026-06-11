@@ -2,9 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rustrest::{
-    App, IntoWebSocketHandler, Request, Response, Router, WebSocket, WebSocketConfig,
-    WebSocketError, WebSocketEvent, WebSocketHandler, WebSocketMessage, WebSocketObservation,
-    WebSocketObserver, WebSocketRuntimeHandle, WebSocketStats, WsBroadcast,
+    App, IntoWebSocketHandler, Request, Response, Router, WebSocket, WebSocketCloseInfo,
+    WebSocketCloseInitiator, WebSocketConfig, WebSocketError, WebSocketEvent, WebSocketHandler,
+    WebSocketMessage, WebSocketObservation, WebSocketObserver, WebSocketReceiver,
+    WebSocketRuntimeHandle, WebSocketSender, WebSocketStats, WsBroadcast,
 };
 
 struct Observer;
@@ -21,6 +22,8 @@ fn exhaustive_existing_error(error: WebSocketError) -> &'static str {
 }
 
 fn accepts_websocket(_: WebSocket) {}
+fn accepts_close_info(_: WebSocketCloseInfo) {}
+fn accepts_close_initiator(_: WebSocketCloseInitiator) {}
 
 #[test]
 fn existing_websocket_surface_still_compiles() {
@@ -44,6 +47,17 @@ fn existing_websocket_surface_still_compiles() {
         let _: Result<(), WebSocketError> = socket.ping(Vec::<u8>::new()).await;
         let _: Result<(), WebSocketError> = socket.pong(Vec::<u8>::new()).await;
         let _: Result<(), WebSocketError> = socket.close().await;
+        let _ = socket.id();
+        let _: Option<std::net::SocketAddr> = socket.remote_addr();
+        let _: &str = socket.route();
+        let (mut receiver, sender): (WebSocketReceiver, WebSocketSender) = socket.split();
+        let cloned_sender: WebSocketSender = sender.clone();
+        let _ = sender.id();
+        let _: Option<std::net::SocketAddr> = sender.remote_addr();
+        let _: &str = sender.route();
+        let _: Option<&str> = sender.protocol();
+        let _: Result<(), WebSocketError> = cloned_sender.send_text("desde clone").await;
+        let _: Result<Option<WebSocketMessage>, WebSocketError> = receiver.recv().await;
     })
     .into_websocket_handler();
     let _: () = app.websocket("/ws", |_socket| async move {});
@@ -88,4 +102,6 @@ fn existing_websocket_surface_still_compiles() {
     };
     let _error_match: fn(WebSocketError) -> &'static str = exhaustive_existing_error;
     let _socket_consumer: fn(WebSocket) = accepts_websocket;
+    let _close_info_consumer: fn(WebSocketCloseInfo) = accepts_close_info;
+    let _close_initiator_consumer: fn(WebSocketCloseInitiator) = accepts_close_initiator;
 }

@@ -15,6 +15,26 @@ impl fmt::Display for WebSocketId {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WebSocketCloseInfo {
+    pub code: u16,
+    pub reason: String,
+    pub initiator: WebSocketCloseInitiator,
+    pub clean: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WebSocketCloseInitiator {
+    Local,
+    Peer,
+    Runtime,
+    Timeout,
+    ProtocolError,
+    Handler,
+}
+
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct WebSocketConnectionSnapshot {

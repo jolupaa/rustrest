@@ -1,19 +1,18 @@
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
-use hyper_util::rt::TokioIo;
+use hyper::body::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio_tungstenite::WebSocketStream;
+use tokio::sync::{mpsc, watch};
 
 use super::WebSocketError;
+use super::driver::{CONTROL_CHANNEL_CAPACITY, ControlCommand, DriverChannels, OutboundCommand};
+use super::types::{WebSocketCloseInfo, WebSocketId};
 
 pub use super::types::{WebSocketEvent, WebSocketMessage};
-
-type WebSocketInner = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 
 pub type WebSocketHandler =
     Arc<dyn Fn(WebSocket) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
@@ -39,71 +38,246 @@ impl IntoWebSocketHandler for WebSocketHandler {
 }
 
 pub struct WebSocket {
-    inner: WebSocketInner,
+    receiver: WebSocketReceiver,
+    sender: WebSocketSender,
+}
+
+#[derive(Clone)]
+pub struct WebSocketSender {
+    shared: Arc<SocketShared>,
+}
+
+pub struct WebSocketReceiver {
+    inbound: mpsc::Receiver<Result<WebSocketMessage, WebSocketError>>,
+    close_rx: watch::Receiver<Option<WebSocketCloseInfo>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct InternalWebSocketSender {
+    _shared: Arc<SocketShared>,
+}
+
+struct SocketShared {
+    id: WebSocketId,
+    remote_addr: Option<SocketAddr>,
+    route: String,
     protocol: Option<String>,
-    ping_interval: Option<Duration>,
+    outbound: mpsc::Sender<OutboundCommand>,
+    control: mpsc::Sender<ControlCommand>,
+}
+
+pub(crate) struct SocketMetadata {
+    pub id: WebSocketId,
+    pub remote_addr: Option<SocketAddr>,
+    pub route: String,
+    pub protocol: Option<String>,
+}
+
+pub(crate) fn channel_pair(
+    metadata: SocketMetadata,
+    inbound_capacity: usize,
+    outbound_capacity: usize,
+) -> (WebSocket, InternalWebSocketSender, DriverChannels) {
+    let (inbound_tx, inbound) = mpsc::channel(inbound_capacity);
+    let (outbound, outbound_rx) = mpsc::channel(outbound_capacity);
+    let (control, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
+    let (close_tx, close_rx) = watch::channel(None);
+    let shared = Arc::new(SocketShared {
+        id: metadata.id,
+        remote_addr: metadata.remote_addr,
+        route: metadata.route,
+        protocol: metadata.protocol,
+        outbound,
+        control,
+    });
+    let socket = WebSocket {
+        receiver: WebSocketReceiver { inbound, close_rx },
+        sender: WebSocketSender {
+            shared: shared.clone(),
+        },
+    };
+    let internal_sender = InternalWebSocketSender { _shared: shared };
+    let channels = DriverChannels {
+        inbound_tx,
+        outbound_rx,
+        control_rx,
+        close_tx,
+    };
+
+    (socket, internal_sender, channels)
 }
 
 impl WebSocket {
-    pub(super) fn new(
-        inner: WebSocketInner,
-        protocol: Option<String>,
-        ping_interval: Option<Duration>,
-    ) -> Self {
-        Self {
-            inner,
-            protocol,
-            ping_interval,
-        }
-    }
-
     /// The subprotocol negotiated during the handshake, if any.
     pub fn protocol(&self) -> Option<&str> {
-        self.protocol.as_deref()
+        self.sender.protocol()
+    }
+
+    pub fn id(&self) -> WebSocketId {
+        self.sender.id()
+    }
+
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        self.sender.remote_addr()
+    }
+
+    pub fn route(&self) -> &str {
+        self.sender.route()
+    }
+
+    pub fn split(self) -> (WebSocketReceiver, WebSocketSender) {
+        (self.receiver, self.sender)
     }
 
     pub async fn recv(&mut self) -> Result<Option<WebSocketMessage>, WebSocketError> {
-        loop {
-            let next = match self.ping_interval {
-                Some(interval) => match tokio::time::timeout(interval, self.inner.next()).await {
-                    Ok(next) => next,
-                    Err(_) => {
-                        // Idle for a full interval: ping and keep waiting.
-                        self.ping(hyper::body::Bytes::new()).await?;
-                        continue;
-                    }
-                },
-                None => self.inner.next().await,
-            };
-            return match next {
-                Some(Ok(message)) => Ok(Some(message)),
-                Some(Err(err)) => Err(err.into()),
-                None => Ok(None),
-            };
-        }
+        self.receiver.recv().await
     }
 
     pub async fn send(&mut self, message: WebSocketMessage) -> Result<(), WebSocketError> {
-        self.inner.send(message).await.map_err(Into::into)
+        self.sender.send(message).await
     }
 
     pub async fn send_text(&mut self, text: &str) -> Result<(), WebSocketError> {
-        self.send(WebSocketMessage::text(text.to_string())).await
+        self.sender.send_text(text).await
     }
 
-    pub async fn send_binary(
-        &mut self,
-        bytes: impl Into<hyper::body::Bytes>,
-    ) -> Result<(), WebSocketError> {
-        self.send(WebSocketMessage::binary(bytes.into())).await
+    pub async fn send_binary(&mut self, bytes: impl Into<Bytes>) -> Result<(), WebSocketError> {
+        self.sender.send_binary(bytes).await
     }
 
     pub async fn send_json<T>(&mut self, value: &T) -> Result<(), WebSocketError>
     where
         T: Serialize,
     {
+        self.sender.send_json(value).await
+    }
+
+    pub async fn recv_json<T>(&mut self) -> Result<Option<T>, WebSocketError>
+    where
+        T: DeserializeOwned,
+    {
+        self.receiver.recv_json().await
+    }
+
+    pub async fn send_event<T>(&mut self, event: &str, data: &T) -> Result<(), WebSocketError>
+    where
+        T: Serialize,
+    {
+        self.sender.send_event(event, data).await
+    }
+
+    pub async fn recv_event<T>(&mut self) -> Result<Option<WebSocketEvent<T>>, WebSocketError>
+    where
+        T: DeserializeOwned,
+    {
+        self.receiver.recv_event().await
+    }
+
+    pub async fn ping(&mut self, payload: impl Into<Bytes>) -> Result<(), WebSocketError> {
+        self.sender.ping(payload).await
+    }
+
+    pub async fn pong(&mut self, payload: impl Into<Bytes>) -> Result<(), WebSocketError> {
+        self.sender.pong(payload).await
+    }
+
+    pub async fn close(&mut self) -> Result<(), WebSocketError> {
+        self.sender.close().await
+    }
+}
+
+impl WebSocketSender {
+    pub fn protocol(&self) -> Option<&str> {
+        self.shared.protocol.as_deref()
+    }
+
+    pub fn id(&self) -> WebSocketId {
+        self.shared.id
+    }
+
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        self.shared.remote_addr
+    }
+
+    pub fn route(&self) -> &str {
+        &self.shared.route
+    }
+
+    pub async fn send(&self, message: WebSocketMessage) -> Result<(), WebSocketError> {
+        match message {
+            WebSocketMessage::Ping(payload) => {
+                self.send_control(ControlCommand::Ping(payload)).await
+            }
+            WebSocketMessage::Pong(payload) => {
+                self.send_control(ControlCommand::Pong(payload)).await
+            }
+            WebSocketMessage::Close(frame) => self.send_control(ControlCommand::Close(frame)).await,
+            message => self
+                .shared
+                .outbound
+                .send(OutboundCommand::Message(message))
+                .await
+                .map_err(|_| closed_error()),
+        }
+    }
+
+    pub async fn send_text(&self, text: &str) -> Result<(), WebSocketError> {
+        self.send(WebSocketMessage::text(text.to_string())).await
+    }
+
+    pub async fn send_binary(&self, bytes: impl Into<Bytes>) -> Result<(), WebSocketError> {
+        self.send(WebSocketMessage::binary(bytes.into())).await
+    }
+
+    pub async fn send_json<T>(&self, value: &T) -> Result<(), WebSocketError>
+    where
+        T: Serialize,
+    {
         let text = serde_json::to_string(value)?;
         self.send_text(&text).await
+    }
+
+    pub async fn send_event<T>(&self, event: &str, data: &T) -> Result<(), WebSocketError>
+    where
+        T: Serialize,
+    {
+        self.send_json(&WebSocketEvent {
+            event: event.to_string(),
+            data,
+        })
+        .await
+    }
+
+    pub async fn ping(&self, payload: impl Into<Bytes>) -> Result<(), WebSocketError> {
+        self.send_control(ControlCommand::Ping(payload.into()))
+            .await
+    }
+
+    pub async fn pong(&self, payload: impl Into<Bytes>) -> Result<(), WebSocketError> {
+        self.send_control(ControlCommand::Pong(payload.into()))
+            .await
+    }
+
+    pub async fn close(&self) -> Result<(), WebSocketError> {
+        self.send_control(ControlCommand::Close(None)).await
+    }
+
+    async fn send_control(&self, command: ControlCommand) -> Result<(), WebSocketError> {
+        self.shared
+            .control
+            .send(command)
+            .await
+            .map_err(|_| closed_error())
+    }
+}
+
+impl WebSocketReceiver {
+    pub async fn recv(&mut self) -> Result<Option<WebSocketMessage>, WebSocketError> {
+        match self.inbound.recv().await {
+            Some(Ok(message)) => Ok(Some(message)),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
+        }
     }
 
     pub async fn recv_json<T>(&mut self) -> Result<Option<T>, WebSocketError>
@@ -119,39 +293,14 @@ impl WebSocket {
         }
     }
 
-    pub async fn send_event<T>(&mut self, event: &str, data: &T) -> Result<(), WebSocketError>
-    where
-        T: Serialize,
-    {
-        self.send_json(&WebSocketEvent {
-            event: event.to_string(),
-            data,
-        })
-        .await
-    }
-
     pub async fn recv_event<T>(&mut self) -> Result<Option<WebSocketEvent<T>>, WebSocketError>
     where
         T: DeserializeOwned,
     {
         self.recv_json::<WebSocketEvent<T>>().await
     }
+}
 
-    pub async fn ping(
-        &mut self,
-        payload: impl Into<hyper::body::Bytes>,
-    ) -> Result<(), WebSocketError> {
-        self.send(WebSocketMessage::Ping(payload.into())).await
-    }
-
-    pub async fn pong(
-        &mut self,
-        payload: impl Into<hyper::body::Bytes>,
-    ) -> Result<(), WebSocketError> {
-        self.send(WebSocketMessage::Pong(payload.into())).await
-    }
-
-    pub async fn close(&mut self) -> Result<(), WebSocketError> {
-        self.send(WebSocketMessage::Close(None)).await
-    }
+fn closed_error() -> WebSocketError {
+    WebSocketError::Protocol(tokio_tungstenite::tungstenite::Error::ConnectionClosed)
 }

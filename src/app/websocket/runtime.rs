@@ -6,8 +6,10 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::SystemTime;
 
 use tokio::sync::{Notify, watch};
+use tokio::task::AbortHandle;
 
 use super::ResolvedWebSocketConfig;
+use super::socket::InternalWebSocketSender;
 use super::types::{
     WebSocketConnectionSnapshot, WebSocketId, WebSocketObservation, WebSocketObserver,
     WebSocketStats,
@@ -35,6 +37,8 @@ struct ConnectionEntry {
     remote_addr: Option<SocketAddr>,
     protocol: Option<String>,
     opened_at: SystemTime,
+    internal_sender: Option<InternalWebSocketSender>,
+    driver_abort: Option<AbortHandle>,
 }
 
 #[derive(Default)]
@@ -77,6 +81,10 @@ pub(crate) struct ConnectionPermit {
 impl ConnectionPermit {
     pub(crate) fn id(&self) -> WebSocketId {
         self.id
+    }
+
+    pub(crate) fn runtime(&self) -> WebSocketRuntimeHandle {
+        self.runtime.clone()
     }
 }
 
@@ -186,6 +194,8 @@ impl WebSocketRuntimeHandle {
                             remote_addr,
                             protocol: protocol.map(str::to_string),
                             opened_at: SystemTime::now(),
+                            internal_sender: None,
+                            driver_abort: None,
                         },
                     );
                     *registry.route_counts.entry(route).or_default() += 1;
@@ -214,6 +224,21 @@ impl WebSocketRuntimeHandle {
                 Err(error)
             }
         }
+    }
+
+    pub(crate) fn register_driver(
+        &self,
+        id: WebSocketId,
+        internal_sender: InternalWebSocketSender,
+        driver_abort: AbortHandle,
+    ) -> bool {
+        let mut registry = self.registry();
+        let Some(entry) = registry.connections.get_mut(&id) else {
+            return false;
+        };
+        entry.internal_sender = Some(internal_sender);
+        entry.driver_abort = Some(driver_abort);
+        true
     }
 
     fn release(&self, id: WebSocketId) {

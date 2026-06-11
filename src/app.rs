@@ -39,9 +39,10 @@ pub use state::StateStore;
 pub use testing::{TestClient, TestRequest};
 pub use websocket::{
     BackpressurePolicy, IntoWebSocketHandler, OriginPolicy, WebSocket, WebSocketCapacityError,
-    WebSocketConfig, WebSocketConnectionSnapshot, WebSocketError, WebSocketErrorCategory,
-    WebSocketEvent, WebSocketHandler, WebSocketId, WebSocketMessage, WebSocketObservation,
-    WebSocketObserver, WebSocketRuntimeHandle, WebSocketStats, WebSocketTimeout, WsBroadcast,
+    WebSocketCloseInfo, WebSocketCloseInitiator, WebSocketConfig, WebSocketConnectionSnapshot,
+    WebSocketError, WebSocketErrorCategory, WebSocketEvent, WebSocketHandler, WebSocketId,
+    WebSocketMessage, WebSocketObservation, WebSocketObserver, WebSocketReceiver,
+    WebSocketRuntimeHandle, WebSocketSender, WebSocketStats, WebSocketTimeout, WsBroadcast,
     WsError,
 };
 
