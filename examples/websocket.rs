@@ -185,8 +185,9 @@ async fn main() -> std::io::Result<()> {
         .content_type("text/html; charset=utf-8")
     });
 
-    println!("Ejemplo WebSocket en http://127.0.0.1:3000");
-    app.listen_with_shutdown("127.0.0.1:3000", async {
+    let address = std::env::var("RUSTREST_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
+    println!("Ejemplo WebSocket en http://{address}");
+    app.listen_with_shutdown(address, async {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await

@@ -252,3 +252,32 @@ cargo run --release --example websocket_load -- \
 The reference profile script and measured baseline live in
 `scripts/run-websocket-reference-profile.sh` and
 `docs/benchmarks/websocket-reference.md`.
+
+The Autobahn gate uses the pinned image
+`crossbario/autobahn-testsuite:25.10.1` and writes its HTML report to
+`target/autobahn/server/index.html`. The runner executes:
+
+```bash
+docker run --rm --network host \
+  -v "${PWD}/autobahn:/config:ro" \
+  -v "${PWD}/target/autobahn:/reports" \
+  crossbario/autobahn-testsuite:25.10.1 \
+  wstest -m fuzzingclient -s /config/fuzzingclient.json
+```
+
+Protocol cases `9.*` are excluded because load and soak behavior has a
+separate acceptance profile. Cases `12.*` and `13.*` cover WebSocket
+compression extensions; RustRest does not currently negotiate
+`permessage-deflate`. All other cases must report neither `FAILED` nor
+`UNIMPLEMENTED`.
+
+On Docker Desktop, where host networking does not expose the host loopback in
+the same way as Linux, bind the example to all interfaces and override only the
+runner connection URL:
+
+```bash
+RUSTREST_ADDR=0.0.0.0:3001 cargo run --release --example websocket
+AUTOBAHN_ENDPOINT_URL=http://127.0.0.1:3001/autobahn \
+AUTOBAHN_SERVER_URL=ws://host.docker.internal:3001/autobahn \
+  ./scripts/run-autobahn.sh
+```
