@@ -196,18 +196,11 @@ async fn drive(
                 };
                 let disconnect = matches!(&command, ControlCommand::Disconnect(_));
                 if matches!(&command, ControlCommand::Close(_)) {
-                    loop {
-                        match outbound_rx.try_recv() {
-                            Ok(OutboundCommand::Message(message)) => {
-                                if let Err(error) = stream.send(message).await {
-                                    return protocol_outcome(inbound_tx, error);
-                                }
-                            }
-                            Err(mpsc::error::TryRecvError::Empty) => break,
-                            Err(mpsc::error::TryRecvError::Disconnected) => {
-                                outbound_open = false;
-                                break;
-                            }
+                    outbound_rx.close();
+                    outbound_open = false;
+                    for message in take_queued_before_close(outbound_rx) {
+                        if let Err(error) = stream.send(message).await {
+                            return protocol_outcome(inbound_tx, error);
                         }
                     }
                 }
@@ -261,11 +254,8 @@ async fn drive(
                                 true,
                             ));
                         }
-                        if inbound_tx.send(Ok(message)).await.is_err() {
-                            return DriverOutcome {
-                                close_info: pending_close.unwrap_or_else(handler_close_info),
-                                handler_completed: false,
-                            };
+                        if !inbound_tx.is_closed() {
+                            let _ = inbound_tx.send(Ok(message)).await;
                         }
                     }
                     Some(Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed))
@@ -301,6 +291,20 @@ async fn drive(
             }
         }
     }
+}
+
+fn take_queued_before_close(
+    outbound_rx: &mut mpsc::Receiver<OutboundCommand>,
+) -> Vec<WebSocketMessage> {
+    let queued = outbound_rx.len();
+    let mut messages = Vec::with_capacity(queued);
+    for _ in 0..queued {
+        let Ok(OutboundCommand::Message(message)) = outbound_rx.try_recv() else {
+            break;
+        };
+        messages.push(message);
+    }
+    messages
 }
 
 async fn write_control(
@@ -390,6 +394,35 @@ mod tests {
     use crate::app::websocket::runtime::WebSocketRuntimeHandle;
     use crate::app::websocket::socket::{SocketMetadata, channel_pair};
     use crate::app::websocket::{ResolvedWebSocketConfig, WebSocketConfig};
+
+    #[tokio::test]
+    async fn close_drain_only_takes_the_initial_queue_snapshot() {
+        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel(2);
+        outbound_tx
+            .try_send(OutboundCommand::Message(WebSocketMessage::text("first")))
+            .unwrap();
+        outbound_tx
+            .try_send(OutboundCommand::Message(WebSocketMessage::text("second")))
+            .unwrap();
+
+        outbound_rx.close();
+        let queued = take_queued_before_close(&mut outbound_rx);
+
+        let late_send = outbound_tx
+            .try_send(OutboundCommand::Message(WebSocketMessage::text("late")))
+            .unwrap_err();
+        assert_eq!(queued.len(), 2);
+        assert!(matches!(
+            late_send,
+            tokio::sync::mpsc::error::TrySendError::Closed(_)
+        ));
+        assert_eq!(outbound_rx.len(), 0);
+        let texts = queued
+            .into_iter()
+            .map(|message| message.into_text().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["first", "second"]);
+    }
 
     #[tokio::test]
     async fn forced_driver_abort_cleans_handler_before_releasing_permit() {

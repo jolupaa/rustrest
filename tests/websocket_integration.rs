@@ -402,6 +402,47 @@ async fn websocket_sender_progresses_independently() {
 }
 
 #[tokio::test]
+async fn websocket_sender_survives_a_dropped_receiver() {
+    let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+    let send_gate = std::sync::Arc::new(Semaphore::new(0));
+    let handler_gate = send_gate.clone();
+    let (addr, _server) = spawn_app(move |app| {
+        let handler_gate = handler_gate.clone();
+        app.websocket("/ws", move |socket| {
+            let handler_gate = handler_gate.clone();
+            let ready_tx = ready_tx.clone();
+            async move {
+                let (receiver, sender) = socket.split();
+                drop(receiver);
+                ready_tx.send(()).unwrap();
+                handler_gate.acquire().await.unwrap().forget();
+                sender.send_text("still-open").await.unwrap();
+            }
+        });
+    })
+    .await;
+
+    let (mut client, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+    tokio::time::timeout(IO_TIMEOUT, ready_rx.recv())
+        .await
+        .expect("handler should drop its receiver before the deadline")
+        .expect("handler should announce that its receiver was dropped");
+
+    client.send(Message::Text("ignored".into())).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    send_gate.add_permits(1);
+
+    let message = tokio::time::timeout(IO_TIMEOUT, client.next())
+        .await
+        .expect("sender should remain usable after inbound traffic")
+        .expect("connection should remain open")
+        .expect("server should send a message");
+    assert_eq!(message.into_text().unwrap(), "still-open");
+}
+
+#[tokio::test]
 async fn websocket_control_frames_remain_visible_to_recv() {
     let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
     let (addr, _server) = spawn_app(move |app| {
