@@ -384,6 +384,100 @@ fn websocket_runtime_isolates_observer_panics_during_admission() {
 }
 
 #[test]
+fn websocket_rooms_are_route_scoped_atomic_and_cleaned_on_release() {
+    let runtime = WebSocketRuntimeHandle::local();
+    let config = resolved_config(
+        WebSocketConfig::new(),
+        WebSocketConfig::new()
+            .max_rooms_per_connection(2)
+            .max_room_name_bytes(16),
+    );
+    let chat = runtime
+        .admit("/chat/:channel", None, None, &config)
+        .unwrap();
+    let admin = runtime
+        .admit("/admin/chat/:channel", None, None, &config)
+        .unwrap();
+
+    runtime
+        .join(chat.id(), &["general".into(), "equipo-7".into()])
+        .unwrap();
+    runtime.join(chat.id(), &["general".into()]).unwrap();
+    runtime.join(admin.id(), &["general".into()]).unwrap();
+
+    assert_eq!(
+        runtime.rooms(chat.id()).unwrap(),
+        vec!["equipo-7", "general"]
+    );
+    assert_eq!(runtime.local_room_size("/chat/:channel", "general"), 1);
+    assert_eq!(
+        runtime.local_room_size("/admin/chat/:channel", "general"),
+        1
+    );
+
+    assert!(
+        runtime
+            .join(chat.id(), &["a".into(), "b".into(), "c".into()])
+            .is_err()
+    );
+    assert!(
+        runtime
+            .join(chat.id(), &["valida".into(), "".into()])
+            .is_err()
+    );
+    assert!(runtime.join(chat.id(), &["con\0nul".into()]).is_err());
+    assert!(runtime.join(chat.id(), &["á".repeat(9)]).is_err());
+    assert_eq!(
+        runtime.rooms(chat.id()).unwrap(),
+        vec!["equipo-7", "general"]
+    );
+
+    runtime.leave(chat.id(), &["general".into()]).unwrap();
+    runtime.leave(chat.id(), &["general".into()]).unwrap();
+    assert_eq!(runtime.rooms(chat.id()).unwrap(), vec!["equipo-7"]);
+    runtime.leave_all(chat.id()).unwrap();
+    assert!(runtime.rooms(chat.id()).unwrap().is_empty());
+
+    runtime.join(chat.id(), &["general".into()]).unwrap();
+    drop(chat);
+    assert!(runtime.rooms(WebSocketId(1)).is_none());
+    assert_eq!(runtime.local_room_size("/chat/:channel", "general"), 0);
+    assert_eq!(
+        runtime.local_room_size("/admin/chat/:channel", "general"),
+        1
+    );
+    drop(admin);
+}
+
+#[test]
+fn websocket_hub_room_limits_are_hard_ceilings() {
+    let hub = WsHub::builder()
+        .max_rooms_per_connection(1)
+        .max_room_name_bytes(4)
+        .build()
+        .unwrap();
+    let runtime = hub.runtime();
+    let config = resolved_config(
+        WebSocketConfig::new(),
+        WebSocketConfig::new()
+            .max_rooms_per_connection(10)
+            .max_room_name_bytes(100),
+    );
+    let permit = runtime.admit("/ws", None, None, &config).unwrap();
+
+    runtime.join(permit.id(), &["sala".into()]).unwrap();
+    assert!(matches!(
+        runtime.join(permit.id(), &["otra".into()]),
+        Err(WsError::RoomLimit)
+    ));
+    runtime.leave_all(permit.id()).unwrap();
+    assert!(matches!(
+        runtime.join(permit.id(), &["larga".into()]),
+        Err(WsError::InvalidRoom(_))
+    ));
+}
+
+#[test]
 fn websocket_admission_errors_map_before_upgrade() {
     for error in [
         AdmissionError::Shutdown,

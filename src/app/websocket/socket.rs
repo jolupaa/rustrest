@@ -263,6 +263,38 @@ impl WebSocket {
         (self.receiver, self.sender)
     }
 
+    pub async fn join(&self, room: impl Into<String>) -> Result<(), WsError> {
+        self.sender.join(room).await
+    }
+
+    pub async fn join_many<I, S>(&self, rooms: I) -> Result<(), WsError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.sender.join_many(rooms).await
+    }
+
+    pub async fn leave(&self, room: impl Into<String>) -> Result<(), WsError> {
+        self.sender.leave(room).await
+    }
+
+    pub async fn leave_many<I, S>(&self, rooms: I) -> Result<(), WsError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.sender.leave_many(rooms).await
+    }
+
+    pub async fn leave_all(&self) -> Result<(), WsError> {
+        self.sender.leave_all().await
+    }
+
+    pub async fn rooms(&self) -> Result<Vec<String>, WsError> {
+        self.sender.rooms().await
+    }
+
     pub async fn recv(&mut self) -> Result<Option<WebSocketMessage>, WebSocketError> {
         self.receiver.recv().await
     }
@@ -362,6 +394,43 @@ impl WebSocketSender {
 
     pub fn route(&self) -> &str {
         &self.shared.route
+    }
+
+    pub async fn join(&self, room: impl Into<String>) -> Result<(), WsError> {
+        self.join_many([room.into()]).await
+    }
+
+    pub async fn join_many<I, S>(&self, rooms: I) -> Result<(), WsError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let rooms = rooms.into_iter().map(Into::into).collect::<Vec<_>>();
+        self.shared.runtime.join(self.shared.id, &rooms)
+    }
+
+    pub async fn leave(&self, room: impl Into<String>) -> Result<(), WsError> {
+        self.leave_many([room.into()]).await
+    }
+
+    pub async fn leave_many<I, S>(&self, rooms: I) -> Result<(), WsError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let rooms = rooms.into_iter().map(Into::into).collect::<Vec<_>>();
+        self.shared.runtime.leave(self.shared.id, &rooms)
+    }
+
+    pub async fn leave_all(&self) -> Result<(), WsError> {
+        self.shared.runtime.leave_all(self.shared.id)
+    }
+
+    pub async fn rooms(&self) -> Result<Vec<String>, WsError> {
+        self.shared
+            .runtime
+            .rooms(self.shared.id)
+            .ok_or(WsError::ConnectionNotFound(self.shared.id))
     }
 
     pub fn try_send(&self, message: WebSocketMessage) -> Result<(), WsError> {

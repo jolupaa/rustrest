@@ -43,7 +43,7 @@ pub use websocket::{
     WebSocketConnectionSnapshot, WebSocketError, WebSocketErrorCategory, WebSocketEvent,
     WebSocketHandler, WebSocketId, WebSocketMessage, WebSocketObservation, WebSocketObserver,
     WebSocketReceiver, WebSocketRuntimeHandle, WebSocketSender, WebSocketStats, WebSocketTimeout,
-    WsBroadcast, WsError,
+    WsBroadcast, WsError, WsHub, WsHubBuilder,
 };
 
 // Crate-internal helpers shared across submodules.

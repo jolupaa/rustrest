@@ -22,6 +22,7 @@ use super::websocket::{header_value_contains_token, is_valid_websocket_key};
 use super::{
     ErrorHandler, HttpError, IntoHandler, IntoMiddleware, Middleware, Next, Request, Response,
     RouteHandle, Router, StateStore, WebSocketConfig, WebSocketObserver, WebSocketRuntimeHandle,
+    WsHub,
 };
 use super::{
     Handler, ResponseBody, allow_header_value, method_not_allowed_handler, not_found_handler,
@@ -134,24 +135,41 @@ pub struct App {
     error_handler: Option<ErrorHandler>,
     pub(crate) config: ServerConfig,
     websocket_runtime: WebSocketRuntimeHandle,
+    websocket_hub: WsHub,
     websocket_defaults: WebSocketConfig,
 }
 
 impl App {
     pub fn new() -> Self {
+        let websocket_hub = WsHub::local();
+        let websocket_runtime = websocket_hub.runtime();
         Self {
             router: Router::new(),
             middlewares: Vec::new(),
             state: StateStore::default(),
             error_handler: None,
             config: ServerConfig::default(),
-            websocket_runtime: WebSocketRuntimeHandle::local(),
+            websocket_runtime,
+            websocket_hub,
             websocket_defaults: WebSocketConfig::new(),
         }
     }
 
     pub fn websocket_runtime(&self) -> WebSocketRuntimeHandle {
         self.websocket_runtime.clone()
+    }
+
+    /// Installs the WebSocket hub used by subsequently served requests.
+    /// Configure it before passing the app to `serve` or `listen`.
+    pub fn websocket_hub(&mut self, hub: WsHub) -> &mut Self {
+        self.websocket_runtime = hub.runtime();
+        self.websocket_hub = hub;
+        self
+    }
+
+    /// Returns a cloneable handle to the app's WebSocket hub.
+    pub fn websocket_hub_handle(&self) -> WsHub {
+        self.websocket_hub.clone()
     }
 
     pub fn websocket_defaults(&mut self, config: WebSocketConfig) -> &mut Self {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,6 +23,8 @@ struct RuntimeInner {
     empty: Notify,
     registry_changed: Notify,
     observer: RwLock<Arc<dyn WebSocketObserver>>,
+    max_rooms_per_connection: usize,
+    max_room_name_bytes: usize,
 }
 
 struct Registry {
@@ -30,6 +32,7 @@ struct Registry {
     connections: HashMap<WebSocketId, ConnectionEntry>,
     route_counts: HashMap<String, usize>,
     ip_counts: HashMap<IpAddr, usize>,
+    rooms: HashMap<(String, String), HashSet<WebSocketId>>,
     counters: WebSocketCounters,
 }
 
@@ -40,6 +43,9 @@ struct ConnectionEntry {
     protocol: Option<String>,
     opened_at: SystemTime,
     close_timeout: Duration,
+    max_rooms_per_connection: usize,
+    max_room_name_bytes: usize,
+    rooms: BTreeSet<String>,
     internal_sender: Option<InternalWebSocketSender>,
     driver_abort: Option<AbortHandle>,
     forced_shutdown_observed: bool,
@@ -100,6 +106,13 @@ impl ConnectionPermit {
 
 impl WebSocketRuntimeHandle {
     pub(crate) fn local() -> Self {
+        Self::local_with_room_limits(32, 128)
+    }
+
+    pub(crate) fn local_with_room_limits(
+        max_rooms_per_connection: usize,
+        max_room_name_bytes: usize,
+    ) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
         Self {
             inner: Arc::new(RuntimeInner {
@@ -109,12 +122,15 @@ impl WebSocketRuntimeHandle {
                     connections: HashMap::new(),
                     route_counts: HashMap::new(),
                     ip_counts: HashMap::new(),
+                    rooms: HashMap::new(),
                     counters: WebSocketCounters::default(),
                 }),
                 shutdown_tx,
                 empty: Notify::new(),
                 registry_changed: Notify::new(),
                 observer: RwLock::new(Arc::new(())),
+                max_rooms_per_connection,
+                max_room_name_bytes,
             }),
         }
     }
@@ -133,6 +149,7 @@ impl WebSocketRuntimeHandle {
             bytes_sent: registry.counters.bytes_sent,
             saturated_sends: registry.counters.saturated_sends,
             heartbeat_timeouts: registry.counters.heartbeat_timeouts,
+            active_rooms: registry.rooms.len(),
             ..WebSocketStats::default()
         }
     }
@@ -216,6 +233,13 @@ impl WebSocketRuntimeHandle {
                             protocol: protocol.map(str::to_string),
                             opened_at: SystemTime::now(),
                             close_timeout: config.close_timeout,
+                            max_rooms_per_connection: config
+                                .max_rooms_per_connection
+                                .min(self.inner.max_rooms_per_connection),
+                            max_room_name_bytes: config
+                                .max_room_name_bytes
+                                .min(self.inner.max_room_name_bytes),
+                            rooms: BTreeSet::new(),
                             internal_sender: None,
                             driver_abort: None,
                             forced_shutdown_observed: false,
@@ -266,6 +290,88 @@ impl WebSocketRuntimeHandle {
         };
         self.inner.registry_changed.notify_waiters();
         registered
+    }
+
+    pub(crate) fn join(&self, id: WebSocketId, rooms: &[String]) -> Result<(), WsError> {
+        let mut registry = self.registry();
+        let (route, additions) = {
+            let entry = registry
+                .connections
+                .get_mut(&id)
+                .ok_or(WsError::ConnectionNotFound(id))?;
+            let requested = rooms.iter().cloned().collect::<BTreeSet<_>>();
+            for room in &requested {
+                validate_room(room, entry.max_room_name_bytes)?;
+            }
+            let additions = requested
+                .difference(&entry.rooms)
+                .cloned()
+                .collect::<Vec<_>>();
+            if entry.rooms.len() + additions.len() > entry.max_rooms_per_connection {
+                return Err(WsError::RoomLimit);
+            }
+            for room in &additions {
+                entry.rooms.insert(room.clone());
+            }
+            (entry.route.clone(), additions)
+        };
+        for room in additions {
+            registry
+                .rooms
+                .entry((route.clone(), room))
+                .or_default()
+                .insert(id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn leave(&self, id: WebSocketId, rooms: &[String]) -> Result<(), WsError> {
+        let mut registry = self.registry();
+        let (route, removals) = {
+            let entry = registry
+                .connections
+                .get_mut(&id)
+                .ok_or(WsError::ConnectionNotFound(id))?;
+            let requested = rooms.iter().cloned().collect::<BTreeSet<_>>();
+            let removals = requested
+                .intersection(&entry.rooms)
+                .cloned()
+                .collect::<Vec<_>>();
+            for room in &removals {
+                entry.rooms.remove(room);
+            }
+            (entry.route.clone(), removals)
+        };
+        remove_room_memberships(&mut registry.rooms, &route, id, removals);
+        Ok(())
+    }
+
+    pub(crate) fn leave_all(&self, id: WebSocketId) -> Result<(), WsError> {
+        let mut registry = self.registry();
+        let (route, rooms) = {
+            let entry = registry
+                .connections
+                .get_mut(&id)
+                .ok_or(WsError::ConnectionNotFound(id))?;
+            let rooms = std::mem::take(&mut entry.rooms).into_iter().collect();
+            (entry.route.clone(), rooms)
+        };
+        remove_room_memberships(&mut registry.rooms, &route, id, rooms);
+        Ok(())
+    }
+
+    pub(crate) fn rooms(&self, id: WebSocketId) -> Option<Vec<String>> {
+        self.registry()
+            .connections
+            .get(&id)
+            .map(|entry| entry.rooms.iter().cloned().collect())
+    }
+
+    pub(crate) fn local_room_size(&self, route: &str, room: &str) -> usize {
+        self.registry()
+            .rooms
+            .get(&(route.to_string(), room.to_string()))
+            .map_or(0, HashSet::len)
     }
 
     /// Closes one process-local connection and waits for registry cleanup.
@@ -458,6 +564,12 @@ impl WebSocketRuntimeHandle {
             if let Some(ip) = entry.remote_addr.map(|addr| addr.ip()) {
                 decrement_count(&mut registry.ip_counts, &ip);
             }
+            remove_room_memberships(
+                &mut registry.rooms,
+                &entry.route,
+                id,
+                entry.rooms.into_iter().collect(),
+            );
             registry.counters.closed_connections += 1;
             registry.connections.is_empty()
         };
@@ -484,6 +596,31 @@ impl WebSocketRuntimeHandle {
             .clone();
         let _ = catch_unwind(AssertUnwindSafe(|| observer.observe(event)));
         trace_websocket_observation(event);
+    }
+}
+
+fn validate_room(room: &str, max_room_name_bytes: usize) -> Result<(), WsError> {
+    if room.is_empty() || room.contains('\0') || room.len() > max_room_name_bytes {
+        return Err(WsError::InvalidRoom(room.to_string()));
+    }
+    Ok(())
+}
+
+fn remove_room_memberships(
+    room_index: &mut HashMap<(String, String), HashSet<WebSocketId>>,
+    route: &str,
+    id: WebSocketId,
+    rooms: Vec<String>,
+) {
+    for room in rooms {
+        let key = (route.to_string(), room);
+        let remove_key = room_index.get_mut(&key).is_some_and(|members| {
+            members.remove(&id);
+            members.is_empty()
+        });
+        if remove_key {
+            room_index.remove(&key);
+        }
     }
 }
 

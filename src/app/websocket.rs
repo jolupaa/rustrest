@@ -1,6 +1,7 @@
 mod config;
 mod driver;
 mod error;
+mod hub;
 mod runtime;
 mod socket;
 #[cfg(test)]
@@ -14,6 +15,7 @@ use hyper::upgrade::OnUpgrade;
 pub(crate) use config::ResolvedWebSocketConfig;
 pub use config::{BackpressurePolicy, OriginPolicy, WebSocketConfig};
 pub use error::{WebSocketCapacityError, WebSocketError, WebSocketTimeout, WsError};
+pub use hub::{WsHub, WsHubBuilder};
 pub use runtime::WebSocketRuntimeHandle;
 use socket::NormalizedWebSocketHandler;
 pub use socket::{

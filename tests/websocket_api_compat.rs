@@ -5,7 +5,7 @@ use rustrest::{
     App, IntoWebSocketHandler, Request, Response, Router, WebSocket, WebSocketCloseInfo,
     WebSocketCloseInitiator, WebSocketConfig, WebSocketError, WebSocketEvent, WebSocketHandler,
     WebSocketMessage, WebSocketObservation, WebSocketObserver, WebSocketReceiver,
-    WebSocketRuntimeHandle, WebSocketSender, WebSocketStats, WsBroadcast, WsError,
+    WebSocketRuntimeHandle, WebSocketSender, WebSocketStats, WsBroadcast, WsError, WsHub,
 };
 
 struct Observer;
@@ -28,6 +28,16 @@ fn accepts_close_initiator(_: WebSocketCloseInitiator) {}
 #[test]
 fn existing_websocket_surface_still_compiles() {
     let mut app = App::new();
+    let hub = WsHub::builder()
+        .max_rooms_per_connection(32)
+        .max_room_name_bytes(128)
+        .broadcast_concurrency(64)
+        .broker_operation_timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let _: &mut App = app.websocket_hub(hub.clone());
+    let _: WsHub = app.websocket_hub_handle();
+    let _: WsHub = WsHub::local();
     let runtime: WebSocketRuntimeHandle = app.websocket_runtime();
     let _stats: WebSocketStats = runtime.stats();
     let _connections = runtime.connections();
@@ -49,6 +59,12 @@ fn existing_websocket_surface_still_compiles() {
         let _: Result<(), WebSocketError> = socket.close().await;
         let _: Result<(), WebSocketError> = socket.close_with(1000, "finalizado").await;
         let _: WebSocketCloseInfo = socket.closed().await;
+        let _: Result<(), WsError> = socket.join("general").await;
+        let _: Result<(), WsError> = socket.join_many(["general", "equipo-7"]).await;
+        let _: Result<(), WsError> = socket.leave("general").await;
+        let _: Result<(), WsError> = socket.leave_many(["general", "equipo-7"]).await;
+        let _: Result<(), WsError> = socket.leave_all().await;
+        let _: Result<Vec<String>, WsError> = socket.rooms().await;
         let _ = socket.id();
         let _: Option<std::net::SocketAddr> = socket.remote_addr();
         let _: &str = socket.route();
@@ -61,6 +77,12 @@ fn existing_websocket_surface_still_compiles() {
         let _: Result<(), WsError> = sender.send(WebSocketMessage::text("split")).await;
         let _: Result<(), WsError> = sender.try_send(WebSocketMessage::text("inmediato"));
         let _: Result<(), WsError> = cloned_sender.send_text("desde clone").await;
+        let _: Result<(), WsError> = sender.join("general").await;
+        let _: Result<(), WsError> = sender.join_many(["general", "equipo-7"]).await;
+        let _: Result<(), WsError> = sender.leave("general").await;
+        let _: Result<(), WsError> = sender.leave_many(["general", "equipo-7"]).await;
+        let _: Result<(), WsError> = sender.leave_all().await;
+        let _: Result<Vec<String>, WsError> = sender.rooms().await;
         let _: Result<(), WsError> = sender.close_with(1000, "finalizado").await;
         let _: WebSocketCloseInfo = sender.closed().await;
         let _: Result<Option<WebSocketMessage>, WebSocketError> = receiver.recv().await;
