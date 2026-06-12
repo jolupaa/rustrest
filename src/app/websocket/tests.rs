@@ -1,5 +1,6 @@
 use hyper::header::SEC_WEBSOCKET_ACCEPT;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use crate::RequestBuilder;
 
@@ -7,6 +8,31 @@ use super::*;
 
 fn resolved_config(app: WebSocketConfig, route: WebSocketConfig) -> ResolvedWebSocketConfig {
     ResolvedWebSocketConfig::from_layers(&app, &route)
+}
+
+#[test]
+fn websocket_config_resolves_process_route_and_disable_overrides() {
+    let app = WebSocketConfig::new()
+        .max_connections(10)
+        .max_connections_per_ip(4)
+        .message_rate_limit(8, Duration::from_secs(1))
+        .idle_timeout(Duration::from_secs(30))
+        .max_connection_lifetime(Duration::from_secs(300));
+    let route = WebSocketConfig::new()
+        .max_connections(2)
+        .disable_max_connections_per_ip()
+        .disable_message_rate_limit()
+        .disable_idle_timeout()
+        .disable_max_connection_lifetime();
+
+    let resolved = resolved_config(app, route);
+
+    assert_eq!(resolved.process_max_connections, Some(10));
+    assert_eq!(resolved.route_max_connections, Some(2));
+    assert_eq!(resolved.max_connections_per_ip, None);
+    assert!(resolved.message_rate_limit.is_none());
+    assert_eq!(resolved.idle_timeout, None);
+    assert_eq!(resolved.max_connection_lifetime, None);
 }
 
 fn handshake_request_without_host() -> RequestBuilder {

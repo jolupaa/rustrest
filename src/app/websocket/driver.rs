@@ -189,6 +189,8 @@ struct DriverState {
     last_application_message: Instant,
     opened_at: Instant,
     next_ping_token: u64,
+    message_window_started: Instant,
+    message_count: u32,
 }
 
 impl DriverState {
@@ -204,6 +206,8 @@ impl DriverState {
             last_application_message: now,
             opened_at: now,
             next_ping_token: 1,
+            message_window_started: now,
+            message_count: 0,
         }
     }
 
@@ -378,8 +382,33 @@ async fn drive(
             incoming = stream.next() => {
                 match incoming {
                     Some(Ok(message)) => {
-                        state.last_inbound_frame = Instant::now();
+                        let received_at = Instant::now();
+                        state.last_inbound_frame = received_at;
                         if message.is_text() || message.is_binary() {
+                            if message_rate_exceeded(&mut state, config, received_at) {
+                                close_command_channels(
+                                    control_rx,
+                                    outbound_rx,
+                                    &mut control_open,
+                                    &mut outbound_open,
+                                );
+                                let frame = CloseFrame {
+                                    code: CloseCode::Policy,
+                                    reason: "Limite de mensajes WebSocket excedido".into(),
+                                };
+                                if let Err(error) = initiate_close(
+                                    stream,
+                                    &mut state,
+                                    Some(frame),
+                                    WebSocketCloseInitiator::Runtime,
+                                    config.close_timeout,
+                                )
+                                .await
+                                {
+                                    return protocol_outcome(inbound_tx, error);
+                                }
+                                continue;
+                            }
                             state.last_application_message = state.last_inbound_frame;
                         }
                         if let WebSocketMessage::Pong(payload) = &message {
@@ -418,7 +447,7 @@ async fn drive(
                                 &mut outbound_open,
                             );
                             let frame = CloseFrame {
-                                code: CloseCode::Policy,
+                                code: CloseCode::Again,
                                 reason: "El handler WebSocket no consume mensajes a tiempo".into(),
                             };
                             if let Err(error) = initiate_close(
@@ -645,6 +674,25 @@ fn lifetime_deadline(state: &DriverState, config: &ResolvedWebSocketConfig) -> O
     config
         .max_connection_lifetime
         .map(|lifetime| state.opened_at + lifetime)
+}
+
+fn message_rate_exceeded(
+    state: &mut DriverState,
+    config: &ResolvedWebSocketConfig,
+    now: Instant,
+) -> bool {
+    let Some(limit) = &config.message_rate_limit else {
+        return false;
+    };
+    if now.duration_since(state.message_window_started) >= limit.interval {
+        state.message_window_started = now;
+        state.message_count = 0;
+    }
+    if state.message_count >= limit.max_messages {
+        return true;
+    }
+    state.message_count += 1;
+    false
 }
 
 async fn wait_until(deadline: Option<Instant>) {

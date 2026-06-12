@@ -838,7 +838,7 @@ async fn websocket_close_rejects_control_sends_after_closing_starts() {
 }
 
 #[tokio::test]
-async fn websocket_close_slow_inbound_consumer_uses_1008() {
+async fn websocket_slow_consumer_closes_with_1013() {
     let (addr, _server) = spawn_app(|app| {
         app.websocket_with(
             "/ws",
@@ -862,7 +862,7 @@ async fn websocket_close_slow_inbound_consumer_uses_1008() {
     client.send(Message::Text("second".into())).await.unwrap();
 
     let frame = receive_close_frame(&mut client).await;
-    assert_eq!(u16::from(frame.code), 1008);
+    assert_eq!(u16::from(frame.code), 1013);
 }
 
 #[tokio::test]
@@ -980,4 +980,80 @@ async fn websocket_handler_background_sender_outlives_handler() {
     assert_eq!(message.into_text().unwrap(), "background-after-handler");
     let close = receive_close_frame(&mut client).await;
     assert_eq!(u16::from(close.code), 1000);
+}
+
+#[tokio::test]
+async fn websocket_message_rate_overflow_closes_with_1008() {
+    let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (addr, _server) = spawn_app(move |app| {
+        let received_tx = received_tx.clone();
+        app.websocket_with(
+            "/ws",
+            WebSocketConfig::new().message_rate_limit(2, Duration::from_secs(1)),
+            move |mut socket| {
+                let received_tx = received_tx.clone();
+                async move {
+                    while let Some(message) = socket.recv().await.unwrap() {
+                        if message.is_text() {
+                            received_tx
+                                .send(message.into_text().unwrap().to_string())
+                                .unwrap();
+                        }
+                    }
+                }
+            },
+        );
+    })
+    .await;
+    let (mut client, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    client.send(Message::Text("one".into())).await.unwrap();
+    client.send(Message::Text("two".into())).await.unwrap();
+    client.send(Message::Text("three".into())).await.unwrap();
+
+    let close = receive_close_frame(&mut client).await;
+    assert_eq!(u16::from(close.code), 1008);
+    assert_eq!(received_rx.recv().await.unwrap(), "one");
+    assert_eq!(received_rx.recv().await.unwrap(), "two");
+    assert!(received_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn websocket_message_rate_resets_after_window_rollover() {
+    let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (addr, _server) = spawn_app(move |app| {
+        let received_tx = received_tx.clone();
+        app.websocket_with(
+            "/ws",
+            WebSocketConfig::new().message_rate_limit(1, Duration::from_millis(40)),
+            move |mut socket| {
+                let received_tx = received_tx.clone();
+                async move {
+                    while let Some(message) = socket.recv().await.unwrap() {
+                        if message.is_text() {
+                            received_tx.send(()).unwrap();
+                        }
+                    }
+                }
+            },
+        );
+    })
+    .await;
+    let (mut client, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    client.send(Message::Text("first".into())).await.unwrap();
+    tokio::time::timeout(IO_TIMEOUT, received_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.send(Message::Text("second".into())).await.unwrap();
+    tokio::time::timeout(IO_TIMEOUT, received_rx.recv())
+        .await
+        .expect("message after window rollover should be delivered")
+        .unwrap();
 }
