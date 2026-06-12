@@ -352,6 +352,16 @@ fn websocket_runtime_rejects_after_accepting_stops() {
     assert_eq!(runtime.stats().rejected_connections, 1);
 }
 
+#[tokio::test]
+async fn websocket_runtime_retains_shutdown_for_late_driver_subscribers() {
+    let runtime = WebSocketRuntimeHandle::local();
+
+    runtime.begin_shutdown().await;
+    let shutdown_rx = runtime.subscribe_shutdown();
+
+    assert!(*shutdown_rx.borrow());
+}
+
 #[test]
 fn websocket_runtime_isolates_observer_panics_during_admission() {
     struct PanickingObserver;

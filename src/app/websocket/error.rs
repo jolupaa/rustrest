@@ -1,4 +1,4 @@
-use super::types::WebSocketErrorCategory;
+use super::types::{WebSocketErrorCategory, WebSocketId};
 
 #[derive(Debug)]
 pub enum WebSocketError {
@@ -48,6 +48,7 @@ pub enum WsError {
     InvalidClose { code: u16, reason: String },
     InvalidRoom(String),
     RoomLimit,
+    ConnectionNotFound(WebSocketId),
     Shutdown,
     HandlerPanic,
     Closed,
@@ -92,6 +93,9 @@ impl std::fmt::Display for WsError {
             }
             Self::InvalidRoom(room) => write!(f, "room WebSocket no valido: {room}"),
             Self::RoomLimit => f.write_str("limite de rooms WebSocket alcanzado"),
+            Self::ConnectionNotFound(id) => {
+                write!(f, "la conexion WebSocket {id} no existe en este runtime")
+            }
             Self::Shutdown => f.write_str("el runtime WebSocket se esta cerrando"),
             Self::HandlerPanic => f.write_str("el handler WebSocket termino con panic"),
             Self::Closed => f.write_str("la conexion WebSocket esta cerrada"),

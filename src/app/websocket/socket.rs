@@ -137,7 +137,7 @@ pub struct WebSocketReceiver {
 
 #[derive(Clone)]
 pub(crate) struct InternalWebSocketSender {
-    _shared: Arc<SocketShared>,
+    shared: Arc<SocketShared>,
 }
 
 struct SocketShared {
@@ -193,7 +193,7 @@ pub(crate) fn channel_pair(
             shared: shared.clone(),
         },
     };
-    let internal_sender = InternalWebSocketSender { _shared: shared };
+    let internal_sender = InternalWebSocketSender { shared };
     let channels = DriverChannels {
         inbound_tx,
         outbound_rx,
@@ -219,6 +219,25 @@ impl Drop for WebSocketSender {
     fn drop(&mut self) {
         let count = self.shared.public_senders.fetch_sub(1, Ordering::AcqRel) - 1;
         let _ = self.shared.sender_count_tx.send(count);
+    }
+}
+
+impl InternalWebSocketSender {
+    pub(crate) async fn disconnect(&self, code: u16, reason: &str) -> Result<(), WsError> {
+        let frame = CloseFrame {
+            code: CloseCode::from(code),
+            reason: reason.to_string().into(),
+        };
+        self.shared
+            .control
+            .send(ControlCommand::Disconnect(Some(frame)))
+            .await
+            .map_err(|_| WsError::Closed)
+    }
+
+    pub(crate) async fn closed(&self) -> WebSocketCloseInfo {
+        let mut close_rx = self.shared.close_rx.clone();
+        wait_for_close(&mut close_rx).await
     }
 }
 
@@ -529,7 +548,7 @@ impl WebSocketReceiver {
     }
 }
 
-fn validate_close(code: u16, reason: &str) -> Result<(), WsError> {
+pub(crate) fn validate_close(code: u16, reason: &str) -> Result<(), WsError> {
     let valid_code = matches!(
         code,
         1000 | 1001 | 1002 | 1003 | 1007 | 1008 | 1009 | 1010 | 1011 | 1012 | 1013

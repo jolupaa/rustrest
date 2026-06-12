@@ -20,7 +20,7 @@ use tokio_rustls::TlsAcceptor;
 pub use tokio_rustls::rustls::ServerConfig;
 
 use super::App;
-use super::server::TransportSecurity;
+use super::server::{TransportSecurity, drain_server_connections};
 
 /// Builds a rustls [`ServerConfig`] from PEM certificate-chain and private-key
 /// files, with ALPN advertising HTTP/2 and HTTP/1.1.
@@ -127,12 +127,7 @@ impl App {
 
         // Stop accepting new connections, then drain the in-flight ones.
         drop(listener);
-        tokio::select! {
-            _ = graceful.shutdown() => {}
-            _ = tokio::time::sleep(Duration::from_secs(10)) => {
-                eprintln!("Timed out waiting for in-flight connections to drain");
-            }
-        }
+        drain_server_connections(&app.websocket_runtime(), graceful.shutdown()).await;
         Ok(())
     }
 }

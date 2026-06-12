@@ -89,6 +89,7 @@ async fn run(
     start_rx: oneshot::Receiver<DriverStart>,
     runtime: WebSocketRuntimeHandle,
 ) -> DriverOutcome {
+    let mut shutdown_rx = runtime.subscribe_shutdown();
     let mut handler_done = match start_rx.await.unwrap_or(DriverStart::Rejected) {
         DriverStart::Registered(handler_done) => handler_done,
         DriverStart::Rejected => {
@@ -121,7 +122,7 @@ async fn run(
         &mut control_rx,
         &mut handler_done,
         &mut sender_count_rx,
-        (&config, &runtime),
+        (&config, &runtime, &mut shutdown_rx),
     )
     .await;
 
@@ -228,9 +229,13 @@ async fn drive(
     control_rx: &mut mpsc::Receiver<ControlCommand>,
     handler_done: &mut oneshot::Receiver<Result<(), WsError>>,
     sender_count_rx: &mut watch::Receiver<usize>,
-    lifecycle: (&ResolvedWebSocketConfig, &WebSocketRuntimeHandle),
+    lifecycle: (
+        &ResolvedWebSocketConfig,
+        &WebSocketRuntimeHandle,
+        &mut watch::Receiver<bool>,
+    ),
 ) -> DriverOutcome {
-    let (config, runtime) = lifecycle;
+    let (config, runtime, shutdown_rx) = lifecycle;
     let mut control_open = true;
     let mut outbound_open = true;
     let mut handler_completed = false;
@@ -239,6 +244,30 @@ async fn drive(
     loop {
         tokio::select! {
             biased;
+
+            _ = wait_for_shutdown(shutdown_rx), if !state.close_sent => {
+                close_command_channels(
+                    control_rx,
+                    outbound_rx,
+                    &mut control_open,
+                    &mut outbound_open,
+                );
+                let frame = CloseFrame {
+                    code: CloseCode::Away,
+                    reason: "apagado del servidor".into(),
+                };
+                if let Err(error) = initiate_close(
+                    stream,
+                    &mut state,
+                    Some(frame),
+                    WebSocketCloseInitiator::Runtime,
+                    config.close_timeout,
+                )
+                .await
+                {
+                    return protocol_outcome(inbound_tx, error);
+                }
+            }
 
             command = control_rx.recv(), if control_open => {
                 let Some(command) = command else {
@@ -699,6 +728,17 @@ async fn wait_until(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => pending::<()>().await,
+    }
+}
+
+async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown_rx.borrow_and_update() {
+            return;
+        }
+        if shutdown_rx.changed().await.is_err() {
+            return;
+        }
     }
 }
 

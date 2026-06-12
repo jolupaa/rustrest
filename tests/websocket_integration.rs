@@ -12,6 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
@@ -94,6 +95,31 @@ async fn raw_handshake(addr: SocketAddr, headers: &[(&str, &str)]) -> String {
     })
     .await
     .expect("handshake I/O should complete before the deadline")
+}
+
+async fn raw_websocket(addr: SocketAddr) -> TcpStream {
+    tokio::time::timeout(IO_TIMEOUT, async {
+        let request = format!(
+            "GET /ws HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        );
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+            let mut byte = [0_u8; 1];
+            assert_eq!(stream.read(&mut byte).await.unwrap(), 1);
+            response.push(byte[0]);
+        }
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 101"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        stream
+    })
+    .await
+    .expect("raw websocket handshake should complete before the deadline")
 }
 
 #[tokio::test]
@@ -1056,4 +1082,155 @@ async fn websocket_message_rate_resets_after_window_rollover() {
         .await
         .expect("message after window rollover should be delivered")
         .unwrap();
+}
+
+#[tokio::test]
+async fn websocket_shutdown_sends_1001_and_drains_cooperative_client() {
+    let mut app = App::new();
+    app.websocket_defaults(WebSocketConfig::new().close_timeout(Duration::from_millis(200)));
+    app.websocket("/ws", |_socket| async move {
+        std::future::pending::<()>().await;
+    });
+    let runtime = app.websocket_runtime();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(app.serve_with_shutdown(listener, async move {
+        let _ = shutdown_rx.await;
+    }));
+
+    let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+    wait_for_connections(&runtime, 1, 0).await;
+    shutdown_tx.send(()).unwrap();
+
+    let close = tokio::time::timeout(IO_TIMEOUT, client.next())
+        .await
+        .expect("shutdown close frame should arrive before the deadline")
+        .expect("server should send a websocket frame")
+        .expect("shutdown frame should be valid");
+    let Message::Close(Some(frame)) = close else {
+        panic!("expected a close frame, got {close:?}");
+    };
+    assert_eq!(frame.code, CloseCode::Away);
+    assert_eq!(frame.reason, "apagado del servidor");
+    client.flush().await.unwrap();
+
+    let result = tokio::time::timeout(IO_TIMEOUT, server)
+        .await
+        .expect("server shutdown should finish before the deadline")
+        .expect("server task should not panic");
+    assert!(result.is_ok());
+    assert_eq!(runtime.stats().active_connections, 0);
+}
+
+#[tokio::test]
+async fn websocket_shutdown_waits_for_uncooperative_client_close_timeout() {
+    let close_timeout = Duration::from_millis(150);
+    let mut app = App::new();
+    app.websocket_defaults(WebSocketConfig::new().close_timeout(close_timeout));
+    app.websocket("/ws", |_socket| async move {
+        std::future::pending::<()>().await;
+    });
+    let runtime = app.websocket_runtime();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(app.serve_with_shutdown(listener, async move {
+        let _ = shutdown_rx.await;
+    }));
+    let _client = raw_websocket(addr).await;
+    wait_for_connections(&runtime, 1, 0).await;
+
+    let started = tokio::time::Instant::now();
+    shutdown_tx.send(()).unwrap();
+    let result = tokio::time::timeout(IO_TIMEOUT, server)
+        .await
+        .expect("forced websocket shutdown should finish before the deadline")
+        .expect("server task should not panic");
+
+    assert!(result.is_ok());
+    assert!(
+        started.elapsed() >= close_timeout,
+        "server returned before the websocket close grace period elapsed"
+    );
+    assert_eq!(runtime.stats().active_connections, 0);
+}
+
+#[tokio::test]
+async fn websocket_runtime_close_targets_one_connection_and_reports_missing_id() {
+    let (addr, runtime, _server) = spawn_app_with_runtime(|app| {
+        app.websocket("/ws", |_socket| async move {
+            std::future::pending::<()>().await;
+        });
+    })
+    .await;
+    let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+    wait_for_connections(&runtime, 1, 0).await;
+    let id = runtime.connections()[0].id;
+
+    let close_runtime = runtime.clone();
+    let close = tokio::spawn(async move { close_runtime.close(id, 1001, "mantenimiento").await });
+    let message = tokio::time::timeout(IO_TIMEOUT, client.next())
+        .await
+        .expect("administrative close should arrive before the deadline")
+        .expect("server should send a websocket frame")
+        .expect("administrative close should be valid");
+    let Message::Close(Some(frame)) = message else {
+        panic!("expected a close frame, got {message:?}");
+    };
+    assert_eq!(frame.code, CloseCode::Away);
+    assert_eq!(frame.reason, "mantenimiento");
+    client.flush().await.unwrap();
+    close.await.unwrap().unwrap();
+
+    assert!(matches!(
+        runtime.close(id, 1001, "otra vez").await,
+        Err(WsError::ConnectionNotFound(missing)) if missing == id
+    ));
+}
+
+#[tokio::test]
+async fn websocket_runtime_shutdown_drains_and_rejects_future_upgrades() {
+    let (addr, runtime, _server) = spawn_app_with_runtime(|app| {
+        app.websocket_defaults(WebSocketConfig::new().close_timeout(Duration::from_millis(200)));
+        app.websocket("/ws", |_socket| async move {
+            std::future::pending::<()>().await;
+        });
+    })
+    .await;
+    let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+    wait_for_connections(&runtime, 1, 0).await;
+
+    let shutdown_runtime = runtime.clone();
+    let shutdown = tokio::spawn(async move { shutdown_runtime.shutdown().await });
+    let message = tokio::time::timeout(IO_TIMEOUT, client.next())
+        .await
+        .expect("runtime shutdown close should arrive before the deadline")
+        .expect("server should send a websocket frame")
+        .expect("runtime shutdown close should be valid");
+    let Message::Close(Some(frame)) = message else {
+        panic!("expected a close frame, got {message:?}");
+    };
+    assert_eq!(frame.code, CloseCode::Away);
+    assert_eq!(frame.reason, "apagado del servidor");
+    client.flush().await.unwrap();
+    shutdown.await.unwrap().unwrap();
+
+    let response = raw_handshake(
+        addr,
+        &[
+            ("Sec-WebSocket-Version", "13"),
+            ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ],
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 503"), "{response}");
 }

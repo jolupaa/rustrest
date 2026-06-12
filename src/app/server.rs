@@ -30,6 +30,30 @@ use super::{
 
 /// Default maximum request body we will buffer into memory (64 KB).
 const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
+const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(crate) async fn drain_server_connections(
+    runtime: &WebSocketRuntimeHandle,
+    http_shutdown: impl Future<Output = ()>,
+) {
+    runtime.begin_shutdown().await;
+    let websocket_grace = runtime.shutdown_grace_period();
+    let websocket_shutdown = async {
+        if runtime.drain(websocket_grace).await.is_err() {
+            runtime.abort_remaining();
+            runtime.wait_until_empty().await;
+        }
+    };
+
+    tokio::select! {
+        _ = async { tokio::join!(http_shutdown, websocket_shutdown); } => {}
+        _ = tokio::time::sleep(SERVER_SHUTDOWN_TIMEOUT) => {
+            eprintln!("Timed out waiting for in-flight connections to drain");
+            runtime.abort_remaining();
+            runtime.wait_until_empty().await;
+        }
+    }
+}
 
 /// How request paths with a trailing slash (`/users/`) are treated relative
 /// to the canonical, slash-less route (`/users`). The root path `/` is always
@@ -434,12 +458,7 @@ impl App {
 
         // Stop accepting new connections, then drain the in-flight ones.
         drop(listener);
-        tokio::select! {
-            _ = graceful.shutdown() => {}
-            _ = tokio::time::sleep(Duration::from_secs(10)) => {
-                eprintln!("Timed out waiting for in-flight connections to drain");
-            }
-        }
+        drain_server_connections(&app.websocket_runtime, graceful.shutdown()).await;
         Ok(())
     }
 

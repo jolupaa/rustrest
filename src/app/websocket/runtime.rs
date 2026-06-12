@@ -3,23 +3,25 @@ use std::net::{IpAddr, SocketAddr};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::{Notify, watch};
 use tokio::task::AbortHandle;
 
 use super::ResolvedWebSocketConfig;
-use super::socket::InternalWebSocketSender;
+use super::socket::{InternalWebSocketSender, validate_close};
 use super::types::{
     WebSocketConnectionSnapshot, WebSocketId, WebSocketObservation, WebSocketObserver,
     WebSocketStats,
 };
+use super::{WebSocketTimeout, WsError};
 
 struct RuntimeInner {
     next_id: AtomicU64,
     registry: Mutex<Registry>,
     shutdown_tx: watch::Sender<bool>,
     empty: Notify,
+    registry_changed: Notify,
     observer: RwLock<Arc<dyn WebSocketObserver>>,
 }
 
@@ -37,6 +39,7 @@ struct ConnectionEntry {
     remote_addr: Option<SocketAddr>,
     protocol: Option<String>,
     opened_at: SystemTime,
+    close_timeout: Duration,
     internal_sender: Option<InternalWebSocketSender>,
     driver_abort: Option<AbortHandle>,
 }
@@ -105,6 +108,7 @@ impl WebSocketRuntimeHandle {
                 }),
                 shutdown_tx,
                 empty: Notify::new(),
+                registry_changed: Notify::new(),
                 observer: RwLock::new(Arc::new(())),
             }),
         }
@@ -198,6 +202,7 @@ impl WebSocketRuntimeHandle {
                             remote_addr,
                             protocol: protocol.map(str::to_string),
                             opened_at: SystemTime::now(),
+                            close_timeout: config.close_timeout,
                             internal_sender: None,
                             driver_abort: None,
                         },
@@ -236,13 +241,128 @@ impl WebSocketRuntimeHandle {
         internal_sender: InternalWebSocketSender,
         driver_abort: AbortHandle,
     ) -> bool {
-        let mut registry = self.registry();
-        let Some(entry) = registry.connections.get_mut(&id) else {
-            return false;
+        let registered = {
+            let mut registry = self.registry();
+            let Some(entry) = registry.connections.get_mut(&id) else {
+                return false;
+            };
+            entry.internal_sender = Some(internal_sender);
+            entry.driver_abort = Some(driver_abort);
+            true
         };
-        entry.internal_sender = Some(internal_sender);
-        entry.driver_abort = Some(driver_abort);
-        true
+        self.inner.registry_changed.notify_waiters();
+        registered
+    }
+
+    pub async fn close(&self, id: WebSocketId, code: u16, reason: &str) -> Result<(), WsError> {
+        validate_close(code, reason)?;
+        let close_timeout = self
+            .registry()
+            .connections
+            .get(&id)
+            .map(|entry| entry.close_timeout)
+            .ok_or(WsError::ConnectionNotFound(id))?;
+
+        tokio::time::timeout(close_timeout, async {
+            let sender = self.wait_for_sender(id).await?;
+            sender.disconnect(code, reason).await?;
+            let _ = sender.closed().await;
+            self.wait_for_removal(id).await;
+            Ok(())
+        })
+        .await
+        .map_err(|_| WsError::Timeout(WebSocketTimeout::Close))?
+    }
+
+    pub async fn shutdown(&self) -> Result<(), WsError> {
+        self.begin_shutdown().await;
+        let grace = self.shutdown_grace_period();
+        match self.drain(grace).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.abort_remaining();
+                self.wait_until_empty().await;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) async fn begin_shutdown(&self) {
+        self.stop_accepting();
+        self.inner.shutdown_tx.send_replace(true);
+    }
+
+    pub(crate) fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.inner.shutdown_tx.subscribe()
+    }
+
+    pub(crate) fn shutdown_grace_period(&self) -> Duration {
+        self.registry()
+            .connections
+            .values()
+            .map(|entry| entry.close_timeout)
+            .max()
+            .unwrap_or(Duration::ZERO)
+    }
+
+    pub(crate) async fn drain(&self, timeout: Duration) -> Result<(), WsError> {
+        if self.active_count() == 0 {
+            return Ok(());
+        }
+        tokio::time::timeout(timeout, self.wait_until_empty())
+            .await
+            .map_err(|_| WsError::Timeout(WebSocketTimeout::Shutdown))
+    }
+
+    pub(crate) fn abort_remaining(&self) {
+        let abort_handles = self
+            .registry()
+            .connections
+            .values()
+            .filter_map(|entry| entry.driver_abort.clone())
+            .collect::<Vec<_>>();
+        for abort_handle in abort_handles {
+            abort_handle.abort();
+        }
+    }
+
+    pub(crate) async fn wait_until_empty(&self) {
+        loop {
+            let notified = self.inner.empty.notified();
+            if self.active_count() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn active_count(&self) -> usize {
+        self.registry().connections.len()
+    }
+
+    async fn wait_for_sender(&self, id: WebSocketId) -> Result<InternalWebSocketSender, WsError> {
+        loop {
+            let changed = self.inner.registry_changed.notified();
+            match self.registry().connections.get(&id) {
+                Some(entry) => {
+                    if let Some(sender) = &entry.internal_sender {
+                        return Ok(sender.clone());
+                    }
+                }
+                None => return Err(WsError::ConnectionNotFound(id)),
+            }
+            changed.await;
+        }
+    }
+
+    async fn wait_for_removal(&self, id: WebSocketId) {
+        loop {
+            let changed = self.inner.registry_changed.notified();
+            if !self.registry().connections.contains_key(&id) {
+                return;
+            }
+            changed.await;
+        }
     }
 
     pub(crate) fn record_saturated_send(&self) {
@@ -271,6 +391,7 @@ impl WebSocketRuntimeHandle {
         if became_empty {
             self.inner.empty.notify_waiters();
         }
+        self.inner.registry_changed.notify_waiters();
     }
 
     fn registry(&self) -> MutexGuard<'_, Registry> {
