@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::RequestBuilder;
 
+use super::socket::{LocalEnqueueOutcome, SocketMetadata, channel_pair};
 use super::*;
 
 fn resolved_config(app: WebSocketConfig, route: WebSocketConfig) -> ResolvedWebSocketConfig {
@@ -475,6 +476,82 @@ fn websocket_hub_room_limits_are_hard_ceilings() {
         runtime.join(permit.id(), &["larga".into()]),
         Err(WsError::InvalidRoom(_))
     ));
+}
+
+#[tokio::test]
+async fn websocket_broadcast_report_represents_every_partial_outcome() {
+    let hub = WsHub::local();
+    let runtime = hub.runtime();
+    let config = resolved_config(
+        WebSocketConfig::new(),
+        WebSocketConfig::new()
+            .outbound_capacity(1)
+            .backpressure_policy(BackpressurePolicy::Reject),
+    );
+    let first = runtime.admit("/chat", None, None, &config).unwrap();
+    let second = runtime.admit("/chat", None, None, &config).unwrap();
+    let third = runtime.admit("/chat", None, None, &config).unwrap();
+    let (_first_socket, first_sender, _first_channels) = channel_pair(
+        SocketMetadata {
+            id: first.id(),
+            remote_addr: None,
+            route: "/chat".into(),
+            protocol: None,
+        },
+        &config,
+        runtime.clone(),
+    );
+    let (_second_socket, second_sender, _second_channels) = channel_pair(
+        SocketMetadata {
+            id: second.id(),
+            remote_addr: None,
+            route: "/chat".into(),
+            protocol: None,
+        },
+        &config,
+        runtime.clone(),
+    );
+    let first_driver = tokio::spawn(std::future::pending::<()>());
+    let second_driver = tokio::spawn(std::future::pending::<()>());
+    assert!(runtime.register_driver(
+        first.id(),
+        first_sender.clone(),
+        first_driver.abort_handle()
+    ));
+    assert!(runtime.register_driver(second.id(), second_sender, second_driver.abort_handle()));
+    assert!(matches!(
+        first_sender
+            .enqueue(WebSocketMessage::text("ocupa-cola"))
+            .await,
+        LocalEnqueueOutcome::Enqueued
+    ));
+
+    let report = hub
+        .route("/chat")
+        .all()
+        .send_text("broadcast")
+        .await
+        .unwrap();
+
+    assert_eq!(report.matched, 3);
+    assert_eq!(report.enqueued, 1);
+    assert_eq!(report.rejected, 1);
+    assert_eq!(report.disconnected, 1);
+    assert_eq!(
+        report.matched,
+        report.enqueued + report.rejected + report.disconnected
+    );
+    assert_eq!(report.remote, WsRemotePublish::NotConfigured);
+    assert!(matches!(
+        hub.all()
+            .send(WebSocketMessage::Ping(Vec::new().into()))
+            .await,
+        Err(WsBroadcastError::InvalidMessage)
+    ));
+
+    first_driver.abort();
+    second_driver.abort();
+    drop((first, second, third));
 }
 
 #[test]

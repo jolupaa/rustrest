@@ -14,8 +14,10 @@ use hyper::upgrade::OnUpgrade;
 
 pub(crate) use config::ResolvedWebSocketConfig;
 pub use config::{BackpressurePolicy, OriginPolicy, WebSocketConfig};
-pub use error::{WebSocketCapacityError, WebSocketError, WebSocketTimeout, WsError};
-pub use hub::{WsHub, WsHubBuilder};
+pub use error::{
+    WebSocketCapacityError, WebSocketError, WebSocketTimeout, WsBroadcastError, WsError,
+};
+pub use hub::{WsBroadcastReport, WsHub, WsHubBuilder, WsRemotePublish, WsRoute, WsTarget};
 pub use runtime::WebSocketRuntimeHandle;
 use socket::NormalizedWebSocketHandler;
 pub use socket::{

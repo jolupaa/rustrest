@@ -25,6 +25,8 @@ struct RuntimeInner {
     observer: RwLock<Arc<dyn WebSocketObserver>>,
     max_rooms_per_connection: usize,
     max_room_name_bytes: usize,
+    broadcast_concurrency: usize,
+    broker_operation_timeout: Duration,
 }
 
 struct Registry {
@@ -69,6 +71,11 @@ pub struct WebSocketRuntimeHandle {
     inner: Arc<RuntimeInner>,
 }
 
+pub(crate) struct LocalBroadcastRecipient {
+    pub id: WebSocketId,
+    pub sender: Option<InternalWebSocketSender>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AdmissionError {
     Shutdown,
@@ -106,12 +113,14 @@ impl ConnectionPermit {
 
 impl WebSocketRuntimeHandle {
     pub(crate) fn local() -> Self {
-        Self::local_with_room_limits(32, 128)
+        Self::local_with_hub_config(32, 128, 64, Duration::from_secs(2))
     }
 
-    pub(crate) fn local_with_room_limits(
+    pub(crate) fn local_with_hub_config(
         max_rooms_per_connection: usize,
         max_room_name_bytes: usize,
+        broadcast_concurrency: usize,
+        broker_operation_timeout: Duration,
     ) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
         Self {
@@ -131,6 +140,8 @@ impl WebSocketRuntimeHandle {
                 observer: RwLock::new(Arc::new(())),
                 max_rooms_per_connection,
                 max_room_name_bytes,
+                broadcast_concurrency,
+                broker_operation_timeout,
             }),
         }
     }
@@ -372,6 +383,55 @@ impl WebSocketRuntimeHandle {
             .rooms
             .get(&(route.to_string(), room.to_string()))
             .map_or(0, HashSet::len)
+    }
+
+    pub(crate) fn hub_config(&self) -> (usize, usize, usize, Duration) {
+        (
+            self.inner.max_rooms_per_connection,
+            self.inner.max_room_name_bytes,
+            self.inner.broadcast_concurrency,
+            self.inner.broker_operation_timeout,
+        )
+    }
+
+    pub(crate) fn select_broadcast_recipients(
+        &self,
+        route: Option<&str>,
+        rooms: &[String],
+        all_in_scope: bool,
+        excluded: &HashSet<WebSocketId>,
+    ) -> Vec<LocalBroadcastRecipient> {
+        let registry = self.registry();
+        let mut ids = if all_in_scope {
+            registry
+                .connections
+                .iter()
+                .filter_map(|(&id, entry)| {
+                    route.is_none_or(|route| entry.route == route).then_some(id)
+                })
+                .collect::<HashSet<_>>()
+        } else {
+            let Some(route) = route else {
+                return Vec::new();
+            };
+            rooms
+                .iter()
+                .filter_map(|room| registry.rooms.get(&(route.to_string(), room.clone())))
+                .flat_map(|members| members.iter().copied())
+                .collect::<HashSet<_>>()
+        };
+        ids.retain(|id| !excluded.contains(id));
+        let mut ids = ids.into_iter().collect::<Vec<_>>();
+        ids.sort_by_key(|id| id.0);
+        ids.into_iter()
+            .map(|id| LocalBroadcastRecipient {
+                id,
+                sender: registry
+                    .connections
+                    .get(&id)
+                    .and_then(|entry| entry.internal_sender.clone()),
+            })
+            .collect()
     }
 
     /// Closes one process-local connection and waits for registry cleanup.

@@ -5,7 +5,8 @@ use rustrest::{
     App, IntoWebSocketHandler, Request, Response, Router, WebSocket, WebSocketCloseInfo,
     WebSocketCloseInitiator, WebSocketConfig, WebSocketError, WebSocketEvent, WebSocketHandler,
     WebSocketMessage, WebSocketObservation, WebSocketObserver, WebSocketReceiver,
-    WebSocketRuntimeHandle, WebSocketSender, WebSocketStats, WsBroadcast, WsError, WsHub,
+    WebSocketRuntimeHandle, WebSocketSender, WebSocketStats, WsBroadcast, WsBroadcastError,
+    WsBroadcastReport, WsError, WsHub, WsRemotePublish, WsRoute, WsTarget,
 };
 
 struct Observer;
@@ -38,6 +39,11 @@ fn existing_websocket_surface_still_compiles() {
     let _: &mut App = app.websocket_hub(hub.clone());
     let _: WsHub = app.websocket_hub_handle();
     let _: WsHub = WsHub::local();
+    let route: WsRoute = hub.route("/ws");
+    let _: WsTarget = route.to("general");
+    let _: WsTarget = route.to_many(["general", "equipo-7"]);
+    let _: WsTarget = route.all();
+    let _: WsTarget = hub.all();
     let runtime: WebSocketRuntimeHandle = app.websocket_runtime();
     let _stats: WebSocketStats = runtime.stats();
     let _connections = runtime.connections();
@@ -65,6 +71,13 @@ fn existing_websocket_surface_still_compiles() {
         let _: Result<(), WsError> = socket.leave_many(["general", "equipo-7"]).await;
         let _: Result<(), WsError> = socket.leave_all().await;
         let _: Result<Vec<String>, WsError> = socket.rooms().await;
+        let _: Result<WsBroadcastReport, WsBroadcastError> =
+            socket.to("general").send_text("hola").await;
+        let _: Result<WsBroadcastReport, WsBroadcastError> = socket
+            .to_many(["general", "equipo-7"])
+            .send_json(&serde_json::json!({ "ok": true }))
+            .await;
+        let _: WsTarget = socket.broadcast().except(socket.id());
         let _ = socket.id();
         let _: Option<std::net::SocketAddr> = socket.remote_addr();
         let _: &str = socket.route();
@@ -83,6 +96,12 @@ fn existing_websocket_surface_still_compiles() {
         let _: Result<(), WsError> = sender.leave_many(["general", "equipo-7"]).await;
         let _: Result<(), WsError> = sender.leave_all().await;
         let _: Result<Vec<String>, WsError> = sender.rooms().await;
+        let _: Result<WsBroadcastReport, WsBroadcastError> = sender
+            .to("general")
+            .send_binary([1_u8, 2, 3].as_slice())
+            .await;
+        let _: Result<WsBroadcastReport, WsBroadcastError> =
+            sender.broadcast().send_event("ready", &true).await;
         let _: Result<(), WsError> = sender.close_with(1000, "finalizado").await;
         let _: WebSocketCloseInfo = sender.closed().await;
         let _: Result<Option<WebSocketMessage>, WebSocketError> = receiver.recv().await;
@@ -141,6 +160,7 @@ fn existing_websocket_surface_still_compiles() {
         event: "ready".to_string(),
         data: true,
     };
+    let _remote: WsRemotePublish = WsRemotePublish::NotConfigured;
     let _error_match: fn(WebSocketError) -> &'static str = exhaustive_existing_error;
     let _socket_consumer: fn(WebSocket) = accepts_websocket;
     let _close_info_consumer: fn(WebSocketCloseInfo) = accepts_close_info;

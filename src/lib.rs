@@ -34,5 +34,6 @@ pub use app::{
     WebSocketError, WebSocketErrorCategory, WebSocketEvent, WebSocketHandler, WebSocketId,
     WebSocketMessage, WebSocketObservation, WebSocketObserver, WebSocketReceiver,
     WebSocketRuntimeHandle, WebSocketSender, WebSocketStats, WebSocketTimeout, WsBroadcast,
-    WsError, WsHub, WsHubBuilder, middleware, sign_value, verify_value,
+    WsBroadcastError, WsBroadcastReport, WsError, WsHub, WsHubBuilder, WsRemotePublish, WsRoute,
+    WsTarget, middleware, sign_value, verify_value,
 };

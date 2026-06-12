@@ -154,6 +154,184 @@ async fn raw_websocket(addr: SocketAddr) -> TcpStream {
     .expect("raw websocket handshake should complete before the deadline")
 }
 
+async fn join_test_rooms(
+    client: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+    rooms: &str,
+) {
+    client
+        .send(Message::Text(format!("join:{rooms}").into()))
+        .await
+        .unwrap();
+    let ready = tokio::time::timeout(IO_TIMEOUT, client.next())
+        .await
+        .expect("room join acknowledgement should arrive")
+        .unwrap()
+        .unwrap();
+    assert_eq!(ready.into_text().unwrap(), "ready");
+}
+
+async fn assert_no_websocket_message(
+    client: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(75), client.next())
+            .await
+            .is_err(),
+        "client unexpectedly received a websocket message"
+    );
+}
+
+#[tokio::test]
+async fn websocket_room_broadcast_excludes_sender_and_respects_route_scope() {
+    let (report_tx, mut report_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new();
+    let hub = app.websocket_hub_handle();
+    for path in ["/chat/:channel", "/admin/chat/:channel"] {
+        let report_tx = report_tx.clone();
+        app.websocket(path, move |mut socket| {
+            let report_tx = report_tx.clone();
+            async move {
+                while let Some(message) = socket.recv().await.unwrap() {
+                    let Ok(text) = message.into_text() else {
+                        continue;
+                    };
+                    if let Some(rooms) = text.strip_prefix("join:") {
+                        socket.join_many(rooms.split(',')).await.unwrap();
+                        socket.send_text("ready").await.unwrap();
+                    } else if let Some(command) = text.strip_prefix("to:") {
+                        let (room, payload) = command.split_once(':').unwrap();
+                        let report = socket.to(room).send_text(payload).await.unwrap();
+                        report_tx.send(report).unwrap();
+                    }
+                }
+            }
+        });
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _server = ServerGuard(tokio::spawn(async move {
+        app.serve(listener).await.unwrap();
+    }));
+
+    let (mut origin, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/chat/a"))
+        .await
+        .unwrap();
+    let (mut peer, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/chat/b"))
+        .await
+        .unwrap();
+    let (mut admin, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/admin/chat/a"))
+        .await
+        .unwrap();
+    join_test_rooms(&mut origin, "general").await;
+    join_test_rooms(&mut peer, "general").await;
+    join_test_rooms(&mut admin, "general").await;
+
+    origin
+        .send(Message::Text("to:general:hola-room".into()))
+        .await
+        .unwrap();
+    let report = tokio::time::timeout(IO_TIMEOUT, report_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.matched, 1);
+    assert_eq!(report.enqueued, 1);
+    assert_eq!(report.rejected, 0);
+    assert_eq!(report.disconnected, 0);
+    let message = tokio::time::timeout(IO_TIMEOUT, peer.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.into_text().unwrap(), "hola-room");
+    assert_no_websocket_message(&mut origin).await;
+    assert_no_websocket_message(&mut admin).await;
+
+    let report = hub
+        .route("/chat/:channel")
+        .all()
+        .send_text("solo-chat")
+        .await
+        .unwrap();
+    assert_eq!(report.matched, 2);
+    for client in [&mut origin, &mut peer] {
+        let message = tokio::time::timeout(IO_TIMEOUT, client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.into_text().unwrap(), "solo-chat");
+    }
+    assert_no_websocket_message(&mut admin).await;
+
+    let report = hub.all().send_text("todos").await.unwrap();
+    assert_eq!(report.matched, 3);
+    for client in [&mut origin, &mut peer, &mut admin] {
+        let message = tokio::time::timeout(IO_TIMEOUT, client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.into_text().unwrap(), "todos");
+    }
+}
+
+#[tokio::test]
+async fn websocket_multi_room_deduplicates_local_recipient() {
+    let (report_tx, mut report_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (addr, _server) = spawn_app(move |app| {
+        app.websocket("/chat/:channel", move |mut socket| {
+            let report_tx = report_tx.clone();
+            async move {
+                while let Some(message) = socket.recv().await.unwrap() {
+                    let Ok(text) = message.into_text() else {
+                        continue;
+                    };
+                    if let Some(rooms) = text.strip_prefix("join:") {
+                        socket.join_many(rooms.split(',')).await.unwrap();
+                        socket.send_text("ready").await.unwrap();
+                    } else if let Some(command) = text.strip_prefix("to_many:") {
+                        let (rooms, payload) = command.split_once(':').unwrap();
+                        let report = socket
+                            .to_many(rooms.split(','))
+                            .send_text(payload)
+                            .await
+                            .unwrap();
+                        report_tx.send(report).unwrap();
+                    }
+                }
+            }
+        });
+    })
+    .await;
+    let (mut origin, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/chat/a"))
+        .await
+        .unwrap();
+    let (mut peer, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/chat/b"))
+        .await
+        .unwrap();
+    join_test_rooms(&mut peer, "general,equipo-7").await;
+
+    origin
+        .send(Message::Text("to_many:general,equipo-7:una-vez".into()))
+        .await
+        .unwrap();
+    let report = tokio::time::timeout(IO_TIMEOUT, report_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.matched, 1);
+    assert_eq!(report.enqueued, 1);
+    let message = tokio::time::timeout(IO_TIMEOUT, peer.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.into_text().unwrap(), "una-vez");
+    assert_no_websocket_message(&mut peer).await;
+    assert_no_websocket_message(&mut origin).await;
+}
+
 #[tokio::test]
 async fn websocket_runtime_stats_and_observer_record_message_metadata() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;

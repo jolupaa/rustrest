@@ -123,3 +123,38 @@ impl From<serde_json::Error> for WsError {
         Self::WebSocket(value.into())
     }
 }
+
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum WsBroadcastError {
+    InvalidMessage,
+    InvalidRoom(String),
+    Serialization(serde_json::Error),
+}
+
+impl std::fmt::Display for WsBroadcastError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidMessage => {
+                f.write_str("los broadcasts WebSocket solo admiten texto o binario")
+            }
+            Self::InvalidRoom(room) => write!(f, "room WebSocket no valido: {room}"),
+            Self::Serialization(error) => write!(f, "error serializando broadcast: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for WsBroadcastError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Serialization(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<serde_json::Error> for WsBroadcastError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Serialization(value)
+    }
+}

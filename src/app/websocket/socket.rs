@@ -20,7 +20,7 @@ use super::runtime::WebSocketRuntimeHandle;
 use super::types::{WebSocketCloseInfo, WebSocketCloseInitiator, WebSocketId};
 use super::{
     BackpressurePolicy, ResolvedWebSocketConfig, WebSocketCapacityError, WebSocketError,
-    WebSocketTimeout, WsError,
+    WebSocketTimeout, WsError, WsHub, WsTarget,
 };
 
 pub use super::types::{WebSocketEvent, WebSocketMessage};
@@ -140,6 +140,12 @@ pub(crate) struct InternalWebSocketSender {
     shared: Arc<SocketShared>,
 }
 
+pub(crate) enum LocalEnqueueOutcome {
+    Enqueued,
+    Rejected,
+    Disconnected,
+}
+
 struct SocketShared {
     id: WebSocketId,
     remote_addr: Option<SocketAddr>,
@@ -153,6 +159,61 @@ struct SocketShared {
     runtime: WebSocketRuntimeHandle,
     public_senders: Arc<AtomicUsize>,
     sender_count_tx: watch::Sender<usize>,
+}
+
+impl SocketShared {
+    fn try_send_application(&self, message: WebSocketMessage) -> Result<(), WsError> {
+        let permit = self
+            .outbound
+            .clone()
+            .try_reserve_owned()
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    self.runtime.record_saturated_send(self.id, true);
+                    WsError::Capacity(WebSocketCapacityError::OutboundQueue)
+                }
+                mpsc::error::TrySendError::Closed(_) => WsError::Closed,
+            })?;
+        permit.send(OutboundCommand::Message(message));
+        Ok(())
+    }
+
+    async fn send_application(&self, message: WebSocketMessage) -> Result<(), WsError> {
+        match self.backpressure_policy {
+            BackpressurePolicy::Wait => {
+                let permit =
+                    tokio::time::timeout(self.send_timeout, self.outbound.clone().reserve_owned())
+                        .await
+                        .map_err(|_| {
+                            self.runtime.record_saturated_send(self.id, true);
+                            WsError::Timeout(WebSocketTimeout::Send)
+                        })?
+                        .map_err(|_| WsError::Closed)?;
+                permit.send(OutboundCommand::Message(message));
+                Ok(())
+            }
+            BackpressurePolicy::Reject => self.try_send_application(message),
+            BackpressurePolicy::Disconnect => match self.try_send_application(message) {
+                Ok(()) => Ok(()),
+                Err(WsError::Capacity(_)) => {
+                    self.disconnect_slow_consumer().await?;
+                    Err(WsError::Capacity(WebSocketCapacityError::OutboundQueue))
+                }
+                Err(error) => Err(error),
+            },
+        }
+    }
+
+    async fn disconnect_slow_consumer(&self) -> Result<(), WsError> {
+        let frame = CloseFrame {
+            code: CloseCode::Again,
+            reason: "Cliente WebSocket demasiado lento".into(),
+        };
+        self.control
+            .send(ControlCommand::Disconnect(Some(frame)))
+            .await
+            .map_err(|_| WsError::Closed)
+    }
 }
 
 pub(crate) struct SocketMetadata {
@@ -223,6 +284,19 @@ impl Drop for WebSocketSender {
 }
 
 impl InternalWebSocketSender {
+    pub(crate) async fn enqueue(&self, message: WebSocketMessage) -> LocalEnqueueOutcome {
+        match self.shared.send_application(message).await {
+            Ok(()) => LocalEnqueueOutcome::Enqueued,
+            Err(WsError::Closed) => LocalEnqueueOutcome::Disconnected,
+            Err(WsError::Capacity(_))
+                if self.shared.backpressure_policy == BackpressurePolicy::Disconnect =>
+            {
+                LocalEnqueueOutcome::Disconnected
+            }
+            Err(_) => LocalEnqueueOutcome::Rejected,
+        }
+    }
+
     pub(crate) async fn disconnect(&self, code: u16, reason: &str) -> Result<(), WsError> {
         let frame = CloseFrame {
             code: CloseCode::from(code),
@@ -293,6 +367,22 @@ impl WebSocket {
 
     pub async fn rooms(&self) -> Result<Vec<String>, WsError> {
         self.sender.rooms().await
+    }
+
+    pub fn to(&self, room: impl Into<String>) -> WsTarget {
+        self.sender.to(room)
+    }
+
+    pub fn to_many<I, S>(&self, rooms: I) -> WsTarget
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.sender.to_many(rooms)
+    }
+
+    pub fn broadcast(&self) -> WsTarget {
+        self.sender.broadcast()
     }
 
     pub async fn recv(&mut self) -> Result<Option<WebSocketMessage>, WebSocketError> {
@@ -433,27 +523,34 @@ impl WebSocketSender {
             .ok_or(WsError::ConnectionNotFound(self.shared.id))
     }
 
+    pub fn to(&self, room: impl Into<String>) -> WsTarget {
+        self.to_many([room.into()])
+    }
+
+    pub fn to_many<I, S>(&self, rooms: I) -> WsTarget
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        WsHub::from_runtime(self.shared.runtime.clone())
+            .route(self.shared.route.clone())
+            .to_many(rooms)
+            .except(self.shared.id)
+    }
+
+    pub fn broadcast(&self) -> WsTarget {
+        WsHub::from_runtime(self.shared.runtime.clone())
+            .route(self.shared.route.clone())
+            .all()
+            .except(self.shared.id)
+    }
+
     pub fn try_send(&self, message: WebSocketMessage) -> Result<(), WsError> {
         match message {
             WebSocketMessage::Ping(payload) => self.try_send_control(ControlCommand::Ping(payload)),
             WebSocketMessage::Pong(payload) => self.try_send_control(ControlCommand::Pong(payload)),
             WebSocketMessage::Close(frame) => self.try_send_control(ControlCommand::Close(frame)),
-            message => {
-                let permit =
-                    self.shared.outbound.clone().try_reserve_owned().map_err(
-                        |error| match error {
-                            mpsc::error::TrySendError::Full(_) => {
-                                self.shared
-                                    .runtime
-                                    .record_saturated_send(self.shared.id, true);
-                                WsError::Capacity(WebSocketCapacityError::OutboundQueue)
-                            }
-                            mpsc::error::TrySendError::Closed(_) => WsError::Closed,
-                        },
-                    )?;
-                permit.send(OutboundCommand::Message(message));
-                Ok(())
-            }
+            message => self.shared.try_send_application(message),
         }
     }
 
@@ -466,7 +563,7 @@ impl WebSocketSender {
                 self.send_control(ControlCommand::Pong(payload)).await
             }
             WebSocketMessage::Close(frame) => self.send_control(ControlCommand::Close(frame)).await,
-            message => self.send_application(message).await,
+            message => self.shared.send_application(message).await,
         }
     }
 
@@ -524,45 +621,6 @@ impl WebSocketSender {
     pub async fn closed(&self) -> WebSocketCloseInfo {
         let mut close_rx = self.shared.close_rx.clone();
         wait_for_close(&mut close_rx).await
-    }
-
-    async fn send_application(&self, message: WebSocketMessage) -> Result<(), WsError> {
-        match self.shared.backpressure_policy {
-            BackpressurePolicy::Wait => {
-                let permit = tokio::time::timeout(
-                    self.shared.send_timeout,
-                    self.shared.outbound.clone().reserve_owned(),
-                )
-                .await
-                .map_err(|_| {
-                    self.shared
-                        .runtime
-                        .record_saturated_send(self.shared.id, true);
-                    WsError::Timeout(WebSocketTimeout::Send)
-                })?
-                .map_err(|_| WsError::Closed)?;
-                permit.send(OutboundCommand::Message(message));
-                Ok(())
-            }
-            BackpressurePolicy::Reject => self.try_send(message),
-            BackpressurePolicy::Disconnect => match self.try_send(message) {
-                Ok(()) => Ok(()),
-                Err(WsError::Capacity(_)) => {
-                    self.disconnect_slow_consumer().await?;
-                    Err(WsError::Capacity(WebSocketCapacityError::OutboundQueue))
-                }
-                Err(error) => Err(error),
-            },
-        }
-    }
-
-    async fn disconnect_slow_consumer(&self) -> Result<(), WsError> {
-        let frame = CloseFrame {
-            code: CloseCode::Again,
-            reason: "Cliente WebSocket demasiado lento".into(),
-        };
-        self.send_control(ControlCommand::Disconnect(Some(frame)))
-            .await
     }
 
     fn try_send_control(&self, command: ControlCommand) -> Result<(), WsError> {
