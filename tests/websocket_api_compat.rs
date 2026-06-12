@@ -2,12 +2,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rustrest::{
-    App, IntoWebSocketHandler, Request, Response, Router, WebSocket, WebSocketCloseInfo,
-    WebSocketCloseInitiator, WebSocketConfig, WebSocketError, WebSocketEvent, WebSocketHandler,
-    WebSocketLifecycleState, WebSocketMessage, WebSocketObservation, WebSocketObserver,
-    WebSocketReceiver, WebSocketRuntimeHandle, WebSocketSender, WebSocketStats, WsBroadcast,
-    WsBroadcastError, WsBroadcastReport, WsError, WsHub, WsLocalSocket, WsRemotePublish, WsRoute,
-    WsTarget,
+    App, InMemoryWsBroker, IntoWebSocketHandler, Request, Response, Router, WebSocket,
+    WebSocketCloseInfo, WebSocketCloseInitiator, WebSocketConfig, WebSocketError, WebSocketEvent,
+    WebSocketHandler, WebSocketLifecycleState, WebSocketMessage, WebSocketObservation,
+    WebSocketObserver, WebSocketReceiver, WebSocketRuntimeHandle, WebSocketSender, WebSocketStats,
+    WsBroadcast, WsBroadcastError, WsBroadcastReport, WsBroker, WsBrokerError, WsBrokerPayload,
+    WsBrokerPublication, WsBrokerStream, WsBrokerTarget, WsError, WsHub, WsLocalSocket, WsNodeId,
+    WsPublicationId, WsRemotePublish, WsRoute, WsTarget,
 };
 
 struct Observer;
@@ -26,17 +27,23 @@ fn exhaustive_existing_error(error: WebSocketError) -> &'static str {
 fn accepts_websocket(_: WebSocket) {}
 fn accepts_close_info(_: WebSocketCloseInfo) {}
 fn accepts_close_initiator(_: WebSocketCloseInitiator) {}
+fn assert_broker_object_safe(_: Arc<dyn WsBroker>) {}
 
 #[test]
 fn existing_websocket_surface_still_compiles() {
     let mut app = App::new();
+    let broker = Arc::new(InMemoryWsBroker::new(64));
+    assert_broker_object_safe(broker.clone());
     let hub = WsHub::builder()
         .max_rooms_per_connection(32)
         .max_room_name_bytes(128)
         .broadcast_concurrency(64)
         .broker_operation_timeout(Duration::from_secs(2))
+        .broker(broker)
+        .node_id(WsNodeId::new(42))
         .build()
         .unwrap();
+    assert_eq!(hub.node_id().get(), 42);
     let _: &mut App = app.websocket_hub(hub.clone());
     let _: WsHub = app.websocket_hub_handle();
     let _: WsHub = WsHub::local();
@@ -188,6 +195,14 @@ fn existing_websocket_surface_still_compiles() {
         data: true,
     };
     let _remote: WsRemotePublish = WsRemotePublish::NotConfigured;
+    let _broker_stream: Option<WsBrokerStream> = None;
+    let _broker_error: Option<WsBrokerError> = None;
+    let _publication = WsBrokerPublication::new(
+        WsPublicationId::new(1),
+        WsNodeId::new(42),
+        WsBrokerTarget::AllRoutes,
+        WsBrokerPayload::Text("hola".into()),
+    );
     let _error_match: fn(WebSocketError) -> &'static str = exhaustive_existing_error;
     let _socket_consumer: fn(WebSocket) = accepts_websocket;
     let _close_info_consumer: fn(WebSocketCloseInfo) = accepts_close_info;

@@ -1,3 +1,4 @@
+use futures_util::StreamExt;
 use hyper::header::SEC_WEBSOCKET_ACCEPT;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -9,6 +10,59 @@ use super::*;
 
 fn resolved_config(app: WebSocketConfig, route: WebSocketConfig) -> ResolvedWebSocketConfig {
     ResolvedWebSocketConfig::from_layers(&app, &route)
+}
+
+#[tokio::test]
+async fn websocket_in_memory_broker_exposes_delivery_lag_and_close() {
+    let broker = InMemoryWsBroker::new(1);
+    let node = WsNodeId::new(7);
+    let mut first = broker.subscribe(node).await.unwrap();
+    let mut second = broker.subscribe(WsNodeId::new(8)).await.unwrap();
+    let publication = |id, text: &str| WsBrokerPublication {
+        id: WsPublicationId::new(id),
+        origin: node,
+        target: WsBrokerTarget::RouteRooms {
+            route: "/chat/:channel".into(),
+            rooms: vec!["general".into()],
+        },
+        payload: WsBrokerPayload::Text(text.into()),
+    };
+
+    broker.publish(publication(1, "uno")).await.unwrap();
+    assert_eq!(first.next().await.unwrap().unwrap().origin, node);
+    assert_eq!(second.next().await.unwrap().unwrap().id.get(), 1);
+
+    broker.publish(publication(2, "dos")).await.unwrap();
+    broker.publish(publication(3, "tres")).await.unwrap();
+    assert!(matches!(
+        first.next().await,
+        Some(Err(WsBrokerError::Lagged(1)))
+    ));
+    assert_eq!(first.next().await.unwrap().unwrap().id.get(), 3);
+
+    broker.close();
+    assert!(matches!(
+        first.next().await,
+        Some(Err(WsBrokerError::SubscriptionClosed))
+    ));
+    assert!(first.next().await.is_none());
+    assert!(matches!(
+        broker.publish(publication(4, "cuatro")).await,
+        Err(WsBrokerError::Unavailable)
+    ));
+}
+
+#[test]
+fn websocket_hubs_allocate_unique_nodes_unless_configured() {
+    let first = WsHub::local();
+    let second = WsHub::local();
+    let configured = WsHub::builder()
+        .node_id(WsNodeId::new(9001))
+        .build()
+        .unwrap();
+
+    assert_ne!(first.node_id(), second.node_id());
+    assert_eq!(configured.node_id().get(), 9001);
 }
 
 #[test]

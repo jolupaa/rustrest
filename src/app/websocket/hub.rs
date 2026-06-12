@@ -10,7 +10,7 @@ use serde::Serialize;
 use super::socket::{InternalWebSocketSender, LocalEnqueueOutcome, validate_close};
 use super::{
     WebSocketConnectionSnapshot, WebSocketEvent, WebSocketId, WebSocketLifecycleState,
-    WebSocketMessage, WebSocketRuntimeHandle, WsBroadcastError, WsError,
+    WebSocketMessage, WebSocketRuntimeHandle, WsBroadcastError, WsBroker, WsError, WsNodeId,
 };
 
 const DEFAULT_MAX_ROOMS_PER_CONNECTION: usize = 32;
@@ -30,6 +30,8 @@ pub(crate) struct WsHubConfig {
     pub max_room_name_bytes: usize,
     pub broadcast_concurrency: usize,
     pub broker_operation_timeout: Duration,
+    pub broker: Option<Arc<dyn WsBroker>>,
+    pub node_id: WsNodeId,
 }
 
 /// Builder for hard hub ceilings and future broker behavior.
@@ -38,6 +40,8 @@ pub struct WsHubBuilder {
     max_room_name_bytes: usize,
     broadcast_concurrency: usize,
     broker_operation_timeout: Duration,
+    broker: Option<Arc<dyn WsBroker>>,
+    node_id: Option<WsNodeId>,
 }
 
 #[derive(Clone)]
@@ -96,19 +100,16 @@ impl WsHub {
     }
 
     pub(crate) fn from_runtime(runtime: WebSocketRuntimeHandle) -> Self {
-        let (
-            max_rooms_per_connection,
-            max_room_name_bytes,
-            broadcast_concurrency,
-            broker_operation_timeout,
-        ) = runtime.hub_config();
+        let runtime_config = runtime.hub_config();
         Self {
             runtime,
             config: Arc::new(WsHubConfig {
-                max_rooms_per_connection,
-                max_room_name_bytes,
-                broadcast_concurrency,
-                broker_operation_timeout,
+                max_rooms_per_connection: runtime_config.max_rooms_per_connection,
+                max_room_name_bytes: runtime_config.max_room_name_bytes,
+                broadcast_concurrency: runtime_config.broadcast_concurrency,
+                broker_operation_timeout: runtime_config.broker_operation_timeout,
+                broker: runtime_config.broker,
+                node_id: runtime_config.node_id,
             }),
         }
     }
@@ -149,6 +150,10 @@ impl WsHub {
 
     pub fn local_connection_count(&self) -> usize {
         self.runtime.stats().active_connections
+    }
+
+    pub fn node_id(&self) -> WsNodeId {
+        self.config.node_id
     }
 }
 
@@ -382,6 +387,16 @@ impl WsHubBuilder {
         self
     }
 
+    pub fn broker(mut self, broker: Arc<dyn WsBroker>) -> Self {
+        self.broker = Some(broker);
+        self
+    }
+
+    pub fn node_id(mut self, node_id: WsNodeId) -> Self {
+        self.node_id = Some(node_id);
+        self
+    }
+
     pub fn build(self) -> Result<WsHub, WsError> {
         if self.max_rooms_per_connection == 0
             || self.max_room_name_bytes == 0
@@ -392,17 +407,22 @@ impl WsHubBuilder {
                 "los limites del hub WebSocket deben ser mayores que cero".into(),
             ));
         }
+        let node_id = self.node_id.unwrap_or_else(super::broker::allocate_node_id);
         let config = Arc::new(WsHubConfig {
             max_rooms_per_connection: self.max_rooms_per_connection,
             max_room_name_bytes: self.max_room_name_bytes,
             broadcast_concurrency: self.broadcast_concurrency,
             broker_operation_timeout: self.broker_operation_timeout,
+            broker: self.broker,
+            node_id,
         });
         let runtime = WebSocketRuntimeHandle::local_with_hub_config(
             config.max_rooms_per_connection,
             config.max_room_name_bytes,
             config.broadcast_concurrency,
             config.broker_operation_timeout,
+            config.broker.clone(),
+            config.node_id,
         );
         Ok(WsHub { runtime, config })
     }
@@ -415,6 +435,8 @@ impl Default for WsHubBuilder {
             max_room_name_bytes: DEFAULT_MAX_ROOM_NAME_BYTES,
             broadcast_concurrency: DEFAULT_BROADCAST_CONCURRENCY,
             broker_operation_timeout: DEFAULT_BROKER_OPERATION_TIMEOUT,
+            broker: None,
+            node_id: None,
         }
     }
 }

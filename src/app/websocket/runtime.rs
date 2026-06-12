@@ -9,6 +9,7 @@ use tokio::sync::{Notify, watch};
 use tokio::task::AbortHandle;
 
 use super::ResolvedWebSocketConfig;
+use super::broker::{WsBroker, WsNodeId, allocate_node_id};
 use super::socket::{InternalWebSocketSender, validate_close};
 use super::types::{
     WebSocketCloseInfo, WebSocketConnectionSnapshot, WebSocketId, WebSocketLifecycleState,
@@ -27,6 +28,8 @@ struct RuntimeInner {
     max_room_name_bytes: usize,
     broadcast_concurrency: usize,
     broker_operation_timeout: Duration,
+    broker: Option<Arc<dyn WsBroker>>,
+    node_id: WsNodeId,
 }
 
 struct Registry {
@@ -82,6 +85,15 @@ pub(crate) struct LocalSocketParts {
     pub sender: InternalWebSocketSender,
 }
 
+pub(crate) struct RuntimeHubConfig {
+    pub max_rooms_per_connection: usize,
+    pub max_room_name_bytes: usize,
+    pub broadcast_concurrency: usize,
+    pub broker_operation_timeout: Duration,
+    pub broker: Option<Arc<dyn WsBroker>>,
+    pub node_id: WsNodeId,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AdmissionError {
     Shutdown,
@@ -119,7 +131,14 @@ impl ConnectionPermit {
 
 impl WebSocketRuntimeHandle {
     pub(crate) fn local() -> Self {
-        Self::local_with_hub_config(32, 128, 64, Duration::from_secs(2))
+        Self::local_with_hub_config(
+            32,
+            128,
+            64,
+            Duration::from_secs(2),
+            None,
+            allocate_node_id(),
+        )
     }
 
     pub(crate) fn local_with_hub_config(
@@ -127,6 +146,8 @@ impl WebSocketRuntimeHandle {
         max_room_name_bytes: usize,
         broadcast_concurrency: usize,
         broker_operation_timeout: Duration,
+        broker: Option<Arc<dyn WsBroker>>,
+        node_id: WsNodeId,
     ) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
         Self {
@@ -148,6 +169,8 @@ impl WebSocketRuntimeHandle {
                 max_room_name_bytes,
                 broadcast_concurrency,
                 broker_operation_timeout,
+                broker,
+                node_id,
             }),
         }
     }
@@ -392,13 +415,15 @@ impl WebSocketRuntimeHandle {
             .map_or(0, HashSet::len)
     }
 
-    pub(crate) fn hub_config(&self) -> (usize, usize, usize, Duration) {
-        (
-            self.inner.max_rooms_per_connection,
-            self.inner.max_room_name_bytes,
-            self.inner.broadcast_concurrency,
-            self.inner.broker_operation_timeout,
-        )
+    pub(crate) fn hub_config(&self) -> RuntimeHubConfig {
+        RuntimeHubConfig {
+            max_rooms_per_connection: self.inner.max_rooms_per_connection,
+            max_room_name_bytes: self.inner.max_room_name_bytes,
+            broadcast_concurrency: self.inner.broadcast_concurrency,
+            broker_operation_timeout: self.inner.broker_operation_timeout,
+            broker: self.inner.broker.clone(),
+            node_id: self.inner.node_id,
+        }
     }
 
     pub(crate) fn local_socket(&self, id: WebSocketId) -> Option<LocalSocketParts> {

@@ -1,3 +1,4 @@
+mod broker;
 mod config;
 mod driver;
 mod error;
@@ -12,6 +13,10 @@ use super::{HttpError, Request, Response};
 use base64::Engine;
 use hyper::upgrade::OnUpgrade;
 
+pub use broker::{
+    InMemoryWsBroker, WsBroker, WsBrokerError, WsBrokerPayload, WsBrokerPublication,
+    WsBrokerStream, WsBrokerTarget, WsNodeId, WsPublicationId,
+};
 pub(crate) use config::ResolvedWebSocketConfig;
 pub use config::{BackpressurePolicy, OriginPolicy, WebSocketConfig};
 pub use error::{
