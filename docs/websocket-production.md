@@ -281,3 +281,9 @@ AUTOBAHN_ENDPOINT_URL=http://127.0.0.1:3001/autobahn \
 AUTOBAHN_SERVER_URL=ws://host.docker.internal:3001/autobahn \
   ./scripts/run-autobahn.sh
 ```
+
+The repository CI repeats default/TLS/tracing/brotli feature checks, all-feature
+Clippy, rustfmt, all four fuzz target builds, a 100-idle/20-active network
+smoke, and the complete non-performance/non-compression Autobahn gate on every
+push and pull request. Failed network jobs upload their JSON, HTML, and server
+log artifacts.
