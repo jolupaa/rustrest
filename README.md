@@ -696,6 +696,9 @@ app.get("/events", |req: Request| {
 
 RustRest supports native WebSocket routes:
 
+For deployment, security, rooms, brokers, WSS, limits, and validation tooling,
+see [Production WebSockets](docs/websocket-production.md).
+
 ```rust
 use rustrest::{App, WebSocketEvent};
 use serde_json::json;
@@ -755,6 +758,11 @@ socket.recv_event::<T>().await;
 socket.ping(bytes).await;
 socket.pong(bytes).await;
 socket.close().await;
+socket.close_with(1000, "finalizado").await;
+socket.closed().await;
+socket.join("general").await;
+socket.rooms().await;
+socket.to("general").send_text("hello").await;
 ```
 
 `recv()` returns `Result<Option<WebSocketMessage>, WebSocketError>`. `Ok(None)` means the peer closed the stream.
@@ -847,9 +855,38 @@ app.websocket_with("/ws", config, |mut socket| async move {
 
 The first client-offered subprotocol the server supports is selected and echoed in `Sec-WebSocket-Protocol`. With `ping_interval`, a Ping frame is sent whenever the connection has been idle inside `recv()` for the interval.
 
-### Broadcast
+### Rooms and Managed Broadcasts
 
-`WsBroadcast` fans messages out to many sockets (chat rooms, live updates):
+`WsHub` and socket selectors provide route-scoped rooms, sender exclusion,
+multi-room deduplication, bounded fan-out, and explicit delivery reports:
+
+```rust
+app.websocket("/chat/:channel", |mut socket| async move {
+    socket.join_many(["general", "equipo-7"]).await?;
+
+    while let Some(event) = socket.recv_event::<serde_json::Value>().await? {
+        match socket
+            .to("general")
+            .send_event("chat:message", &event.data)
+            .await
+        {
+            Ok(report) => println!("matched={} enqueued={}", report.matched, report.enqueued),
+            Err(error) => eprintln!("broadcast failed: {error}"),
+        }
+    }
+    Ok::<(), rustrest::WsError>(())
+});
+```
+
+Rooms are scoped by the normalized route pattern. `socket.to(...)` excludes
+the sender; `app.websocket_hub_handle().route(...).all()` includes every local
+match unless `.except(id)` is used. An optional `WsBroker` extends room
+broadcasts across nodes without making global presence guarantees.
+
+### Raw Tokio Broadcast Helper
+
+`WsBroadcast` is a raw local `tokio::sync::broadcast` channel. It does not
+track sockets, routes, rooms, backpressure reports, or brokers:
 
 ```rust
 use rustrest::{WebSocketMessage, WsBroadcast};
@@ -876,6 +913,9 @@ app.websocket("/chat", move |mut socket| {
     }
 });
 ```
+
+Lagging subscribers receive `RecvError::Lagged` and must handle skipped
+messages explicitly. Prefer `WsHub` for managed WebSocket fan-out.
 
 ### Manual Handshake Helper
 

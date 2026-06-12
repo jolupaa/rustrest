@@ -58,7 +58,37 @@ fn existing_websocket_surface_still_compiles() {
     let _local_socket_lookup: fn(&WsHub, rustrest::WebSocketId) -> Option<WsLocalSocket> =
         WsHub::local_socket;
     let _local_connection_count: fn(&WsHub) -> usize = WsHub::local_connection_count;
-    let _: &mut App = app.websocket_defaults(WebSocketConfig::new());
+    let production_config = WebSocketConfig::new()
+        .protocols(&["chat"])
+        .require_protocol(true)
+        .max_message_size(1024 * 1024)
+        .max_frame_size(256 * 1024)
+        .write_buffer_size(128 * 1024)
+        .max_write_buffer_size(2 * 1024 * 1024)
+        .inbound_capacity(64)
+        .outbound_capacity(64)
+        .backpressure_policy(rustrest::BackpressurePolicy::Wait)
+        .send_timeout(Duration::from_secs(5))
+        .ping_interval(Duration::from_secs(30))
+        .pong_timeout(Duration::from_secs(10))
+        .idle_timeout(Duration::from_secs(120))
+        .max_connection_lifetime(Duration::from_secs(86_400))
+        .close_timeout(Duration::from_secs(5))
+        .origin_policy(rustrest::OriginPolicy::same_host().allow_missing(false))
+        .max_connections(2_000)
+        .max_connections_per_ip(20)
+        .message_rate_limit(100, Duration::from_secs(1))
+        .max_rooms_per_connection(32)
+        .max_room_name_bytes(128);
+    production_config.validate().unwrap();
+    let relaxed_route = WebSocketConfig::new()
+        .disable_ping()
+        .disable_idle_timeout()
+        .disable_max_connection_lifetime()
+        .disable_max_connections_per_ip()
+        .disable_message_rate_limit();
+    relaxed_route.validate().unwrap();
+    let _: &mut App = app.websocket_defaults(production_config);
     let _: &mut App = app.websocket_observer(Arc::new(Observer));
     let handler: WebSocketHandler = (|mut socket: WebSocket| async move {
         let _: Option<&str> = socket.protocol();
@@ -120,8 +150,10 @@ fn existing_websocket_surface_still_compiles() {
     })
     .into_websocket_handler();
     let admin_hub = hub.clone();
+    let admin_runtime = runtime.clone();
     let _: () = app.websocket("/ws-admin-api", move |socket| {
         let admin_hub = admin_hub.clone();
+        let admin_runtime = admin_runtime.clone();
         async move {
             let local = admin_hub.local_socket(socket.id());
             if let Some(local) = local {
@@ -140,6 +172,11 @@ fn existing_websocket_surface_still_compiles() {
             let _: Result<(), WsError> = admin_hub
                 .disconnect_local(socket.id(), 1008, "no autorizado")
                 .await;
+            let _snapshot = admin_runtime.connection(socket.id());
+            let _: Result<(), WsError> = admin_runtime
+                .close(socket.id(), 1008, "no autorizado")
+                .await;
+            let _: Result<(), WsError> = admin_runtime.shutdown().await;
         }
     });
     let _: () = app.websocket("/ws", |_socket| async move {});
