@@ -15,8 +15,8 @@ use super::decode_component;
 use super::trie::RouteIndex;
 use super::websocket::ResolvedWebSocketConfig;
 use super::{
-    Handler, HttpError, IntoHandler, IntoMiddleware, Middleware, Next, Request, Response,
-    WebSocket, WebSocketConfig, WebSocketHandler, WsError,
+    Handler, HttpError, IntoHandler, IntoMiddleware, IntoWebSocketHandler, IntoWebSocketOutput,
+    Middleware, Next, Request, Response, WebSocket, WebSocketConfig, WsError,
 };
 
 pub(crate) const METHOD_ALL: &str = "*";
@@ -208,37 +208,40 @@ impl Router {
         self.add(METHOD_ALL, path, handler)
     }
 
-    pub fn websocket<F, Fut>(&mut self, path: &str, handler: F)
+    pub fn websocket<F, Fut, O>(&mut self, path: &str, handler: F)
     where
         F: Fn(WebSocket) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+        O: IntoWebSocketOutput + Send + 'static,
     {
         self.websocket_with(path, WebSocketConfig::new(), handler);
     }
 
-    pub fn ws<F, Fut>(&mut self, path: &str, handler: F)
+    pub fn ws<F, Fut, O>(&mut self, path: &str, handler: F)
     where
         F: Fn(WebSocket) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+        O: IntoWebSocketOutput + Send + 'static,
     {
         self.websocket(path, handler);
     }
 
     /// Like [`Router::websocket`], with subprotocols, message size limits,
     /// and keepalive pings from `config`.
-    pub fn websocket_with<F, Fut>(&mut self, path: &str, config: WebSocketConfig, handler: F)
+    pub fn websocket_with<F, Fut, O>(&mut self, path: &str, config: WebSocketConfig, handler: F)
     where
         F: Fn(WebSocket) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+        O: IntoWebSocketOutput + Send + 'static,
     {
-        let handler: WebSocketHandler = Arc::new(move |socket| Box::pin(handler(socket)));
+        let handler = handler.into_normalized_websocket_handler();
         let kind = RouteKind::WebSocket(Box::new(config.clone()));
         self.add_with_kind(
             "GET",
             path,
             move |req: Request| {
                 let handler = Arc::clone(&handler);
-                req.websocket_with(config.clone(), handler)
+                req.websocket_with_normalized(config.clone(), handler)
             },
             kind,
         );

@@ -68,6 +68,12 @@ fn existing_websocket_surface_still_compiles() {
     })
     .into_websocket_handler();
     let _: () = app.websocket("/ws", |_socket| async move {});
+    let _: () = app.websocket("/ws-result", |_socket| async move {
+        Ok::<(), WebSocketError>(())
+    });
+    let _: () = app.websocket("/ws-result-precise", |_socket| async move {
+        Ok::<(), WsError>(())
+    });
 
     let _: () = app.ws("/short", |_socket| async move {});
     let _: () = app.websocket_with(
@@ -81,6 +87,12 @@ fn existing_websocket_surface_still_compiles() {
 
     let mut router = Router::new();
     let _: () = router.websocket("/nested", |_socket| async move {});
+    let _: () = router.websocket("/nested-result", |_socket| async move {
+        Ok::<(), WebSocketError>(())
+    });
+    let _: () = router.websocket("/nested-result-precise", |_socket| async move {
+        Ok::<(), WsError>(())
+    });
     let _: () = router.ws("/nested-short", |_socket| async move {});
     let _: () = router.websocket_with(
         "/nested-configured",

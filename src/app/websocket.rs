@@ -15,9 +15,10 @@ pub(crate) use config::ResolvedWebSocketConfig;
 pub use config::{BackpressurePolicy, OriginPolicy, WebSocketConfig};
 pub use error::{WebSocketCapacityError, WebSocketError, WebSocketTimeout, WsError};
 pub use runtime::WebSocketRuntimeHandle;
+use socket::NormalizedWebSocketHandler;
 pub use socket::{
-    IntoWebSocketHandler, WebSocket, WebSocketEvent, WebSocketHandler, WebSocketMessage,
-    WebSocketReceiver, WebSocketSender,
+    IntoWebSocketHandler, IntoWebSocketOutput, WebSocket, WebSocketEvent, WebSocketHandler,
+    WebSocketMessage, WebSocketReceiver, WebSocketSender,
 };
 pub use types::{
     WebSocketCloseInfo, WebSocketCloseInitiator, WebSocketConnectionSnapshot,
@@ -218,6 +219,14 @@ impl Request {
     where
         H: IntoWebSocketHandler,
     {
+        self.websocket_with_normalized(config, handler.into_normalized_websocket_handler())
+    }
+
+    pub(crate) fn websocket_with_normalized(
+        self,
+        config: WebSocketConfig,
+        handler: NormalizedWebSocketHandler,
+    ) -> Response {
         let config = self.resolved_websocket_config.clone().unwrap_or_else(|| {
             ResolvedWebSocketConfig::from_layers(&WebSocketConfig::default(), &config)
         });
@@ -226,14 +235,14 @@ impl Request {
             Err(rejection) => return rejection.into_response(),
         };
 
-        self.into_websocket_response(config, protocol, handler.into_websocket_handler())
+        self.into_websocket_response(config, protocol, handler)
     }
 
     fn into_websocket_response(
         self,
         config: ResolvedWebSocketConfig,
         protocol: Option<String>,
-        handler: WebSocketHandler,
+        handler: NormalizedWebSocketHandler,
     ) -> Response {
         let route = self.route_pattern().unwrap_or(&self.path).to_string();
         let permit = match self.websocket_runtime.admit(
@@ -295,7 +304,7 @@ fn spawn_websocket(
     upgrade: OnUpgrade,
     config: ResolvedWebSocketConfig,
     protocol: Option<String>,
-    handler: WebSocketHandler,
+    handler: NormalizedWebSocketHandler,
     permit: ConnectionPermit,
     route: String,
     remote_addr: Option<std::net::SocketAddr>,

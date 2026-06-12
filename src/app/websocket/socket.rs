@@ -1,10 +1,13 @@
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use hyper::body::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -25,17 +28,58 @@ pub use super::types::{WebSocketEvent, WebSocketMessage};
 pub type WebSocketHandler =
     Arc<dyn Fn(WebSocket) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
-pub trait IntoWebSocketHandler {
-    fn into_websocket_handler(self) -> WebSocketHandler;
+pub(crate) type NormalizedWebSocketHandler = Arc<
+    dyn Fn(WebSocket) -> Pin<Box<dyn Future<Output = Result<(), WsError>> + Send>> + Send + Sync,
+>;
+
+#[doc(hidden)]
+pub trait IntoWebSocketOutput {
+    fn into_websocket_output(self) -> Result<(), WsError>;
 }
 
-impl<F, Fut> IntoWebSocketHandler for F
+impl IntoWebSocketOutput for () {
+    fn into_websocket_output(self) -> Result<(), WsError> {
+        Ok(())
+    }
+}
+
+impl IntoWebSocketOutput for Result<(), WebSocketError> {
+    fn into_websocket_output(self) -> Result<(), WsError> {
+        self.map_err(Into::into)
+    }
+}
+
+impl IntoWebSocketOutput for Result<(), WsError> {
+    fn into_websocket_output(self) -> Result<(), WsError> {
+        self
+    }
+}
+
+pub trait IntoWebSocketHandler {
+    fn into_websocket_handler(self) -> WebSocketHandler;
+
+    #[doc(hidden)]
+    fn into_normalized_websocket_handler(self) -> NormalizedWebSocketHandler;
+}
+
+impl<F, Fut, O> IntoWebSocketHandler for F
 where
     F: Fn(WebSocket) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = ()> + Send + 'static,
+    Fut: Future<Output = O> + Send + 'static,
+    O: IntoWebSocketOutput + Send + 'static,
 {
     fn into_websocket_handler(self) -> WebSocketHandler {
-        Arc::new(move |socket| Box::pin(self(socket)))
+        let handler = normalize_handler(self);
+        Arc::new(move |socket| {
+            let handler = handler.clone();
+            Box::pin(async move {
+                let _ = handler(socket).await;
+            })
+        })
+    }
+
+    fn into_normalized_websocket_handler(self) -> NormalizedWebSocketHandler {
+        normalize_handler(self)
     }
 }
 
@@ -43,6 +87,38 @@ impl IntoWebSocketHandler for WebSocketHandler {
     fn into_websocket_handler(self) -> WebSocketHandler {
         self
     }
+
+    fn into_normalized_websocket_handler(self) -> NormalizedWebSocketHandler {
+        Arc::new(move |socket| {
+            let future = catch_unwind(AssertUnwindSafe(|| self(socket)));
+            Box::pin(async move {
+                let future = future.map_err(|_| WsError::HandlerPanic)?;
+                AssertUnwindSafe(future)
+                    .catch_unwind()
+                    .await
+                    .map_err(|_| WsError::HandlerPanic)
+            })
+        })
+    }
+}
+
+fn normalize_handler<F, Fut, O>(handler: F) -> NormalizedWebSocketHandler
+where
+    F: Fn(WebSocket) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = O> + Send + 'static,
+    O: IntoWebSocketOutput + Send + 'static,
+{
+    Arc::new(move |socket| {
+        let future = catch_unwind(AssertUnwindSafe(|| handler(socket)));
+        Box::pin(async move {
+            let future = future.map_err(|_| WsError::HandlerPanic)?;
+            let output = AssertUnwindSafe(future)
+                .catch_unwind()
+                .await
+                .map_err(|_| WsError::HandlerPanic)?;
+            output.into_websocket_output()
+        })
+    })
 }
 
 pub struct WebSocket {
@@ -50,7 +126,6 @@ pub struct WebSocket {
     sender: WebSocketSender,
 }
 
-#[derive(Clone)]
 pub struct WebSocketSender {
     shared: Arc<SocketShared>,
 }
@@ -76,6 +151,8 @@ struct SocketShared {
     send_timeout: Duration,
     close_rx: watch::Receiver<Option<WebSocketCloseInfo>>,
     runtime: WebSocketRuntimeHandle,
+    public_senders: Arc<AtomicUsize>,
+    sender_count_tx: watch::Sender<usize>,
 }
 
 pub(crate) struct SocketMetadata {
@@ -94,6 +171,8 @@ pub(crate) fn channel_pair(
     let (outbound, outbound_rx) = mpsc::channel(config.outbound_capacity);
     let (control, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
     let (close_tx, close_rx) = watch::channel(None);
+    let (sender_count_tx, sender_count_rx) = watch::channel(1);
+    let public_senders = Arc::new(AtomicUsize::new(1));
     let shared = Arc::new(SocketShared {
         id: metadata.id,
         remote_addr: metadata.remote_addr,
@@ -105,6 +184,8 @@ pub(crate) fn channel_pair(
         send_timeout: config.send_timeout,
         close_rx: close_rx.clone(),
         runtime,
+        public_senders: public_senders.clone(),
+        sender_count_tx,
     });
     let socket = WebSocket {
         receiver: WebSocketReceiver { inbound, close_rx },
@@ -118,9 +199,27 @@ pub(crate) fn channel_pair(
         outbound_rx,
         control_rx,
         close_tx,
+        sender_count_rx,
     };
 
     (socket, internal_sender, channels)
+}
+
+impl Clone for WebSocketSender {
+    fn clone(&self) -> Self {
+        let count = self.shared.public_senders.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = self.shared.sender_count_tx.send(count);
+        Self {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+impl Drop for WebSocketSender {
+    fn drop(&mut self) {
+        let count = self.shared.public_senders.fetch_sub(1, Ordering::AcqRel) - 1;
+        let _ = self.shared.sender_count_tx.send(count);
+    }
 }
 
 impl WebSocket {

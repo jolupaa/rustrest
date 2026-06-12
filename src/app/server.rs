@@ -265,28 +265,35 @@ impl App {
         self.router.all(path, handler)
     }
 
-    pub fn websocket<F, Fut>(&mut self, path: &str, handler: F)
+    pub fn websocket<F, Fut, O>(&mut self, path: &str, handler: F)
     where
         F: Fn(super::WebSocket) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
+        Fut: std::future::Future<Output = O> + Send + 'static,
+        O: super::IntoWebSocketOutput + Send + 'static,
     {
         self.router.websocket(path, handler);
     }
 
-    pub fn ws<F, Fut>(&mut self, path: &str, handler: F)
+    pub fn ws<F, Fut, O>(&mut self, path: &str, handler: F)
     where
         F: Fn(super::WebSocket) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
+        Fut: std::future::Future<Output = O> + Send + 'static,
+        O: super::IntoWebSocketOutput + Send + 'static,
     {
         self.router.ws(path, handler);
     }
 
     /// Like [`App::websocket`], with subprotocols, message size limits, and
     /// keepalive pings from `config`.
-    pub fn websocket_with<F, Fut>(&mut self, path: &str, config: super::WebSocketConfig, handler: F)
-    where
+    pub fn websocket_with<F, Fut, O>(
+        &mut self,
+        path: &str,
+        config: super::WebSocketConfig,
+        handler: F,
+    ) where
         F: Fn(super::WebSocket) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
+        Fut: std::future::Future<Output = O> + Send + 'static,
+        O: super::IntoWebSocketOutput + Send + 'static,
     {
         self.router.websocket_with(path, config, handler);
     }

@@ -520,12 +520,15 @@ async fn websocket_runtime_releases_permit_after_handler_completion() {
     })
     .await;
 
-    let (_client, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+    let (mut client, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
         .unwrap();
     wait_for_connections(&runtime, 1, 0).await;
 
     release.add_permits(1);
+    let close = receive_close_frame(&mut client).await;
+    assert_eq!(u16::from(close.code), 1000);
+    client.flush().await.unwrap();
     wait_for_connections(&runtime, 0, 1).await;
     let stats = runtime.stats();
     assert_eq!(stats.accepted_connections, 1);
@@ -895,4 +898,86 @@ async fn websocket_close_waits_for_peer_after_handler_returns() {
     assert_eq!(u16::from(frame.code), 1000);
     client.flush().await.unwrap();
     wait_for_connections(&runtime, 0, 1).await;
+}
+
+#[tokio::test]
+async fn websocket_handler_panic_closes_only_that_connection_with_1011() {
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handler_attempts = attempts.clone();
+    let (addr, _server) = spawn_app(move |app| {
+        let handler_attempts = handler_attempts.clone();
+        app.websocket("/ws", move |mut socket| {
+            let attempt = handler_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    panic!("panic aislado del handler");
+                }
+                while let Some(message) = socket.recv().await.unwrap() {
+                    if message.is_text() {
+                        socket.send(message).await.unwrap();
+                        break;
+                    }
+                }
+            }
+        });
+    })
+    .await;
+
+    let (mut first, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+    let close = receive_close_frame(&mut first).await;
+    assert_eq!(u16::from(close.code), 1011);
+    first.flush().await.unwrap();
+
+    let (mut second, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+    second.send(Message::Text("healthy".into())).await.unwrap();
+    let echo = tokio::time::timeout(IO_TIMEOUT, second.next())
+        .await
+        .expect("second connection should remain healthy")
+        .unwrap()
+        .unwrap();
+    assert_eq!(echo.into_text().unwrap(), "healthy");
+}
+
+#[tokio::test]
+async fn websocket_handler_completion_closes_with_1000() {
+    let (addr, _server) = spawn_app(|app| {
+        app.websocket("/ws", |_socket| async move {});
+    })
+    .await;
+    let (mut client, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    let close = receive_close_frame(&mut client).await;
+    assert_eq!(u16::from(close.code), 1000);
+}
+
+#[tokio::test]
+async fn websocket_handler_background_sender_outlives_handler() {
+    let (addr, _server) = spawn_app(|app| {
+        app.websocket("/ws", |socket| async move {
+            let (_receiver, sender) = socket.split();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                sender.send_text("background-after-handler").await.unwrap();
+            });
+        });
+    })
+    .await;
+    let (mut client, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    let message = tokio::time::timeout(IO_TIMEOUT, client.next())
+        .await
+        .expect("background sender should remain connected")
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.into_text().unwrap(), "background-after-handler");
+    let close = receive_close_frame(&mut client).await;
+    assert_eq!(u16::from(close.code), 1000);
 }

@@ -14,9 +14,9 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role};
 
 use super::runtime::{ConnectionPermit, WebSocketRuntimeHandle};
-use super::socket::{WebSocket, WebSocketHandler};
+use super::socket::{NormalizedWebSocketHandler, WebSocket};
 use super::types::{WebSocketCloseInfo, WebSocketCloseInitiator, WebSocketMessage};
-use super::{ResolvedWebSocketConfig, WebSocketError};
+use super::{ResolvedWebSocketConfig, WebSocketError, WsError};
 
 type WebSocketTransport = WebSocketStream<TokioIo<Upgraded>>;
 
@@ -38,6 +38,7 @@ pub(crate) struct DriverChannels {
     pub outbound_rx: mpsc::Receiver<OutboundCommand>,
     pub control_rx: mpsc::Receiver<ControlCommand>,
     pub close_tx: watch::Sender<Option<WebSocketCloseInfo>>,
+    pub sender_count_rx: watch::Receiver<usize>,
 }
 
 pub(crate) struct DriverTask {
@@ -46,14 +47,14 @@ pub(crate) struct DriverTask {
 }
 
 enum DriverStart {
-    Registered(oneshot::Receiver<()>),
+    Registered(oneshot::Receiver<Result<(), WsError>>),
     Rejected,
 }
 
 pub(crate) async fn spawn(
     upgraded: Upgraded,
     config: ResolvedWebSocketConfig,
-    handler: WebSocketHandler,
+    handler: NormalizedWebSocketHandler,
     socket: WebSocket,
     channels: DriverChannels,
     permit: ConnectionPermit,
@@ -111,6 +112,7 @@ async fn run(
         mut outbound_rx,
         mut control_rx,
         close_tx,
+        mut sender_count_rx,
     } = channels;
     let outcome = drive(
         &mut stream,
@@ -118,8 +120,8 @@ async fn run(
         &mut outbound_rx,
         &mut control_rx,
         &mut handler_done,
-        &config,
-        &runtime,
+        &mut sender_count_rx,
+        (&config, &runtime),
     )
     .await;
 
@@ -132,7 +134,7 @@ async fn supervise(
     start_rx: oneshot::Receiver<bool>,
     driver_start_tx: oneshot::Sender<DriverStart>,
     driver: JoinHandle<DriverOutcome>,
-    handler: WebSocketHandler,
+    handler: NormalizedWebSocketHandler,
     socket: WebSocket,
     _permit: ConnectionPermit,
 ) {
@@ -144,8 +146,8 @@ async fn supervise(
 
     let (handler_done_tx, handler_done_rx) = oneshot::channel();
     let handler = tokio::spawn(async move {
-        handler(socket).await;
-        let _ = handler_done_tx.send(());
+        let result = handler(socket).await;
+        let _ = handler_done_tx.send(result);
     });
     if driver_start_tx
         .send(DriverStart::Registered(handler_done_rx))
@@ -220,10 +222,11 @@ async fn drive(
     inbound_tx: &mpsc::Sender<Result<WebSocketMessage, WebSocketError>>,
     outbound_rx: &mut mpsc::Receiver<OutboundCommand>,
     control_rx: &mut mpsc::Receiver<ControlCommand>,
-    handler_done: &mut oneshot::Receiver<()>,
-    config: &ResolvedWebSocketConfig,
-    runtime: &WebSocketRuntimeHandle,
+    handler_done: &mut oneshot::Receiver<Result<(), WsError>>,
+    sender_count_rx: &mut watch::Receiver<usize>,
+    lifecycle: (&ResolvedWebSocketConfig, &WebSocketRuntimeHandle),
 ) -> DriverOutcome {
+    let (config, runtime) = lifecycle;
     let mut control_open = true;
     let mut outbound_open = true;
     let mut handler_completed = false;
@@ -479,13 +482,85 @@ async fn drive(
                 state.pending_ping = Some((payload, Instant::now()));
             }
 
-            _ = &mut *handler_done, if !handler_completed => {
+            result = &mut *handler_done, if !handler_completed => {
                 handler_completed = true;
-                if !state.close_sent {
-                    return DriverOutcome {
-                        close_info: state.close_info.unwrap_or_else(handler_close_info),
-                        handler_completed: true,
+                match result {
+                    Ok(Ok(())) if !state.close_sent => {
+                        if *sender_count_rx.borrow() == 0 {
+                            close_command_channels(
+                                control_rx,
+                                outbound_rx,
+                                &mut control_open,
+                                &mut outbound_open,
+                            );
+                            let frame = CloseFrame {
+                                code: CloseCode::Normal,
+                                reason: "".into(),
+                            };
+                            if let Err(error) = initiate_close(
+                                stream,
+                                &mut state,
+                                Some(frame),
+                                WebSocketCloseInitiator::Handler,
+                                config.close_timeout,
+                            )
+                            .await
+                            {
+                                return protocol_outcome(inbound_tx, error);
+                            }
+                        }
+                    }
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) | Err(_) if !state.close_sent => {
+                        close_command_channels(
+                            control_rx,
+                            outbound_rx,
+                            &mut control_open,
+                            &mut outbound_open,
+                        );
+                        let frame = CloseFrame {
+                            code: CloseCode::Error,
+                            reason: "El handler WebSocket fallo".into(),
+                        };
+                        if let Err(error) = initiate_close(
+                            stream,
+                            &mut state,
+                            Some(frame),
+                            WebSocketCloseInitiator::Handler,
+                            config.close_timeout,
+                        )
+                        .await
+                        {
+                            return protocol_outcome(inbound_tx, error);
+                        }
+                    }
+                    Ok(Err(_)) | Err(_) => {}
+                }
+            }
+
+            changed = sender_count_rx.changed(), if handler_completed && !state.close_sent => {
+                if changed.is_err() || *sender_count_rx.borrow_and_update() == 0 {
+                    close_command_channels(
+                        control_rx,
+                        outbound_rx,
+                        &mut control_open,
+                        &mut outbound_open,
+                    );
+                    let frame = CloseFrame {
+                        code: CloseCode::Normal,
+                        reason: "".into(),
                     };
+                    if let Err(error) = initiate_close(
+                        stream,
+                        &mut state,
+                        Some(frame),
+                        WebSocketCloseInitiator::Handler,
+                        config.close_timeout,
+                    )
+                    .await
+                    {
+                        return protocol_outcome(inbound_tx, error);
+                    }
                 }
             }
         }
@@ -646,15 +721,6 @@ fn peer_disconnect_info() -> WebSocketCloseInfo {
     }
 }
 
-fn handler_close_info() -> WebSocketCloseInfo {
-    WebSocketCloseInfo {
-        code: 1000,
-        reason: String::new(),
-        initiator: WebSocketCloseInitiator::Handler,
-        clean: false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
@@ -731,7 +797,7 @@ mod tests {
         let handler_started = started.clone();
         let cleanup_sender = Arc::new(Mutex::new(Some(cleanup_tx)));
         let handler_runtime = runtime.clone();
-        let handler: WebSocketHandler = Arc::new(move |_socket| {
+        let handler: NormalizedWebSocketHandler = Arc::new(move |_socket| {
             let handler_runtime = handler_runtime.clone();
             let handler_started = handler_started.clone();
             let cleanup_tx = cleanup_sender.lock().unwrap().take().unwrap();
@@ -741,7 +807,7 @@ mod tests {
                     cleanup_tx,
                 };
                 handler_started.notify_one();
-                pending::<()>().await;
+                pending::<Result<(), WsError>>().await
             })
         });
         let driver = tokio::spawn(async move {
