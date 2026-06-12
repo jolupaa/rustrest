@@ -21,7 +21,9 @@ impl WebSocketObserver for MetadataObserver {
 async fn main() -> std::io::Result<()> {
     let mut app = App::new();
     app.websocket_hub(WsHub::local());
-    app.websocket_observer(Arc::new(MetadataObserver));
+    if std::env::var("RUSTREST_WS_OBSERVER").as_deref() != Ok("off") {
+        app.websocket_observer(Arc::new(MetadataObserver));
+    }
     app.websocket_defaults(WebSocketConfig::new().max_connections(12_000));
 
     // Token fijo solo para demostrar que la autenticacion ocurre antes del upgrade.
