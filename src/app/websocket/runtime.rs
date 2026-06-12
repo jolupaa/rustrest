@@ -770,10 +770,10 @@ impl WebSocketRuntimeHandle {
             return false;
         }
         registry.seen_publication_order.push_back(key);
-        if registry.seen_publication_order.len() > MAX_SEEN_PUBLICATIONS
-            && let Some(expired) = registry.seen_publication_order.pop_front()
-        {
-            registry.seen_publications.remove(&expired);
+        if registry.seen_publication_order.len() > MAX_SEEN_PUBLICATIONS {
+            if let Some(expired) = registry.seen_publication_order.pop_front() {
+                registry.seen_publications.remove(&expired);
+            }
         }
         true
     }

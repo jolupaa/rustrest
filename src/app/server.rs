@@ -703,10 +703,10 @@ impl App {
             },
             Err(_) => panic_response(),
         };
-        if let Some(err) = response.take_error()
-            && let Some(handler) = &self.error_handler
-        {
-            response = handler(err);
+        if let Some(err) = response.take_error() {
+            if let Some(handler) = &self.error_handler {
+                response = handler(err);
+            }
         }
         if is_head {
             response.clear_body();

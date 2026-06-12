@@ -206,10 +206,10 @@ async fn websocket_tls_rooms_broadcast_over_wss() {
         socket.join("general").await?;
         socket.send_text("ready").await?;
         while let Some(message) = socket.recv().await? {
-            if message.is_text()
-                && let Err(error) = socket.to("general").send(message).await
-            {
-                eprintln!("Fallo de broadcast WSS: {error}");
+            if message.is_text() {
+                if let Err(error) = socket.to("general").send(message).await {
+                    eprintln!("Fallo de broadcast WSS: {error}");
+                }
             }
         }
         Ok::<(), WsError>(())
