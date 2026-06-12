@@ -4,9 +4,10 @@ use std::time::Duration;
 use rustrest::{
     App, IntoWebSocketHandler, Request, Response, Router, WebSocket, WebSocketCloseInfo,
     WebSocketCloseInitiator, WebSocketConfig, WebSocketError, WebSocketEvent, WebSocketHandler,
-    WebSocketMessage, WebSocketObservation, WebSocketObserver, WebSocketReceiver,
-    WebSocketRuntimeHandle, WebSocketSender, WebSocketStats, WsBroadcast, WsBroadcastError,
-    WsBroadcastReport, WsError, WsHub, WsRemotePublish, WsRoute, WsTarget,
+    WebSocketLifecycleState, WebSocketMessage, WebSocketObservation, WebSocketObserver,
+    WebSocketReceiver, WebSocketRuntimeHandle, WebSocketSender, WebSocketStats, WsBroadcast,
+    WsBroadcastError, WsBroadcastReport, WsError, WsHub, WsLocalSocket, WsRemotePublish, WsRoute,
+    WsTarget,
 };
 
 struct Observer;
@@ -47,6 +48,9 @@ fn existing_websocket_surface_still_compiles() {
     let runtime: WebSocketRuntimeHandle = app.websocket_runtime();
     let _stats: WebSocketStats = runtime.stats();
     let _connections = runtime.connections();
+    let _local_socket_lookup: fn(&WsHub, rustrest::WebSocketId) -> Option<WsLocalSocket> =
+        WsHub::local_socket;
+    let _local_connection_count: fn(&WsHub) -> usize = WsHub::local_connection_count;
     let _: &mut App = app.websocket_defaults(WebSocketConfig::new());
     let _: &mut App = app.websocket_observer(Arc::new(Observer));
     let handler: WebSocketHandler = (|mut socket: WebSocket| async move {
@@ -108,6 +112,29 @@ fn existing_websocket_surface_still_compiles() {
         let _: WebSocketCloseInfo = receiver.closed().await;
     })
     .into_websocket_handler();
+    let admin_hub = hub.clone();
+    let _: () = app.websocket("/ws-admin-api", move |socket| {
+        let admin_hub = admin_hub.clone();
+        async move {
+            let local = admin_hub.local_socket(socket.id());
+            if let Some(local) = local {
+                let _: rustrest::WebSocketId = local.id();
+                let _: &str = local.route();
+                let _: Option<std::net::SocketAddr> = local.remote_addr();
+                let _: Option<&str> = local.protocol();
+                let _: std::time::SystemTime = local.opened_at();
+                let _: &[String] = local.rooms();
+                let _: WebSocketLifecycleState = local.lifecycle();
+                let _: Result<(), WsError> = local.send_text("administrado").await;
+                let _: Result<(), WsError> = local.send_event("ready", &true).await;
+                let _: Result<(), WsError> = local.close_with(1000, "finalizado").await;
+                let _: WebSocketCloseInfo = local.closed().await;
+            }
+            let _: Result<(), WsError> = admin_hub
+                .disconnect_local(socket.id(), 1008, "no autorizado")
+                .await;
+        }
+    });
     let _: () = app.websocket("/ws", |_socket| async move {});
     let _: () = app.websocket("/ws-result", |_socket| async move {
         Ok::<(), WebSocketError>(())

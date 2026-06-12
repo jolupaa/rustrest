@@ -333,6 +333,75 @@ async fn websocket_multi_room_deduplicates_local_recipient() {
 }
 
 #[tokio::test]
+async fn websocket_local_administration_sends_disconnects_and_snapshots_rooms() {
+    let (id_tx, mut id_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new();
+    let hub = app.websocket_hub_handle();
+    app.websocket("/admin/:tenant", move |socket| {
+        let id_tx = id_tx.clone();
+        async move {
+            socket.join_many(["zeta", "general"]).await.unwrap();
+            id_tx.send(socket.id()).unwrap();
+            std::future::pending::<()>().await;
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _server = ServerGuard(tokio::spawn(async move {
+        app.serve(listener).await.unwrap();
+    }));
+    let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/admin/acme"))
+        .await
+        .unwrap();
+    let id = tokio::time::timeout(IO_TIMEOUT, id_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let local = hub.local_socket(id).expect("local socket should exist");
+    assert_eq!(local.id(), id);
+    assert_eq!(local.route(), "/admin/:tenant");
+    assert!(local.remote_addr().is_some());
+    assert_eq!(local.rooms(), ["general", "zeta"]);
+    assert!(local.opened_at() <= SystemTime::now());
+    assert_eq!(local.lifecycle(), rustrest::WebSocketLifecycleState::Open);
+    assert_eq!(hub.local_connection_count(), 1);
+
+    local
+        .send_event("account:changed", &json!({ "active": true }))
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(IO_TIMEOUT, client.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let event: WebSocketEvent<serde_json::Value> =
+        serde_json::from_str(event.to_text().unwrap()).unwrap();
+    assert_eq!(event.event, "account:changed");
+    assert_eq!(event.data, json!({ "active": true }));
+
+    let disconnect_hub = hub.clone();
+    let disconnect = tokio::spawn(async move {
+        disconnect_hub
+            .disconnect_local(id, 1008, "no autorizado")
+            .await
+    });
+    let close = receive_close_frame(&mut client).await;
+    assert_eq!(u16::from(close.code), 1008);
+    assert_eq!(close.reason, "no autorizado");
+    client.flush().await.unwrap();
+    disconnect.await.unwrap().unwrap();
+
+    assert!(hub.local_socket(id).is_none());
+    assert_eq!(hub.local_connection_count(), 0);
+    assert!(matches!(
+        hub.disconnect_local(id, 1008, "otra vez").await,
+        Err(WsError::ConnectionNotFound(missing)) if missing == id
+    ));
+}
+
+#[tokio::test]
 async fn websocket_runtime_stats_and_observer_record_message_metadata() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 

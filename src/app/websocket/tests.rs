@@ -236,6 +236,9 @@ fn websocket_runtime_accounts_for_permits() {
     let _second = runtime
         .admit("/chat/:room", Some(second_addr), None, &config)
         .unwrap();
+    runtime
+        .join(first_id, &["zeta".into(), "general".into()])
+        .unwrap();
 
     assert_eq!(runtime.stats().active_connections, 2);
     let first_snapshot = runtime.connection(first_id).unwrap();
@@ -243,7 +246,14 @@ fn websocket_runtime_accounts_for_permits() {
     assert_eq!(first_snapshot.route, "/chat/:room");
     assert_eq!(first_snapshot.remote_addr, Some(first_addr));
     assert_eq!(first_snapshot.protocol.as_deref(), Some("chat"));
-    assert_eq!(runtime.connections().len(), 2);
+    assert_eq!(first_snapshot.rooms, ["general", "zeta"]);
+    assert_eq!(
+        first_snapshot.lifecycle,
+        WebSocketLifecycleState::Connecting
+    );
+    let connections = runtime.connections();
+    assert_eq!(connections.len(), 2);
+    assert!(connections[0].id.0 < connections[1].id.0);
     drop(first);
     assert_eq!(runtime.stats().active_connections, 1);
     assert_eq!(runtime.stats().accepted_connections, 2);

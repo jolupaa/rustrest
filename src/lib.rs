@@ -32,8 +32,8 @@ pub use app::{
     StateStore, TestClient, TestRequest, TrailingSlash, WebSocket, WebSocketCapacityError,
     WebSocketCloseInfo, WebSocketCloseInitiator, WebSocketConfig, WebSocketConnectionSnapshot,
     WebSocketError, WebSocketErrorCategory, WebSocketEvent, WebSocketHandler, WebSocketId,
-    WebSocketMessage, WebSocketObservation, WebSocketObserver, WebSocketReceiver,
-    WebSocketRuntimeHandle, WebSocketSender, WebSocketStats, WebSocketTimeout, WsBroadcast,
-    WsBroadcastError, WsBroadcastReport, WsError, WsHub, WsHubBuilder, WsRemotePublish, WsRoute,
-    WsTarget, middleware, sign_value, verify_value,
+    WebSocketLifecycleState, WebSocketMessage, WebSocketObservation, WebSocketObserver,
+    WebSocketReceiver, WebSocketRuntimeHandle, WebSocketSender, WebSocketStats, WebSocketTimeout,
+    WsBroadcast, WsBroadcastError, WsBroadcastReport, WsError, WsHub, WsHubBuilder, WsLocalSocket,
+    WsRemotePublish, WsRoute, WsTarget, middleware, sign_value, verify_value,
 };

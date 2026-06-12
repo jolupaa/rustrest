@@ -288,6 +288,8 @@ async fn drive(
                     Some(frame),
                     WebSocketCloseInitiator::Runtime,
                     config.close_timeout,
+                    runtime,
+                    id,
                 )
                 .await
                 {
@@ -335,6 +337,8 @@ async fn drive(
                             frame,
                             initiator,
                             config.close_timeout,
+                            runtime,
+                            id,
                         )
                         .await
                         {
@@ -372,6 +376,8 @@ async fn drive(
                     Some(frame),
                     WebSocketCloseInitiator::Timeout,
                     config.close_timeout,
+                    runtime,
+                    id,
                 )
                 .await
                 {
@@ -396,6 +402,8 @@ async fn drive(
                     Some(frame),
                     WebSocketCloseInitiator::Timeout,
                     config.close_timeout,
+                    runtime,
+                    id,
                 )
                 .await
                 {
@@ -420,6 +428,8 @@ async fn drive(
                     Some(frame),
                     WebSocketCloseInitiator::Timeout,
                     config.close_timeout,
+                    runtime,
+                    id,
                 )
                 .await
                 {
@@ -463,6 +473,8 @@ async fn drive(
                                     Some(frame),
                                     WebSocketCloseInitiator::Runtime,
                                     config.close_timeout,
+                                    runtime,
+                                    id,
                                 )
                                 .await
                                 {
@@ -493,6 +505,7 @@ async fn drive(
                             }
                         }
                         if let WebSocketMessage::Close(frame) = &message {
+                            runtime.record_closing(id);
                             state.close_received = true;
                             if state.close_info.is_none() {
                                 state.close_info = Some(close_info(
@@ -524,6 +537,8 @@ async fn drive(
                                 Some(frame),
                                 WebSocketCloseInitiator::Runtime,
                                 config.close_timeout,
+                                runtime,
+                                id,
                             )
                             .await
                             {
@@ -559,6 +574,8 @@ async fn drive(
                             Some(frame),
                             WebSocketCloseInitiator::ProtocolError,
                             config.close_timeout,
+                            runtime,
+                            id,
                         )
                         .await
                         {
@@ -603,6 +620,8 @@ async fn drive(
                                 Some(frame),
                                 WebSocketCloseInitiator::Handler,
                                 config.close_timeout,
+                                runtime,
+                                id,
                             )
                             .await
                             {
@@ -628,6 +647,8 @@ async fn drive(
                             Some(frame),
                             WebSocketCloseInitiator::Handler,
                             config.close_timeout,
+                            runtime,
+                            id,
                         )
                         .await
                         {
@@ -656,6 +677,8 @@ async fn drive(
                         Some(frame),
                         WebSocketCloseInitiator::Handler,
                         config.close_timeout,
+                        runtime,
+                        id,
                     )
                     .await
                     {
@@ -707,10 +730,13 @@ async fn initiate_close(
     frame: Option<CloseFrame>,
     initiator: WebSocketCloseInitiator,
     close_timeout: Duration,
+    runtime: &WebSocketRuntimeHandle,
+    id: WebSocketId,
 ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
     if state.close_sent {
         return Ok(());
     }
+    runtime.record_closing(id);
     state.close_info = Some(close_info(frame.as_ref(), initiator, false));
     stream.send(WebSocketMessage::Close(frame)).await?;
     state.close_sent = true;

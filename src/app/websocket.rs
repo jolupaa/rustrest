@@ -17,7 +17,9 @@ pub use config::{BackpressurePolicy, OriginPolicy, WebSocketConfig};
 pub use error::{
     WebSocketCapacityError, WebSocketError, WebSocketTimeout, WsBroadcastError, WsError,
 };
-pub use hub::{WsBroadcastReport, WsHub, WsHubBuilder, WsRemotePublish, WsRoute, WsTarget};
+pub use hub::{
+    WsBroadcastReport, WsHub, WsHubBuilder, WsLocalSocket, WsRemotePublish, WsRoute, WsTarget,
+};
 pub use runtime::WebSocketRuntimeHandle;
 use socket::NormalizedWebSocketHandler;
 pub use socket::{
@@ -26,7 +28,8 @@ pub use socket::{
 };
 pub use types::{
     WebSocketCloseInfo, WebSocketCloseInitiator, WebSocketConnectionSnapshot,
-    WebSocketErrorCategory, WebSocketId, WebSocketObservation, WebSocketObserver, WebSocketStats,
+    WebSocketErrorCategory, WebSocketId, WebSocketLifecycleState, WebSocketObservation,
+    WebSocketObserver, WebSocketStats,
 };
 
 pub(crate) use runtime::{AdmissionError, ConnectionPermit};

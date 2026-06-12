@@ -35,6 +35,14 @@ pub enum WebSocketCloseInitiator {
     Handler,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WebSocketLifecycleState {
+    Connecting,
+    Open,
+    Closing,
+}
+
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct WebSocketConnectionSnapshot {
@@ -43,6 +51,8 @@ pub struct WebSocketConnectionSnapshot {
     pub remote_addr: Option<SocketAddr>,
     pub protocol: Option<String>,
     pub opened_at: SystemTime,
+    pub rooms: Vec<String>,
+    pub lifecycle: WebSocketLifecycleState,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

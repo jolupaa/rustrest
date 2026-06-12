@@ -1,15 +1,16 @@
 use std::collections::{BTreeSet, HashSet};
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use futures_util::StreamExt;
 use hyper::body::Bytes;
 use serde::Serialize;
 
-use super::socket::LocalEnqueueOutcome;
+use super::socket::{InternalWebSocketSender, LocalEnqueueOutcome, validate_close};
 use super::{
-    WebSocketEvent, WebSocketId, WebSocketMessage, WebSocketRuntimeHandle, WsBroadcastError,
-    WsError,
+    WebSocketConnectionSnapshot, WebSocketEvent, WebSocketId, WebSocketLifecycleState,
+    WebSocketMessage, WebSocketRuntimeHandle, WsBroadcastError, WsError,
 };
 
 const DEFAULT_MAX_ROOMS_PER_CONNECTION: usize = 32;
@@ -53,6 +54,12 @@ pub struct WsTarget {
     all_in_scope: bool,
     excluded: HashSet<WebSocketId>,
     publish_remote: bool,
+}
+
+#[derive(Clone)]
+pub struct WsLocalSocket {
+    snapshot: WebSocketConnectionSnapshot,
+    sender: InternalWebSocketSender,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -122,6 +129,99 @@ impl WsHub {
             excluded: HashSet::new(),
             publish_remote: true,
         }
+    }
+
+    pub fn local_socket(&self, id: WebSocketId) -> Option<WsLocalSocket> {
+        self.runtime.local_socket(id).map(|parts| WsLocalSocket {
+            snapshot: parts.snapshot,
+            sender: parts.sender,
+        })
+    }
+
+    pub async fn disconnect_local(
+        &self,
+        id: WebSocketId,
+        code: u16,
+        reason: &str,
+    ) -> Result<(), WsError> {
+        self.runtime.close(id, code, reason).await
+    }
+
+    pub fn local_connection_count(&self) -> usize {
+        self.runtime.stats().active_connections
+    }
+}
+
+impl WsLocalSocket {
+    pub fn id(&self) -> WebSocketId {
+        self.snapshot.id
+    }
+
+    pub fn route(&self) -> &str {
+        &self.snapshot.route
+    }
+
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        self.snapshot.remote_addr
+    }
+
+    pub fn protocol(&self) -> Option<&str> {
+        self.snapshot.protocol.as_deref()
+    }
+
+    pub fn opened_at(&self) -> SystemTime {
+        self.snapshot.opened_at
+    }
+
+    pub fn rooms(&self) -> &[String] {
+        &self.snapshot.rooms
+    }
+
+    pub fn lifecycle(&self) -> WebSocketLifecycleState {
+        self.snapshot.lifecycle
+    }
+
+    pub async fn send(&self, message: WebSocketMessage) -> Result<(), WsError> {
+        self.sender.send(message).await
+    }
+
+    pub async fn send_text(&self, text: &str) -> Result<(), WsError> {
+        self.send(WebSocketMessage::text(text.to_string())).await
+    }
+
+    pub async fn send_binary(&self, bytes: impl Into<Bytes>) -> Result<(), WsError> {
+        self.send(WebSocketMessage::binary(bytes.into())).await
+    }
+
+    pub async fn send_json<T>(&self, value: &T) -> Result<(), WsError>
+    where
+        T: Serialize,
+    {
+        self.send_text(&serde_json::to_string(value)?).await
+    }
+
+    pub async fn send_event<T>(&self, event: &str, data: &T) -> Result<(), WsError>
+    where
+        T: Serialize,
+    {
+        self.send_json(&WebSocketEvent {
+            event: event.to_string(),
+            data,
+        })
+        .await
+    }
+
+    pub async fn close(&self) -> Result<(), WsError> {
+        self.close_with(1000, "").await
+    }
+
+    pub async fn close_with(&self, code: u16, reason: &str) -> Result<(), WsError> {
+        validate_close(code, reason)?;
+        self.sender.disconnect(code, reason).await
+    }
+
+    pub async fn closed(&self) -> super::WebSocketCloseInfo {
+        self.sender.closed().await
     }
 }
 

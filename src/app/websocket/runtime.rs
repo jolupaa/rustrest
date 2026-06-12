@@ -11,8 +11,8 @@ use tokio::task::AbortHandle;
 use super::ResolvedWebSocketConfig;
 use super::socket::{InternalWebSocketSender, validate_close};
 use super::types::{
-    WebSocketCloseInfo, WebSocketConnectionSnapshot, WebSocketId, WebSocketObservation,
-    WebSocketObserver, WebSocketStats,
+    WebSocketCloseInfo, WebSocketConnectionSnapshot, WebSocketId, WebSocketLifecycleState,
+    WebSocketObservation, WebSocketObserver, WebSocketStats,
 };
 use super::{WebSocketTimeout, WsError};
 
@@ -48,6 +48,7 @@ struct ConnectionEntry {
     max_rooms_per_connection: usize,
     max_room_name_bytes: usize,
     rooms: BTreeSet<String>,
+    lifecycle: WebSocketLifecycleState,
     internal_sender: Option<InternalWebSocketSender>,
     driver_abort: Option<AbortHandle>,
     forced_shutdown_observed: bool,
@@ -74,6 +75,11 @@ pub struct WebSocketRuntimeHandle {
 pub(crate) struct LocalBroadcastRecipient {
     pub id: WebSocketId,
     pub sender: Option<InternalWebSocketSender>,
+}
+
+pub(crate) struct LocalSocketParts {
+    pub snapshot: WebSocketConnectionSnapshot,
+    pub sender: InternalWebSocketSender,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,6 +257,7 @@ impl WebSocketRuntimeHandle {
                                 .max_room_name_bytes
                                 .min(self.inner.max_room_name_bytes),
                             rooms: BTreeSet::new(),
+                            lifecycle: WebSocketLifecycleState::Connecting,
                             internal_sender: None,
                             driver_abort: None,
                             forced_shutdown_observed: false,
@@ -394,6 +401,15 @@ impl WebSocketRuntimeHandle {
         )
     }
 
+    pub(crate) fn local_socket(&self, id: WebSocketId) -> Option<LocalSocketParts> {
+        let registry = self.registry();
+        let entry = registry.connections.get(&id)?;
+        Some(LocalSocketParts {
+            snapshot: snapshot(id, entry),
+            sender: entry.internal_sender.clone()?,
+        })
+    }
+
     pub(crate) fn select_broadcast_recipients(
         &self,
         route: Option<&str>,
@@ -437,12 +453,15 @@ impl WebSocketRuntimeHandle {
     /// Closes one process-local connection and waits for registry cleanup.
     pub async fn close(&self, id: WebSocketId, code: u16, reason: &str) -> Result<(), WsError> {
         validate_close(code, reason)?;
-        let close_timeout = self
-            .registry()
-            .connections
-            .get(&id)
-            .map(|entry| entry.close_timeout)
-            .ok_or(WsError::ConnectionNotFound(id))?;
+        let close_timeout = {
+            let mut registry = self.registry();
+            let entry = registry
+                .connections
+                .get_mut(&id)
+                .ok_or(WsError::ConnectionNotFound(id))?;
+            entry.lifecycle = WebSocketLifecycleState::Closing;
+            entry.close_timeout
+        };
 
         tokio::time::timeout(close_timeout, async {
             let sender = self.wait_for_sender(id).await?;
@@ -472,7 +491,13 @@ impl WebSocketRuntimeHandle {
     }
 
     pub(crate) async fn begin_shutdown(&self) {
-        self.stop_accepting();
+        {
+            let mut registry = self.registry();
+            registry.accepting = false;
+            for entry in registry.connections.values_mut() {
+                entry.lifecycle = WebSocketLifecycleState::Closing;
+            }
+        }
         self.inner.shutdown_tx.send_replace(true);
     }
 
@@ -560,7 +585,20 @@ impl WebSocketRuntimeHandle {
     }
 
     pub(crate) fn record_opened(&self, id: WebSocketId) {
+        {
+            let mut registry = self.registry();
+            if let Some(entry) = registry.connections.get_mut(&id) {
+                entry.lifecycle = WebSocketLifecycleState::Open;
+            }
+        }
         self.observe(&WebSocketObservation::Opened { id });
+    }
+
+    pub(crate) fn record_closing(&self, id: WebSocketId) {
+        let mut registry = self.registry();
+        if let Some(entry) = registry.connections.get_mut(&id) {
+            entry.lifecycle = WebSocketLifecycleState::Closing;
+        }
     }
 
     pub(crate) fn record_message(
@@ -759,6 +797,8 @@ fn snapshot(id: WebSocketId, entry: &ConnectionEntry) -> WebSocketConnectionSnap
         remote_addr: entry.remote_addr,
         protocol: entry.protocol.clone(),
         opened_at: entry.opened_at,
+        rooms: entry.rooms.iter().cloned().collect(),
+        lifecycle: entry.lifecycle,
     }
 }
 

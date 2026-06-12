@@ -284,6 +284,30 @@ impl Drop for WebSocketSender {
 }
 
 impl InternalWebSocketSender {
+    pub(crate) async fn send(&self, message: WebSocketMessage) -> Result<(), WsError> {
+        match message {
+            WebSocketMessage::Ping(payload) => self
+                .shared
+                .control
+                .send(ControlCommand::Ping(payload))
+                .await
+                .map_err(|_| WsError::Closed),
+            WebSocketMessage::Pong(payload) => self
+                .shared
+                .control
+                .send(ControlCommand::Pong(payload))
+                .await
+                .map_err(|_| WsError::Closed),
+            WebSocketMessage::Close(frame) => self
+                .shared
+                .control
+                .send(ControlCommand::Disconnect(frame))
+                .await
+                .map_err(|_| WsError::Closed),
+            message => self.shared.send_application(message).await,
+        }
+    }
+
     pub(crate) async fn enqueue(&self, message: WebSocketMessage) -> LocalEnqueueOutcome {
         match self.shared.send_application(message).await {
             Ok(()) => LocalEnqueueOutcome::Enqueued,
