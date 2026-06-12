@@ -72,6 +72,7 @@ impl App {
         shutdown: impl Future<Output = ()> + Send,
     ) -> io::Result<()> {
         self.validate_websockets()?;
+        self.websocket_runtime().start_broker().await;
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let app = Arc::new(self);
         let builder = Arc::new(auto::Builder::new(TokioExecutor::new()));

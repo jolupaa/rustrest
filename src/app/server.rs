@@ -421,6 +421,7 @@ impl App {
         shutdown: impl Future<Output = ()> + Send,
     ) -> io::Result<()> {
         self.validate_websockets()?;
+        self.websocket_runtime.start_broker().await;
         let header_read_timeout = self.config.header_read_timeout;
         let app = Arc::new(self);
         let mut builder = auto::Builder::new(TokioExecutor::new());

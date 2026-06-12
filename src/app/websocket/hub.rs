@@ -10,13 +10,16 @@ use serde::Serialize;
 use super::socket::{InternalWebSocketSender, LocalEnqueueOutcome, validate_close};
 use super::{
     WebSocketConnectionSnapshot, WebSocketEvent, WebSocketId, WebSocketLifecycleState,
-    WebSocketMessage, WebSocketRuntimeHandle, WsBroadcastError, WsBroker, WsError, WsNodeId,
+    WebSocketMessage, WebSocketRuntimeHandle, WsBroadcastError, WsBroker, WsBrokerError,
+    WsBrokerPayload, WsBrokerPublication, WsBrokerTarget, WsError, WsNodeId,
 };
 
 const DEFAULT_MAX_ROOMS_PER_CONNECTION: usize = 32;
 const DEFAULT_MAX_ROOM_NAME_BYTES: usize = 128;
 const DEFAULT_BROADCAST_CONCURRENCY: usize = 64;
 const DEFAULT_BROKER_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_BROKER_ROUTE_BYTES: usize = 1024;
+const MAX_BROKER_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 /// Cloneable process-local WebSocket room and broadcast handle.
@@ -155,6 +158,71 @@ impl WsHub {
     pub fn node_id(&self) -> WsNodeId {
         self.config.node_id
     }
+
+    pub(crate) fn validate_broker_publication(
+        &self,
+        publication: &WsBrokerPublication,
+    ) -> Result<(), WsBrokerError> {
+        match &publication.target {
+            WsBrokerTarget::RouteRooms { route, rooms } => {
+                validate_broker_route(route)?;
+                if rooms.is_empty() || rooms.len() > self.config.max_rooms_per_connection {
+                    return Err(WsBrokerError::InvalidPublication(
+                        "el destino de rooms debe incluir una cantidad valida".into(),
+                    ));
+                }
+                for room in rooms {
+                    validate_broker_room(room, self.config.max_room_name_bytes)?;
+                }
+            }
+            WsBrokerTarget::RouteAll { route } => validate_broker_route(route)?,
+            WsBrokerTarget::AllRoutes => {}
+        }
+        let payload_len = match &publication.payload {
+            WsBrokerPayload::Text(text) => text.len(),
+            WsBrokerPayload::Binary(bytes) => bytes.len(),
+        };
+        if payload_len > MAX_BROKER_PAYLOAD_BYTES {
+            return Err(WsBrokerError::InvalidPublication(
+                "el payload supera el limite del broker WebSocket".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn deliver_broker_publication(&self, publication: WsBrokerPublication) {
+        let target = match publication.target {
+            WsBrokerTarget::RouteRooms { route, rooms } => WsTarget {
+                hub: self.clone(),
+                route: Some(route),
+                rooms: normalize_rooms(rooms),
+                all_in_scope: false,
+                excluded: HashSet::new(),
+                publish_remote: false,
+            },
+            WsBrokerTarget::RouteAll { route } => WsTarget {
+                hub: self.clone(),
+                route: Some(route),
+                rooms: Vec::new(),
+                all_in_scope: true,
+                excluded: HashSet::new(),
+                publish_remote: false,
+            },
+            WsBrokerTarget::AllRoutes => WsTarget {
+                hub: self.clone(),
+                route: None,
+                rooms: Vec::new(),
+                all_in_scope: true,
+                excluded: HashSet::new(),
+                publish_remote: false,
+            },
+        };
+        let message = match publication.payload {
+            WsBrokerPayload::Text(text) => WebSocketMessage::text(text),
+            WsBrokerPayload::Binary(bytes) => WebSocketMessage::binary(bytes),
+        };
+        let _ = target.send_local(message).await;
+    }
 }
 
 impl WsLocalSocket {
@@ -287,6 +355,41 @@ impl WsTarget {
                 return Err(WsBroadcastError::InvalidRoom(room.clone()));
             }
         }
+        let mut report = self.send_local(message.clone()).await;
+        if !self.publish_remote {
+            return Ok(report);
+        }
+        let Some(broker) = &self.hub.config.broker else {
+            return Ok(report);
+        };
+        let publication = WsBrokerPublication::new(
+            self.hub.runtime.next_publication_id(),
+            self.hub.config.node_id,
+            self.broker_target(),
+            broker_payload(&message).ok_or(WsBroadcastError::InvalidMessage)?,
+        );
+        let published = tokio::time::timeout(
+            self.hub.config.broker_operation_timeout,
+            broker.publish(publication),
+        )
+        .await;
+        match published {
+            Ok(Ok(())) => {
+                report.remote = WsRemotePublish::Published;
+                Ok(report)
+            }
+            Ok(Err(source)) => Err(WsBroadcastError::Broker {
+                source,
+                local_report: report,
+            }),
+            Err(_) => Err(WsBroadcastError::Broker {
+                source: WsBrokerError::Timeout,
+                local_report: report,
+            }),
+        }
+    }
+
+    async fn send_local(&self, message: WebSocketMessage) -> WsBroadcastReport {
         let recipients = self.hub.runtime.select_broadcast_recipients(
             self.route.as_deref(),
             &self.rooms,
@@ -322,8 +425,21 @@ impl WsTarget {
             report.matched,
             report.enqueued + report.rejected + report.disconnected
         );
-        let _ = self.publish_remote;
-        Ok(report)
+        report
+    }
+
+    fn broker_target(&self) -> WsBrokerTarget {
+        match (self.route.as_ref(), self.all_in_scope) {
+            (Some(route), false) => WsBrokerTarget::RouteRooms {
+                route: route.clone(),
+                rooms: self.rooms.clone(),
+            },
+            (Some(route), true) => WsBrokerTarget::RouteAll {
+                route: route.clone(),
+            },
+            (None, true) => WsBrokerTarget::AllRoutes,
+            (None, false) => unreachable!("un destino por rooms siempre tiene una ruta"),
+        }
     }
 
     pub async fn send_text(&self, text: &str) -> Result<WsBroadcastReport, WsBroadcastError> {
@@ -452,4 +568,30 @@ where
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+fn broker_payload(message: &WebSocketMessage) -> Option<WsBrokerPayload> {
+    match message {
+        WebSocketMessage::Text(text) => Some(WsBrokerPayload::Text(text.to_string())),
+        WebSocketMessage::Binary(bytes) => Some(WsBrokerPayload::Binary(bytes.clone())),
+        _ => None,
+    }
+}
+
+fn validate_broker_route(route: &str) -> Result<(), WsBrokerError> {
+    if route.is_empty() || route.contains('\0') || route.len() > MAX_BROKER_ROUTE_BYTES {
+        return Err(WsBrokerError::InvalidPublication(
+            "la ruta del broker WebSocket no es valida".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_broker_room(room: &str, max_bytes: usize) -> Result<(), WsBrokerError> {
+    if room.is_empty() || room.contains('\0') || room.len() > max_bytes {
+        return Err(WsBrokerError::InvalidPublication(
+            "una room del broker WebSocket no es valida".into(),
+        ));
+    }
+    Ok(())
 }

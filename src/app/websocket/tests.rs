@@ -1,6 +1,8 @@
 use futures_util::StreamExt;
 use hyper::header::SEC_WEBSOCKET_ACCEPT;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::RequestBuilder;
@@ -63,6 +65,53 @@ fn websocket_hubs_allocate_unique_nodes_unless_configured() {
 
     assert_ne!(first.node_id(), second.node_id());
     assert_eq!(configured.node_id().get(), 9001);
+}
+
+struct RecoveringBroker {
+    inner: InMemoryWsBroker,
+    subscriptions: AtomicUsize,
+}
+
+impl WsBroker for RecoveringBroker {
+    fn publish<'a>(
+        &'a self,
+        publication: WsBrokerPublication,
+    ) -> futures_util::future::BoxFuture<'a, Result<(), WsBrokerError>> {
+        self.inner.publish(publication)
+    }
+
+    fn subscribe<'a>(
+        &'a self,
+        node: WsNodeId,
+    ) -> futures_util::future::BoxFuture<'a, Result<WsBrokerStream, WsBrokerError>> {
+        if self.subscriptions.fetch_add(1, Ordering::SeqCst) == 0 {
+            Box::pin(async { Err(WsBrokerError::Unavailable) })
+        } else {
+            self.inner.subscribe(node)
+        }
+    }
+}
+
+#[tokio::test]
+async fn websocket_broker_subscription_recovers() {
+    let broker = Arc::new(RecoveringBroker {
+        inner: InMemoryWsBroker::new(8),
+        subscriptions: AtomicUsize::new(0),
+    });
+    let hub = WsHub::builder().broker(broker.clone()).build().unwrap();
+    let runtime = hub.runtime();
+
+    runtime.start_broker().await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !runtime.stats().broker_connected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(broker.subscriptions.load(Ordering::SeqCst) >= 2);
+    runtime.begin_shutdown().await;
 }
 
 #[test]

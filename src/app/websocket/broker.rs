@@ -97,6 +97,7 @@ pub enum WsBrokerPayload {
 #[non_exhaustive]
 pub enum WsBrokerError {
     Unavailable,
+    Timeout,
     Lagged(u64),
     InvalidPublication(String),
     SubscriptionClosed,
@@ -106,6 +107,7 @@ impl std::fmt::Display for WsBrokerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unavailable => f.write_str("el broker WebSocket no esta disponible"),
+            Self::Timeout => f.write_str("el broker WebSocket agoto su tiempo limite"),
             Self::Lagged(count) => {
                 write!(
                     f,

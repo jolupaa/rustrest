@@ -1,15 +1,16 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, SystemTime};
 
+use futures_util::StreamExt;
 use tokio::sync::{Notify, watch};
 use tokio::task::AbortHandle;
 
 use super::ResolvedWebSocketConfig;
-use super::broker::{WsBroker, WsNodeId, allocate_node_id};
+use super::broker::{WsBroker, WsBrokerPublication, WsNodeId, WsPublicationId, allocate_node_id};
 use super::socket::{InternalWebSocketSender, validate_close};
 use super::types::{
     WebSocketCloseInfo, WebSocketConnectionSnapshot, WebSocketId, WebSocketLifecycleState,
@@ -19,6 +20,8 @@ use super::{WebSocketTimeout, WsError};
 
 struct RuntimeInner {
     next_id: AtomicU64,
+    next_publication_id: AtomicU64,
+    broker_started: AtomicBool,
     registry: Mutex<Registry>,
     shutdown_tx: watch::Sender<bool>,
     empty: Notify,
@@ -38,8 +41,13 @@ struct Registry {
     route_counts: HashMap<String, usize>,
     ip_counts: HashMap<IpAddr, usize>,
     rooms: HashMap<(String, String), HashSet<WebSocketId>>,
+    broker_connected: bool,
+    seen_publications: HashSet<(WsNodeId, WsPublicationId)>,
+    seen_publication_order: VecDeque<(WsNodeId, WsPublicationId)>,
     counters: WebSocketCounters,
 }
+
+const MAX_SEEN_PUBLICATIONS: usize = 4096;
 
 #[derive(Clone)]
 struct ConnectionEntry {
@@ -153,12 +161,17 @@ impl WebSocketRuntimeHandle {
         Self {
             inner: Arc::new(RuntimeInner {
                 next_id: AtomicU64::new(1),
+                next_publication_id: AtomicU64::new(1),
+                broker_started: AtomicBool::new(false),
                 registry: Mutex::new(Registry {
                     accepting: true,
                     connections: HashMap::new(),
                     route_counts: HashMap::new(),
                     ip_counts: HashMap::new(),
                     rooms: HashMap::new(),
+                    broker_connected: false,
+                    seen_publications: HashSet::new(),
+                    seen_publication_order: VecDeque::new(),
                     counters: WebSocketCounters::default(),
                 }),
                 shutdown_tx,
@@ -190,6 +203,7 @@ impl WebSocketRuntimeHandle {
             saturated_sends: registry.counters.saturated_sends,
             heartbeat_timeouts: registry.counters.heartbeat_timeouts,
             active_rooms: registry.rooms.len(),
+            broker_connected: registry.broker_connected,
             ..WebSocketStats::default()
         }
     }
@@ -426,6 +440,32 @@ impl WebSocketRuntimeHandle {
         }
     }
 
+    pub(crate) fn next_publication_id(&self) -> WsPublicationId {
+        WsPublicationId::new(
+            self.inner
+                .next_publication_id
+                .fetch_add(1, Ordering::Relaxed),
+        )
+    }
+
+    pub(crate) async fn start_broker(&self) {
+        let Some(broker) = self.inner.broker.clone() else {
+            return;
+        };
+        if self
+            .inner
+            .broker_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            runtime.supervise_broker(broker).await;
+        });
+    }
+
     pub(crate) fn local_socket(&self, id: WebSocketId) -> Option<LocalSocketParts> {
         let registry = self.registry();
         let entry = registry.connections.get(&id)?;
@@ -580,6 +620,94 @@ impl WebSocketRuntimeHandle {
         }
     }
 
+    async fn supervise_broker(self, broker: Arc<dyn WsBroker>) {
+        let mut shutdown = self.subscribe_shutdown();
+        let mut retry_delay = Duration::from_millis(100);
+        loop {
+            if *shutdown.borrow() {
+                self.set_broker_connected(false);
+                return;
+            }
+            let subscribed = tokio::select! {
+                changed = shutdown.changed() => {
+                    let _ = changed;
+                    self.set_broker_connected(false);
+                    return;
+                }
+                result = tokio::time::timeout(
+                    self.inner.broker_operation_timeout,
+                    broker.subscribe(self.inner.node_id),
+                ) => result,
+            };
+            let mut stream = match subscribed {
+                Ok(Ok(stream)) => {
+                    self.set_broker_connected(true);
+                    retry_delay = Duration::from_millis(100);
+                    stream
+                }
+                Ok(Err(_)) | Err(_) => {
+                    self.set_broker_connected(false);
+                    if !wait_for_broker_retry(&mut shutdown, retry_delay).await {
+                        return;
+                    }
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(1));
+                    continue;
+                }
+            };
+
+            loop {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        let _ = changed;
+                        self.set_broker_connected(false);
+                        return;
+                    }
+                    item = stream.next() => match item {
+                        Some(Ok(publication)) => self.handle_broker_publication(publication).await,
+                        Some(Err(_)) | None => break,
+                    }
+                }
+            }
+            self.set_broker_connected(false);
+            if !wait_for_broker_retry(&mut shutdown, retry_delay).await {
+                return;
+            }
+            retry_delay = (retry_delay * 2).min(Duration::from_secs(1));
+        }
+    }
+
+    async fn handle_broker_publication(&self, publication: WsBrokerPublication) {
+        if publication.origin == self.inner.node_id {
+            return;
+        }
+        let hub = super::WsHub::from_runtime(self.clone());
+        if hub.validate_broker_publication(&publication).is_err()
+            || !self.mark_publication_seen(publication.origin, publication.id)
+        {
+            return;
+        }
+        hub.deliver_broker_publication(publication).await;
+    }
+
+    fn mark_publication_seen(&self, origin: WsNodeId, id: WsPublicationId) -> bool {
+        let key = (origin, id);
+        let mut registry = self.registry();
+        if !registry.seen_publications.insert(key) {
+            return false;
+        }
+        registry.seen_publication_order.push_back(key);
+        if registry.seen_publication_order.len() > MAX_SEEN_PUBLICATIONS
+            && let Some(expired) = registry.seen_publication_order.pop_front()
+        {
+            registry.seen_publications.remove(&expired);
+        }
+        true
+    }
+
+    fn set_broker_connected(&self, connected: bool) {
+        self.registry().broker_connected = connected;
+    }
+
     fn active_count(&self) -> usize {
         self.registry().connections.len()
     }
@@ -719,6 +847,16 @@ impl WebSocketRuntimeHandle {
             .clone();
         let _ = catch_unwind(AssertUnwindSafe(|| observer.observe(event)));
         trace_websocket_observation(event);
+    }
+}
+
+async fn wait_for_broker_retry(shutdown: &mut watch::Receiver<bool>, delay: Duration) -> bool {
+    tokio::select! {
+        changed = shutdown.changed() => {
+            let _ = changed;
+            false
+        }
+        _ = tokio::time::sleep(delay) => !*shutdown.borrow(),
     }
 }
 

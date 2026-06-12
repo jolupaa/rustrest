@@ -1,4 +1,5 @@
 use super::types::{WebSocketErrorCategory, WebSocketId};
+use super::{WsBroadcastReport, WsBrokerError};
 
 #[derive(Debug)]
 pub enum WebSocketError {
@@ -130,6 +131,10 @@ pub enum WsBroadcastError {
     InvalidMessage,
     InvalidRoom(String),
     Serialization(serde_json::Error),
+    Broker {
+        source: WsBrokerError,
+        local_report: WsBroadcastReport,
+    },
 }
 
 impl std::fmt::Display for WsBroadcastError {
@@ -140,6 +145,9 @@ impl std::fmt::Display for WsBroadcastError {
             }
             Self::InvalidRoom(room) => write!(f, "room WebSocket no valido: {room}"),
             Self::Serialization(error) => write!(f, "error serializando broadcast: {error}"),
+            Self::Broker { source, .. } => {
+                write!(f, "fallo publicando el broadcast WebSocket: {source}")
+            }
         }
     }
 }
@@ -148,6 +156,7 @@ impl std::error::Error for WsBroadcastError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Serialization(error) => Some(error),
+            Self::Broker { source, .. } => Some(source),
             _ => None,
         }
     }

@@ -4,8 +4,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use rustrest::{
-    App, BackpressurePolicy, WebSocketCapacityError, WebSocketConfig, WebSocketEvent,
-    WebSocketObservation, WebSocketObserver, WebSocketRuntimeHandle, WsError,
+    App, BackpressurePolicy, InMemoryWsBroker, WebSocketCapacityError, WebSocketConfig,
+    WebSocketEvent, WebSocketObservation, WebSocketObserver, WebSocketRuntimeHandle,
+    WsBroadcastError, WsBroadcastReport, WsBroker, WsBrokerPayload, WsBrokerPublication,
+    WsBrokerTarget, WsError, WsHub, WsNodeId, WsPublicationId,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -90,6 +92,65 @@ async fn wait_for_connections(runtime: &WebSocketRuntimeHandle, active: usize, c
     })
     .await
     .expect("websocket runtime stats should settle before the deadline");
+}
+
+async fn wait_for_broker(runtime: &WebSocketRuntimeHandle) {
+    tokio::time::timeout(IO_TIMEOUT, async {
+        loop {
+            if runtime.stats().broker_connected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("websocket broker should connect before the deadline");
+}
+
+async fn spawn_broker_app(
+    broker: Arc<InMemoryWsBroker>,
+    node_id: u64,
+    report_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<Result<WsBroadcastReport, WsBroadcastError>>,
+    >,
+) -> (SocketAddr, WebSocketRuntimeHandle, ServerGuard) {
+    let hub = WsHub::builder()
+        .broker(broker)
+        .node_id(WsNodeId::new(node_id))
+        .build()
+        .unwrap();
+    let mut app = App::new();
+    app.websocket_hub(hub);
+    for path in ["/chat/:channel", "/admin/chat/:channel"] {
+        let report_tx = report_tx.clone();
+        app.websocket(path, move |mut socket| {
+            let report_tx = report_tx.clone();
+            async move {
+                while let Some(message) = socket.recv().await.unwrap() {
+                    let Ok(text) = message.into_text() else {
+                        continue;
+                    };
+                    if let Some(rooms) = text.strip_prefix("join:") {
+                        socket.join_many(rooms.split(',')).await.unwrap();
+                        socket.send_text("ready").await.unwrap();
+                    } else if let Some(command) = text.strip_prefix("to:") {
+                        let (room, payload) = command.split_once(':').unwrap();
+                        let result = socket.to(room).send_text(payload).await;
+                        if let Some(report_tx) = &report_tx {
+                            report_tx.send(result).unwrap();
+                        }
+                    }
+                }
+            }
+        });
+    }
+    let runtime = app.websocket_runtime();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = ServerGuard(tokio::spawn(async move {
+        app.serve(listener).await.unwrap();
+    }));
+    (addr, runtime, server)
 }
 
 async fn raw_handshake(addr: SocketAddr, headers: &[(&str, &str)]) -> String {
@@ -329,6 +390,126 @@ async fn websocket_multi_room_deduplicates_local_recipient() {
         .unwrap();
     assert_eq!(message.into_text().unwrap(), "una-vez");
     assert_no_websocket_message(&mut peer).await;
+    assert_no_websocket_message(&mut origin).await;
+}
+
+#[tokio::test]
+async fn websocket_broker_two_nodes_delivers_once_and_preserves_route_scope() {
+    let broker = Arc::new(InMemoryWsBroker::new(64));
+    let (report_tx, mut report_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (addr_a, runtime_a, _server_a) =
+        spawn_broker_app(broker.clone(), 101, Some(report_tx)).await;
+    let (addr_b, runtime_b, _server_b) = spawn_broker_app(broker.clone(), 202, None).await;
+    wait_for_broker(&runtime_a).await;
+    wait_for_broker(&runtime_b).await;
+
+    let (mut origin, _) = tokio_tungstenite::connect_async(format!("ws://{addr_a}/chat/a"))
+        .await
+        .unwrap();
+    let (mut local_peer, _) = tokio_tungstenite::connect_async(format!("ws://{addr_a}/chat/b"))
+        .await
+        .unwrap();
+    let (mut remote_peer, _) = tokio_tungstenite::connect_async(format!("ws://{addr_b}/chat/c"))
+        .await
+        .unwrap();
+    let (mut isolated, _) = tokio_tungstenite::connect_async(format!("ws://{addr_b}/admin/chat/c"))
+        .await
+        .unwrap();
+    for client in [
+        &mut origin,
+        &mut local_peer,
+        &mut remote_peer,
+        &mut isolated,
+    ] {
+        join_test_rooms(client, "general").await;
+    }
+
+    origin
+        .send(Message::Text("to:general:entre-nodos".into()))
+        .await
+        .unwrap();
+    let report = tokio::time::timeout(IO_TIMEOUT, report_rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.matched, 1);
+    assert_eq!(report.enqueued, 1);
+    assert_eq!(report.remote, rustrest::WsRemotePublish::Published);
+    for client in [&mut local_peer, &mut remote_peer] {
+        let message = tokio::time::timeout(IO_TIMEOUT, client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.into_text().unwrap(), "entre-nodos");
+        assert_no_websocket_message(client).await;
+    }
+    assert_no_websocket_message(&mut origin).await;
+    assert_no_websocket_message(&mut isolated).await;
+
+    let duplicate = WsBrokerPublication::new(
+        WsPublicationId::new(77),
+        WsNodeId::new(999),
+        WsBrokerTarget::RouteRooms {
+            route: "/chat/:channel".into(),
+            rooms: vec!["general".into()],
+        },
+        WsBrokerPayload::Text("sin-duplicado".into()),
+    );
+    broker.publish(duplicate.clone()).await.unwrap();
+    broker.publish(duplicate).await.unwrap();
+    for client in [&mut origin, &mut local_peer, &mut remote_peer] {
+        let message = tokio::time::timeout(IO_TIMEOUT, client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.into_text().unwrap(), "sin-duplicado");
+        assert_no_websocket_message(client).await;
+    }
+    assert_no_websocket_message(&mut isolated).await;
+}
+
+#[tokio::test]
+async fn websocket_broker_failure_keeps_local_report() {
+    let broker = Arc::new(InMemoryWsBroker::new(64));
+    let (report_tx, mut report_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (addr, runtime, _server) = spawn_broker_app(broker.clone(), 303, Some(report_tx)).await;
+    wait_for_broker(&runtime).await;
+    let (mut origin, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/chat/a"))
+        .await
+        .unwrap();
+    let (mut local_peer, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/chat/b"))
+        .await
+        .unwrap();
+    join_test_rooms(&mut origin, "general").await;
+    join_test_rooms(&mut local_peer, "general").await;
+    broker.close();
+
+    origin
+        .send(Message::Text("to:general:solo-local".into()))
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(IO_TIMEOUT, report_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let WsBroadcastError::Broker {
+        source: _,
+        local_report,
+    } = result.unwrap_err()
+    else {
+        panic!("expected broker failure");
+    };
+    assert_eq!(local_report.matched, 1);
+    assert_eq!(local_report.enqueued, 1);
+    let message = tokio::time::timeout(IO_TIMEOUT, local_peer.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.into_text().unwrap(), "solo-local");
     assert_no_websocket_message(&mut origin).await;
 }
 
