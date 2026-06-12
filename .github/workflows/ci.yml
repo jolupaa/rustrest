@@ -47,6 +47,17 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: Check declared minimum Rust version
+        run: cargo check --all-targets --all-features
+
   clippy:
     runs-on: ubuntu-latest
     steps:

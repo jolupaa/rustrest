@@ -11,13 +11,40 @@ connections, 1,000 active connections, 900 seconds of load, complete echo
 delivery, zero unexpected closes, and graceful shutdown within 15 seconds.
 Artifacts are written under `target/ws-reference/`.
 
-No successful reference baseline is committed yet. The current development
-environment is macOS and cannot produce the required Linux `/proc` and
-`/usr/bin/time -v` measurements. Run the script on the designated Linux
-reference host and replace this notice only with measured values from a passing
-report: date, commit, kernel, CPU, RAM, Rust version, limits, configuration,
-connection counts, throughput, p50/p95/p99 latency, peak and stabilized RSS,
-CPU, open file descriptors, errors, and shutdown duration.
+## Accepted Linux reference
+
+The full 900-second reference profile passed on June 12, 2026.
+
+Source commit: `8b0e4390aa6e27004148d62220370eb48fd64b32`.
+The run used an ARM64 LinuxKit container (`6.10.14-linuxkit`) on Docker
+Desktop with 12 Apple CPU cores, 7.7 GiB available RAM plus 1 GiB swap,
+Rust 1.85.1, and `ulimit -n` 1,048,576. This is a reproducible
+containerized Linux baseline, not a bare-metal capacity claim.
+
+Configuration: 10,000 idle connections, 1,000 active connections, 900
+seconds, 256-byte text messages, and connection concurrency 256. All 11,000
+connections opened. The client sent and received exactly 67,974,257 messages
+(about 75,527 messages/second) with zero connect, send, receive, or
+unexpected-close failures.
+
+Round-trip latency was 1,024 us p50, 2,628 us p95, and 3,606 us p99. Server
+maximum RSS was 1,582,000 KiB. Across 60 samples after the 300-second warm-up,
+RSS minimum, maximum, first, and final values were all 1,582,000 KiB: 0%
+final growth and 0% stable range. Stable server CPU averaged 151.7%, sampled
+peak CPU was 156%, and peak/final open file descriptors were 11,011. The
+server reported no swaps or panic text and exited with status 0.
+
+The client completed in 902,495 ms including establishment and close drain.
+After the client closed its sockets, graceful server shutdown completed in
+108 ms. `/usr/bin/time -v` measured total server wall time as 15:02.60.
+
+## RFC 6455 conformance
+
+On June 12, 2026, `crossbario/autobahn-testsuite:25.10.1` ran all 247
+configured non-performance, non-compression cases. The checker inspected 494
+behavior records across 248 JSON reports and found zero `FAILED` or
+`UNIMPLEMENTED` records. Cases `9.*`, `12.*`, and `13.*` remain excluded for
+the documented load-test and compression-extension reasons.
 
 ## Development smoke (not the reference baseline)
 

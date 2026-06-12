@@ -30,8 +30,15 @@ output_dir="target/ws-reference"
 rm -rf "${output_dir}"
 mkdir -p "${output_dir}"
 
+reference_commit="${RUSTREST_REFERENCE_COMMIT:-}"
+if [[ -z "${reference_commit}" ]] && command -v git >/dev/null 2>&1; then
+  reference_commit="$(git rev-parse HEAD 2>/dev/null || true)"
+fi
+reference_commit="${reference_commit:-unknown}"
+
 {
   date --iso-8601=seconds
+  echo "repository commit: ${reference_commit}"
   uname -a
   rustc -Vv
   echo "ulimit -n: ${fd_limit}"
