@@ -15,7 +15,7 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role};
 
 use super::runtime::{ConnectionPermit, WebSocketRuntimeHandle};
 use super::socket::{NormalizedWebSocketHandler, WebSocket};
-use super::types::{WebSocketCloseInfo, WebSocketCloseInitiator, WebSocketMessage};
+use super::types::{WebSocketCloseInfo, WebSocketCloseInitiator, WebSocketId, WebSocketMessage};
 use super::{ResolvedWebSocketConfig, WebSocketError, WsError};
 
 type WebSocketTransport = WebSocketStream<TokioIo<Upgraded>>;
@@ -60,12 +60,34 @@ pub(crate) async fn spawn(
     permit: ConnectionPermit,
 ) -> DriverTask {
     let runtime = permit.runtime();
+    let id = permit.id();
+    let route = socket.route().to_string();
+    let remote_addr = socket.remote_addr();
+    let protocol = socket.protocol().map(str::to_string);
     let io = TokioIo::new(upgraded);
     let stream =
         WebSocketStream::from_raw_socket(io, Role::Server, Some(config.tungstenite_config())).await;
     let (start_tx, start_rx) = oneshot::channel();
     let (driver_start_tx, driver_start_rx) = oneshot::channel();
-    let driver = tokio::spawn(run(stream, config, channels, driver_start_rx, runtime));
+    let driver_future = run(stream, config, channels, driver_start_rx, runtime, id);
+    #[cfg(feature = "tracing")]
+    let driver = {
+        use tracing::Instrument;
+
+        let span = tracing::info_span!(
+            "websocket.connection",
+            ws.id = %id,
+            ws.route = %route,
+            ws.remote_addr = ?remote_addr,
+            ws.protocol = ?protocol,
+        );
+        tokio::spawn(driver_future.instrument(span))
+    };
+    #[cfg(not(feature = "tracing"))]
+    let driver = {
+        let _ = (route, remote_addr, protocol);
+        tokio::spawn(driver_future)
+    };
     let abort_handle = driver.abort_handle();
     tokio::spawn(supervise(
         start_rx,
@@ -88,6 +110,7 @@ async fn run(
     channels: DriverChannels,
     start_rx: oneshot::Receiver<DriverStart>,
     runtime: WebSocketRuntimeHandle,
+    id: WebSocketId,
 ) -> DriverOutcome {
     let mut shutdown_rx = runtime.subscribe_shutdown();
     let mut handler_done = match start_rx.await.unwrap_or(DriverStart::Rejected) {
@@ -107,6 +130,7 @@ async fn run(
             };
         }
     };
+    runtime.record_opened(id);
 
     let DriverChannels {
         inbound_tx,
@@ -122,10 +146,11 @@ async fn run(
         &mut control_rx,
         &mut handler_done,
         &mut sender_count_rx,
-        (&config, &runtime, &mut shutdown_rx),
+        (id, &config, &runtime, &mut shutdown_rx),
     )
     .await;
 
+    runtime.record_closed(id, &outcome.close_info);
     let _ = close_tx.send(Some(outcome.close_info.clone()));
     drop(inbound_tx);
     outcome
@@ -230,12 +255,13 @@ async fn drive(
     handler_done: &mut oneshot::Receiver<Result<(), WsError>>,
     sender_count_rx: &mut watch::Receiver<usize>,
     lifecycle: (
+        WebSocketId,
         &ResolvedWebSocketConfig,
         &WebSocketRuntimeHandle,
         &mut watch::Receiver<bool>,
     ),
 ) -> DriverOutcome {
-    let (config, runtime, shutdown_rx) = lifecycle;
+    let (id, config, runtime, shutdown_rx) = lifecycle;
     let mut control_open = true;
     let mut outbound_open = true;
     let mut handler_completed = false;
@@ -288,9 +314,12 @@ async fn drive(
                 }
                 if matches!(&command, ControlCommand::Close(_)) {
                     for message in take_queued_before_close(outbound_rx) {
+                        let bytes = message.len();
+                        let message_type = application_message_type(&message);
                         if let Err(error) = stream.send(message).await {
                             return protocol_outcome(inbound_tx, error);
                         }
+                        runtime.record_message(id, true, bytes, message_type);
                     }
                 }
                 match command {
@@ -325,7 +354,7 @@ async fn drive(
             }
 
             _ = wait_until(pong_deadline(&state, config)), if !state.close_sent => {
-                runtime.record_heartbeat_timeout();
+                runtime.record_heartbeat_timeout(id);
                 state.pending_ping = None;
                 close_command_channels(
                     control_rx,
@@ -403,9 +432,12 @@ async fn drive(
                     outbound_open = false;
                     continue;
                 };
+                let bytes = message.len();
+                let message_type = application_message_type(&message);
                 if let Err(error) = stream.send(message).await {
                     return protocol_outcome(inbound_tx, error);
                 }
+                runtime.record_message(id, true, bytes, message_type);
             }
 
             incoming = stream.next() => {
@@ -439,6 +471,12 @@ async fn drive(
                                 continue;
                             }
                             state.last_application_message = state.last_inbound_frame;
+                            runtime.record_message(
+                                id,
+                                false,
+                                message.len(),
+                                application_message_type(&message),
+                            );
                         }
                         if let WebSocketMessage::Pong(payload) = &message {
                             if state
@@ -469,6 +507,7 @@ async fn drive(
                             == InboundDelivery::TimedOut
                             && !state.close_sent
                         {
+                            runtime.record_saturated_send(id, false);
                             close_command_channels(
                                 control_rx,
                                 outbound_rx,
@@ -542,6 +581,9 @@ async fn drive(
 
             result = &mut *handler_done, if !handler_completed => {
                 handler_completed = true;
+                if matches!(&result, Ok(Err(_)) | Err(_)) {
+                    runtime.record_handler_failed(id);
+                }
                 match result {
                     Ok(Ok(())) if !state.close_sent => {
                         if *sender_count_rx.borrow() == 0 {
@@ -742,6 +784,10 @@ async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
     }
 }
 
+fn application_message_type(message: &WebSocketMessage) -> &'static str {
+    if message.is_text() { "text" } else { "binary" }
+}
+
 fn take_queued_before_close(
     outbound_rx: &mut mpsc::Receiver<OutboundCommand>,
 ) -> Vec<WebSocketMessage> {
@@ -817,7 +863,9 @@ mod tests {
     use super::*;
     use crate::app::websocket::runtime::WebSocketRuntimeHandle;
     use crate::app::websocket::socket::{SocketMetadata, channel_pair};
-    use crate::app::websocket::{ResolvedWebSocketConfig, WebSocketConfig};
+    use crate::app::websocket::{
+        ResolvedWebSocketConfig, WebSocketConfig, WebSocketObservation, WebSocketObserver,
+    };
 
     #[tokio::test]
     async fn close_drain_only_takes_the_initial_queue_snapshot() {
@@ -849,7 +897,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forced_driver_abort_cleans_handler_before_releasing_permit() {
+    async fn websocket_observer_forced_driver_abort_cleans_before_releasing_permit() {
+        struct RecordingObserver(Arc<Mutex<Vec<WebSocketId>>>);
+
+        impl WebSocketObserver for RecordingObserver {
+            fn observe(&self, event: &WebSocketObservation<'_>) {
+                if let WebSocketObservation::ForcedShutdown { id } = event {
+                    self.0.lock().unwrap().push(*id);
+                }
+            }
+        }
+
         struct HandlerGuard {
             runtime: WebSocketRuntimeHandle,
             cleanup_tx: mpsc::Sender<usize>,
@@ -864,6 +922,8 @@ mod tests {
         }
 
         let runtime = WebSocketRuntimeHandle::local();
+        let forced_shutdowns = Arc::new(Mutex::new(Vec::new()));
+        runtime.set_observer(Arc::new(RecordingObserver(forced_shutdowns.clone())));
         let config =
             ResolvedWebSocketConfig::from_layers(&WebSocketConfig::new(), &WebSocketConfig::new());
         let permit = runtime.admit("/ws", None, None, &config).unwrap();
@@ -918,11 +978,12 @@ mod tests {
         start_tx.send(true).unwrap();
         started.notified().await;
 
-        driver_abort.abort();
+        runtime.abort_remaining();
         supervisor.await.unwrap();
 
         assert_eq!(cleanup_rx.try_recv().unwrap(), 1);
         assert_eq!(runtime.stats().active_connections, 0);
         assert_eq!(runtime.stats().closed_connections, 1);
+        assert_eq!(*forced_shutdowns.lock().unwrap(), [id]);
     }
 }

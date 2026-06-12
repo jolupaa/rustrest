@@ -11,8 +11,8 @@ use tokio::task::AbortHandle;
 use super::ResolvedWebSocketConfig;
 use super::socket::{InternalWebSocketSender, validate_close};
 use super::types::{
-    WebSocketConnectionSnapshot, WebSocketId, WebSocketObservation, WebSocketObserver,
-    WebSocketStats,
+    WebSocketCloseInfo, WebSocketConnectionSnapshot, WebSocketId, WebSocketObservation,
+    WebSocketObserver, WebSocketStats,
 };
 use super::{WebSocketTimeout, WsError};
 
@@ -42,6 +42,7 @@ struct ConnectionEntry {
     close_timeout: Duration,
     internal_sender: Option<InternalWebSocketSender>,
     driver_abort: Option<AbortHandle>,
+    forced_shutdown_observed: bool,
 }
 
 #[derive(Default)]
@@ -49,6 +50,10 @@ struct WebSocketCounters {
     accepted_connections: u64,
     rejected_connections: u64,
     closed_connections: u64,
+    messages_received: u64,
+    messages_sent: u64,
+    bytes_received: u64,
+    bytes_sent: u64,
     saturated_sends: u64,
     heartbeat_timeouts: u64,
 }
@@ -114,6 +119,7 @@ impl WebSocketRuntimeHandle {
         }
     }
 
+    /// Returns one coherent snapshot of process-local WebSocket counters.
     pub fn stats(&self) -> WebSocketStats {
         let registry = self.registry();
         WebSocketStats {
@@ -121,12 +127,17 @@ impl WebSocketRuntimeHandle {
             accepted_connections: registry.counters.accepted_connections,
             rejected_connections: registry.counters.rejected_connections,
             closed_connections: registry.counters.closed_connections,
+            messages_received: registry.counters.messages_received,
+            messages_sent: registry.counters.messages_sent,
+            bytes_received: registry.counters.bytes_received,
+            bytes_sent: registry.counters.bytes_sent,
             saturated_sends: registry.counters.saturated_sends,
             heartbeat_timeouts: registry.counters.heartbeat_timeouts,
             ..WebSocketStats::default()
         }
     }
 
+    /// Returns active process-local connections sorted by ID.
     pub fn connections(&self) -> Vec<WebSocketConnectionSnapshot> {
         let registry = self.registry();
         let mut connections = registry
@@ -138,6 +149,7 @@ impl WebSocketRuntimeHandle {
         connections
     }
 
+    /// Returns metadata for one active process-local connection.
     pub fn connection(&self, id: WebSocketId) -> Option<WebSocketConnectionSnapshot> {
         let registry = self.registry();
         registry
@@ -146,6 +158,7 @@ impl WebSocketRuntimeHandle {
             .map(|entry| snapshot(id, entry))
     }
 
+    /// Replaces the process-local metadata observer.
     pub fn set_observer(&self, observer: Arc<dyn WebSocketObserver>) {
         *self
             .inner
@@ -205,6 +218,7 @@ impl WebSocketRuntimeHandle {
                             close_timeout: config.close_timeout,
                             internal_sender: None,
                             driver_abort: None,
+                            forced_shutdown_observed: false,
                         },
                     );
                     *registry.route_counts.entry(route).or_default() += 1;
@@ -254,6 +268,7 @@ impl WebSocketRuntimeHandle {
         registered
     }
 
+    /// Closes one process-local connection and waits for registry cleanup.
     pub async fn close(&self, id: WebSocketId, code: u16, reason: &str) -> Result<(), WsError> {
         validate_close(code, reason)?;
         let close_timeout = self
@@ -274,6 +289,9 @@ impl WebSocketRuntimeHandle {
         .map_err(|_| WsError::Timeout(WebSocketTimeout::Close))?
     }
 
+    /// Stops future WebSocket admission and drains active WebSockets.
+    ///
+    /// This does not stop the HTTP listener.
     pub async fn shutdown(&self) -> Result<(), WsError> {
         self.begin_shutdown().await;
         let grace = self.shutdown_grace_period();
@@ -315,13 +333,23 @@ impl WebSocketRuntimeHandle {
     }
 
     pub(crate) fn abort_remaining(&self) {
-        let abort_handles = self
-            .registry()
-            .connections
-            .values()
-            .filter_map(|entry| entry.driver_abort.clone())
-            .collect::<Vec<_>>();
-        for abort_handle in abort_handles {
+        let remaining = {
+            let mut registry = self.registry();
+            registry
+                .connections
+                .iter_mut()
+                .filter_map(|(&id, entry)| {
+                    let abort_handle = entry.driver_abort.clone()?;
+                    if entry.forced_shutdown_observed {
+                        return None;
+                    }
+                    entry.forced_shutdown_observed = true;
+                    Some((id, abort_handle))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (id, abort_handle) in remaining {
+            self.observe(&WebSocketObservation::ForcedShutdown { id });
             abort_handle.abort();
         }
     }
@@ -365,12 +393,58 @@ impl WebSocketRuntimeHandle {
         }
     }
 
-    pub(crate) fn record_saturated_send(&self) {
-        self.registry().counters.saturated_sends += 1;
+    pub(crate) fn record_opened(&self, id: WebSocketId) {
+        self.observe(&WebSocketObservation::Opened { id });
     }
 
-    pub(crate) fn record_heartbeat_timeout(&self) {
+    pub(crate) fn record_message(
+        &self,
+        id: WebSocketId,
+        outbound: bool,
+        bytes: usize,
+        message_type: &'static str,
+    ) {
+        {
+            let mut registry = self.registry();
+            let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+            if outbound {
+                registry.counters.messages_sent = registry.counters.messages_sent.saturating_add(1);
+                registry.counters.bytes_sent = registry.counters.bytes_sent.saturating_add(bytes);
+            } else {
+                registry.counters.messages_received =
+                    registry.counters.messages_received.saturating_add(1);
+                registry.counters.bytes_received =
+                    registry.counters.bytes_received.saturating_add(bytes);
+            }
+        }
+        self.observe(&WebSocketObservation::Message {
+            id,
+            outbound,
+            bytes,
+        });
+        trace_websocket_message(id, outbound, bytes, message_type);
+    }
+
+    pub(crate) fn record_saturated_send(&self, id: WebSocketId, outbound: bool) {
+        self.registry().counters.saturated_sends += 1;
+        self.observe(&WebSocketObservation::QueueSaturated { id, outbound });
+    }
+
+    pub(crate) fn record_heartbeat_timeout(&self, id: WebSocketId) {
         self.registry().counters.heartbeat_timeouts += 1;
+        self.observe(&WebSocketObservation::HeartbeatTimeout { id });
+    }
+
+    pub(crate) fn record_closed(&self, id: WebSocketId, close_info: &WebSocketCloseInfo) {
+        self.observe(&WebSocketObservation::Closed {
+            id,
+            code: Some(close_info.code),
+            clean: close_info.clean,
+        });
+    }
+
+    pub(crate) fn record_handler_failed(&self, id: WebSocketId) {
+        self.observe(&WebSocketObservation::HandlerFailed { id });
     }
 
     fn release(&self, id: WebSocketId) {
@@ -409,8 +483,68 @@ impl WebSocketRuntimeHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         let _ = catch_unwind(AssertUnwindSafe(|| observer.observe(event)));
+        trace_websocket_observation(event);
     }
 }
+
+#[cfg(feature = "tracing")]
+fn trace_websocket_message(
+    id: WebSocketId,
+    outbound: bool,
+    bytes: usize,
+    message_type: &'static str,
+) {
+    tracing::debug!(
+        ws.id = %id,
+        ws.outbound = outbound,
+        ws.message_type = message_type,
+        ws.bytes = bytes,
+        "websocket message"
+    );
+}
+
+#[cfg(not(feature = "tracing"))]
+fn trace_websocket_message(
+    _id: WebSocketId,
+    _outbound: bool,
+    _bytes: usize,
+    _message_type: &'static str,
+) {
+}
+
+#[cfg(feature = "tracing")]
+fn trace_websocket_observation(event: &WebSocketObservation<'_>) {
+    match event {
+        WebSocketObservation::Accepted { id, route } => {
+            tracing::debug!(ws.id = %id, ws.route = *route, "websocket accepted");
+        }
+        WebSocketObservation::Rejected { route, reason } => {
+            tracing::warn!(ws.route = *route, ws.reason = *reason, "websocket rejected");
+        }
+        WebSocketObservation::Opened { id } => {
+            tracing::info!(ws.id = %id, "websocket opened");
+        }
+        WebSocketObservation::Message { .. } => {}
+        WebSocketObservation::QueueSaturated { id, outbound } => {
+            tracing::warn!(ws.id = %id, ws.outbound = outbound, "websocket queue saturated");
+        }
+        WebSocketObservation::HeartbeatTimeout { id } => {
+            tracing::warn!(ws.id = %id, "websocket heartbeat timed out");
+        }
+        WebSocketObservation::Closed { id, code, clean } => {
+            tracing::info!(ws.id = %id, ws.code = ?code, ws.clean = clean, "websocket closed");
+        }
+        WebSocketObservation::HandlerFailed { id } => {
+            tracing::error!(ws.id = %id, "websocket handler failed");
+        }
+        WebSocketObservation::ForcedShutdown { id } => {
+            tracing::warn!(ws.id = %id, "websocket force-aborted during shutdown");
+        }
+    }
+}
+
+#[cfg(not(feature = "tracing"))]
+fn trace_websocket_observation(_event: &WebSocketObservation<'_>) {}
 
 impl Drop for ConnectionPermit {
     fn drop(&mut self) {

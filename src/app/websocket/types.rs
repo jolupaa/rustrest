@@ -64,11 +64,49 @@ pub struct WebSocketStats {
 
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
+/// Metadata emitted by the WebSocket runtime. Message payloads are never
+/// included; message events expose only direction and encoded byte length.
 pub enum WebSocketObservation<'a> {
-    Accepted { id: WebSocketId, route: &'a str },
-    Rejected { route: &'a str, reason: &'a str },
+    Accepted {
+        id: WebSocketId,
+        route: &'a str,
+    },
+    Rejected {
+        route: &'a str,
+        reason: &'a str,
+    },
+    Opened {
+        id: WebSocketId,
+    },
+    Message {
+        id: WebSocketId,
+        outbound: bool,
+        bytes: usize,
+    },
+    QueueSaturated {
+        id: WebSocketId,
+        outbound: bool,
+    },
+    HeartbeatTimeout {
+        id: WebSocketId,
+    },
+    Closed {
+        id: WebSocketId,
+        code: Option<u16>,
+        clean: bool,
+    },
+    HandlerFailed {
+        id: WebSocketId,
+    },
+    ForcedShutdown {
+        id: WebSocketId,
+    },
 }
 
+/// Receives synchronous WebSocket runtime metadata callbacks.
+///
+/// Implementations should return quickly and must move expensive work onto
+/// their own bounded queue. Observer panics are isolated from connections.
 pub trait WebSocketObserver: Send + Sync + 'static {
     fn observe(&self, _event: &WebSocketObservation<'_>) {}
 }

@@ -374,7 +374,9 @@ impl WebSocketSender {
                     self.shared.outbound.clone().try_reserve_owned().map_err(
                         |error| match error {
                             mpsc::error::TrySendError::Full(_) => {
-                                self.shared.runtime.record_saturated_send();
+                                self.shared
+                                    .runtime
+                                    .record_saturated_send(self.shared.id, true);
                                 WsError::Capacity(WebSocketCapacityError::OutboundQueue)
                             }
                             mpsc::error::TrySendError::Closed(_) => WsError::Closed,
@@ -464,7 +466,9 @@ impl WebSocketSender {
                 )
                 .await
                 .map_err(|_| {
-                    self.shared.runtime.record_saturated_send();
+                    self.shared
+                        .runtime
+                        .record_saturated_send(self.shared.id, true);
                     WsError::Timeout(WebSocketTimeout::Send)
                 })?
                 .map_err(|_| WsError::Closed)?;
@@ -498,7 +502,9 @@ impl WebSocketSender {
             .try_send(command)
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => {
-                    self.shared.runtime.record_saturated_send();
+                    self.shared
+                        .runtime
+                        .record_saturated_send(self.shared.id, true);
                     WsError::Capacity(WebSocketCapacityError::OutboundQueue)
                 }
                 mpsc::error::TrySendError::Closed(_) => WsError::Closed,

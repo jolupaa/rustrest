@@ -1,10 +1,11 @@
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use rustrest::{
     App, BackpressurePolicy, WebSocketCapacityError, WebSocketConfig, WebSocketEvent,
-    WebSocketRuntimeHandle, WsError,
+    WebSocketObservation, WebSocketObserver, WebSocketRuntimeHandle, WsError,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,6 +19,37 @@ const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 
 struct ServerGuard(JoinHandle<()>);
+
+#[derive(Clone)]
+struct RecordingObserver(Arc<Mutex<Vec<String>>>);
+
+impl WebSocketObserver for RecordingObserver {
+    fn observe(&self, event: &WebSocketObservation<'_>) {
+        let value = match event {
+            WebSocketObservation::Accepted { id, route } => format!("accepted:{id}:{route}"),
+            WebSocketObservation::Rejected { route, reason } => {
+                format!("rejected:{route}:{reason}")
+            }
+            WebSocketObservation::Opened { id } => format!("opened:{id}"),
+            WebSocketObservation::Message {
+                id,
+                outbound,
+                bytes,
+            } => format!("message:{id}:{outbound}:{bytes}"),
+            WebSocketObservation::QueueSaturated { id, outbound } => {
+                format!("queue:{id}:{outbound}")
+            }
+            WebSocketObservation::HeartbeatTimeout { id } => format!("heartbeat:{id}"),
+            WebSocketObservation::Closed { id, code, clean } => {
+                format!("closed:{id}:{code:?}:{clean}")
+            }
+            WebSocketObservation::HandlerFailed { id } => format!("handler_failed:{id}"),
+            WebSocketObservation::ForcedShutdown { id } => format!("forced_shutdown:{id}"),
+            _ => return,
+        };
+        self.0.lock().unwrap().push(value);
+    }
+}
 
 impl Drop for ServerGuard {
     fn drop(&mut self) {
@@ -120,6 +152,249 @@ async fn raw_websocket(addr: SocketAddr) -> TcpStream {
     })
     .await
     .expect("raw websocket handshake should complete before the deadline")
+}
+
+#[tokio::test]
+async fn websocket_runtime_stats_and_observer_record_message_metadata() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let release = Arc::new(Semaphore::new(0));
+    let observer_events = observations.clone();
+    let handler_release = release.clone();
+    let (addr, runtime, _server) = spawn_app_with_runtime(move |app| {
+        app.websocket_observer(Arc::new(RecordingObserver(observer_events)));
+        app.websocket_with(
+            "/ws",
+            WebSocketConfig::new().protocols(&["superchat"]),
+            move |mut socket| {
+                let handler_release = handler_release.clone();
+                async move {
+                    if let Some(message) = socket.recv().await.unwrap() {
+                        socket.send(message).await.unwrap();
+                    }
+                    handler_release.acquire().await.unwrap().forget();
+                }
+            },
+        );
+    })
+    .await;
+
+    let mut request = format!("ws://{addr}/ws").into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("sec-websocket-protocol", "superchat".parse().unwrap());
+    let (mut client, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    wait_for_connections(&runtime, 1, 0).await;
+
+    let snapshot = runtime.connections().pop().unwrap();
+    assert_eq!(snapshot.route, "/ws");
+    assert!(snapshot.remote_addr.is_some());
+    assert_eq!(snapshot.protocol.as_deref(), Some("superchat"));
+    assert!(snapshot.opened_at <= SystemTime::now());
+
+    let payload = "contenido-privado";
+    client.send(Message::Text(payload.into())).await.unwrap();
+    let echo = tokio::time::timeout(IO_TIMEOUT, client.next())
+        .await
+        .expect("echo should arrive before the deadline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(echo.into_text().unwrap(), payload);
+    release.add_permits(1);
+    let close = receive_close_frame(&mut client).await;
+    assert_eq!(u16::from(close.code), 1000);
+    client.flush().await.unwrap();
+    wait_for_connections(&runtime, 0, 1).await;
+
+    let stats = runtime.stats();
+    assert_eq!(stats.messages_received, 1);
+    assert_eq!(stats.messages_sent, 1);
+    assert_eq!(stats.bytes_received, payload.len() as u64);
+    assert_eq!(stats.bytes_sent, payload.len() as u64);
+
+    let events = observations.lock().unwrap().clone();
+    let id = snapshot.id.to_string();
+    assert!(events.iter().any(|event| event == &format!("opened:{id}")));
+    assert!(
+        events
+            .iter()
+            .any(|event| event == &format!("message:{id}:false:{}", payload.len()))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event == &format!("message:{id}:true:{}", payload.len()))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.starts_with(&format!("closed:{id}:")))
+    );
+    assert!(events.iter().all(|event| !event.contains(payload)));
+}
+
+#[tokio::test]
+async fn websocket_runtime_stats_count_messages_flushed_before_local_close() {
+    let (addr, runtime, _server) = spawn_app_with_runtime(|app| {
+        app.websocket("/ws", |socket| async move {
+            let (_receiver, sender) = socket.split();
+            sender.try_send(Message::Text("antes".into())).unwrap();
+            sender.close().await.unwrap();
+        });
+    })
+    .await;
+    let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    let message = tokio::time::timeout(IO_TIMEOUT, client.next())
+        .await
+        .expect("queued message should arrive before close")
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.into_text().unwrap(), "antes");
+    let close = receive_close_frame(&mut client).await;
+    assert_eq!(u16::from(close.code), 1000);
+    client.flush().await.unwrap();
+    wait_for_connections(&runtime, 0, 1).await;
+
+    let stats = runtime.stats();
+    assert_eq!(stats.messages_sent, 1);
+    assert_eq!(stats.bytes_sent, 5);
+}
+
+#[tokio::test]
+async fn websocket_observer_panic_does_not_break_echo() {
+    struct PanickingObserver;
+
+    impl WebSocketObserver for PanickingObserver {
+        fn observe(&self, _event: &WebSocketObservation<'_>) {
+            panic!("observer panic");
+        }
+    }
+
+    let (addr, _server) = spawn_app(|app| {
+        app.websocket_observer(Arc::new(PanickingObserver));
+        app.websocket("/ws", |mut socket| async move {
+            if let Some(message) = socket.recv().await.unwrap() {
+                socket.send(message).await.unwrap();
+            }
+        });
+    })
+    .await;
+    let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    client.send(Message::Text("eco".into())).await.unwrap();
+    let echo = tokio::time::timeout(IO_TIMEOUT, client.next())
+        .await
+        .expect("observer panic must not block echo")
+        .unwrap()
+        .unwrap();
+    assert_eq!(echo.into_text().unwrap(), "eco");
+}
+
+#[cfg(feature = "tracing")]
+#[tokio::test]
+async fn websocket_observer_tracing_records_metadata_without_payload() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    struct FieldVisitor<'a>(&'a Arc<Mutex<Vec<String>>>);
+
+    impl Visit for FieldVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{}={value:?}", field.name()));
+        }
+    }
+
+    struct CapturingSubscriber {
+        fields: Arc<Mutex<Vec<String>>>,
+        next_id: AtomicU64,
+    }
+
+    impl Subscriber for CapturingSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, attributes: &Attributes<'_>) -> Id {
+            self.fields
+                .lock()
+                .unwrap()
+                .push(format!("span={}", attributes.metadata().name()));
+            attributes.record(&mut FieldVisitor(&self.fields));
+            Id::from_u64(self.next_id.fetch_add(1, Ordering::Relaxed))
+        }
+
+        fn record(&self, _span: &Id, values: &Record<'_>) {
+            values.record(&mut FieldVisitor(&self.fields));
+        }
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            self.fields
+                .lock()
+                .unwrap()
+                .push(format!("event={}", event.metadata().name()));
+            event.record(&mut FieldVisitor(&self.fields));
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    let fields = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = CapturingSubscriber {
+        fields: fields.clone(),
+        next_id: AtomicU64::new(1),
+    };
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+    let mut app = App::new();
+    app.websocket("/ws", |mut socket| async move {
+        if let Some(message) = socket.recv().await.unwrap() {
+            socket.send(message).await.unwrap();
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(app.serve(listener));
+    let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    let payload = "contenido-ultrasecreto";
+    client.send(Message::Text(payload.into())).await.unwrap();
+    let _ = tokio::time::timeout(IO_TIMEOUT, client.next())
+        .await
+        .expect("echo should arrive before the deadline")
+        .unwrap()
+        .unwrap();
+    let _ = receive_close_frame(&mut client).await;
+    client.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    server.abort();
+
+    let fields = fields.lock().unwrap();
+    assert!(
+        fields
+            .iter()
+            .any(|field| field == "span=websocket.connection"),
+        "captured tracing fields: {fields:?}"
+    );
+    assert!(fields.iter().any(|field| field.starts_with("ws.id=")));
+    assert!(fields.iter().any(|field| field == "ws.route=\"/ws\""));
+    assert!(fields.iter().any(|field| field.starts_with("ws.bytes=")));
+    assert!(fields.iter().all(|field| !field.contains(payload)));
 }
 
 #[tokio::test]
@@ -582,9 +857,12 @@ async fn websocket_runtime_releases_permit_after_transport_close() {
 }
 
 #[tokio::test]
-async fn websocket_backpressure_disconnect_closes_slow_consumer_with_1013() {
+async fn websocket_observer_records_queue_saturation_for_slow_consumer() {
     let (saturated_tx, mut saturated_rx) = tokio::sync::mpsc::unbounded_channel();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let observer_events = observations.clone();
     let (addr, runtime, _server) = spawn_app_with_runtime(move |app| {
+        app.websocket_observer(Arc::new(RecordingObserver(observer_events)));
         app.websocket_with(
             "/ws",
             WebSocketConfig::new()
@@ -639,6 +917,13 @@ async fn websocket_backpressure_disconnect_closes_slow_consumer_with_1013() {
     let stats = runtime.stats();
     assert_eq!(stats.saturated_sends, 1);
     assert_eq!(stats.closed_connections, 1);
+    assert!(
+        observations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.starts_with("queue:") && event.ends_with(":true"))
+    );
 }
 
 async fn receive_close_frame(
@@ -725,8 +1010,11 @@ async fn websocket_heartbeat_matching_pong_keeps_connection_alive() {
 }
 
 #[tokio::test]
-async fn websocket_heartbeat_missing_pong_closes_with_1001() {
-    let (addr, runtime, _server) = spawn_app_with_runtime(|app| {
+async fn websocket_observer_records_heartbeat_timeout() {
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let observer_events = observations.clone();
+    let (addr, runtime, _server) = spawn_app_with_runtime(move |app| {
+        app.websocket_observer(Arc::new(RecordingObserver(observer_events)));
         app.websocket_with(
             "/ws",
             WebSocketConfig::new()
@@ -752,6 +1040,13 @@ async fn websocket_heartbeat_missing_pong_closes_with_1001() {
     assert_eq!(u16::from(close.code), 1001);
     wait_for_connections(&runtime, 0, 1).await;
     assert_eq!(runtime.stats().heartbeat_timeouts, 1);
+    assert!(
+        observations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.starts_with("heartbeat:"))
+    );
 }
 
 #[tokio::test]
@@ -927,10 +1222,13 @@ async fn websocket_close_waits_for_peer_after_handler_returns() {
 }
 
 #[tokio::test]
-async fn websocket_handler_panic_closes_only_that_connection_with_1011() {
+async fn websocket_observer_records_handler_panic_and_isolates_connection() {
     let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let handler_attempts = attempts.clone();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let observer_events = observations.clone();
     let (addr, _server) = spawn_app(move |app| {
+        app.websocket_observer(Arc::new(RecordingObserver(observer_events)));
         let handler_attempts = handler_attempts.clone();
         app.websocket("/ws", move |mut socket| {
             let attempt = handler_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -966,6 +1264,13 @@ async fn websocket_handler_panic_closes_only_that_connection_with_1011() {
         .unwrap()
         .unwrap();
     assert_eq!(echo.into_text().unwrap(), "healthy");
+    assert!(
+        observations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.starts_with("handler_failed:"))
+    );
 }
 
 #[tokio::test]
