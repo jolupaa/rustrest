@@ -323,9 +323,11 @@ impl WebSocketSender {
     }
 
     pub async fn close_with(&self, code: u16, reason: impl Into<String>) -> Result<(), WsError> {
+        let reason = reason.into();
+        validate_close(code, &reason)?;
         let frame = CloseFrame {
             code: CloseCode::from(code),
-            reason: reason.into().into(),
+            reason: reason.into(),
         };
         self.send_control(ControlCommand::Close(Some(frame))).await
     }
@@ -426,6 +428,26 @@ impl WebSocketReceiver {
     pub async fn closed(&mut self) -> WebSocketCloseInfo {
         wait_for_close(&mut self.close_rx).await
     }
+}
+
+fn validate_close(code: u16, reason: &str) -> Result<(), WsError> {
+    let valid_code = matches!(
+        code,
+        1000 | 1001 | 1002 | 1003 | 1007 | 1008 | 1009 | 1010 | 1011 | 1012 | 1013
+    ) || (3000..=4999).contains(&code);
+    if !valid_code {
+        return Err(WsError::InvalidClose {
+            code,
+            reason: "codigo de cierre reservado o no asignado".to_string(),
+        });
+    }
+    if reason.len() > 123 {
+        return Err(WsError::InvalidClose {
+            code,
+            reason: "la razon de cierre supera 123 bytes UTF-8".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn compatibility_error(error: WsError) -> WebSocketError {
@@ -596,5 +618,26 @@ mod tests {
 
         assert_eq!(sender.closed().await, expected);
         assert_eq!(receiver.closed().await, expected);
+    }
+
+    #[tokio::test]
+    async fn websocket_close_code_rejects_reserved_codes() {
+        let (sender, _channels, _runtime) =
+            sender_with_policy(BackpressurePolicy::Wait, Duration::from_secs(1));
+
+        let error = sender.close_with(1005, "reservado").await.unwrap_err();
+
+        assert!(matches!(error, WsError::InvalidClose { code: 1005, .. }));
+    }
+
+    #[tokio::test]
+    async fn websocket_close_code_rejects_reasons_over_123_bytes() {
+        let (sender, _channels, _runtime) =
+            sender_with_policy(BackpressurePolicy::Wait, Duration::from_secs(1));
+        let reason = "á".repeat(62);
+
+        let error = sender.close_with(1000, reason).await.unwrap_err();
+
+        assert!(matches!(error, WsError::InvalidClose { code: 1000, .. }));
     }
 }

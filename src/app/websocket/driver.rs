@@ -1,4 +1,5 @@
 use std::future::pending;
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use hyper::body::Bytes;
@@ -8,10 +9,11 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::Instant;
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::error::CapacityError;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role};
 
-use super::runtime::ConnectionPermit;
+use super::runtime::{ConnectionPermit, WebSocketRuntimeHandle};
 use super::socket::{WebSocket, WebSocketHandler};
 use super::types::{WebSocketCloseInfo, WebSocketCloseInitiator, WebSocketMessage};
 use super::{ResolvedWebSocketConfig, WebSocketError};
@@ -56,12 +58,13 @@ pub(crate) async fn spawn(
     channels: DriverChannels,
     permit: ConnectionPermit,
 ) -> DriverTask {
+    let runtime = permit.runtime();
     let io = TokioIo::new(upgraded);
     let stream =
         WebSocketStream::from_raw_socket(io, Role::Server, Some(config.tungstenite_config())).await;
     let (start_tx, start_rx) = oneshot::channel();
     let (driver_start_tx, driver_start_rx) = oneshot::channel();
-    let driver = tokio::spawn(run(stream, config, channels, driver_start_rx));
+    let driver = tokio::spawn(run(stream, config, channels, driver_start_rx, runtime));
     let abort_handle = driver.abort_handle();
     tokio::spawn(supervise(
         start_rx,
@@ -83,6 +86,7 @@ async fn run(
     config: ResolvedWebSocketConfig,
     channels: DriverChannels,
     start_rx: oneshot::Receiver<DriverStart>,
+    runtime: WebSocketRuntimeHandle,
 ) -> DriverOutcome {
     let mut handler_done = match start_rx.await.unwrap_or(DriverStart::Rejected) {
         DriverStart::Registered(handler_done) => handler_done,
@@ -114,7 +118,8 @@ async fn run(
         &mut outbound_rx,
         &mut control_rx,
         &mut handler_done,
-        config.ping_interval,
+        &config,
+        &runtime,
     )
     .await;
 
@@ -172,18 +177,57 @@ struct DriverOutcome {
     handler_completed: bool,
 }
 
+struct DriverState {
+    close_sent: bool,
+    close_received: bool,
+    close_info: Option<WebSocketCloseInfo>,
+    close_deadline: Option<Instant>,
+    pending_ping: Option<(Bytes, Instant)>,
+    last_inbound_frame: Instant,
+    last_application_message: Instant,
+    opened_at: Instant,
+    next_ping_token: u64,
+}
+
+impl DriverState {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            close_sent: false,
+            close_received: false,
+            close_info: None,
+            close_deadline: None,
+            pending_ping: None,
+            last_inbound_frame: now,
+            last_application_message: now,
+            opened_at: now,
+            next_ping_token: 1,
+        }
+    }
+
+    fn outcome(&self, handler_completed: bool) -> DriverOutcome {
+        let mut close_info = self.close_info.clone().unwrap_or_else(peer_disconnect_info);
+        close_info.clean = self.close_sent && self.close_received;
+        DriverOutcome {
+            close_info,
+            handler_completed,
+        }
+    }
+}
+
 async fn drive(
     stream: &mut WebSocketTransport,
     inbound_tx: &mpsc::Sender<Result<WebSocketMessage, WebSocketError>>,
     outbound_rx: &mut mpsc::Receiver<OutboundCommand>,
     control_rx: &mut mpsc::Receiver<ControlCommand>,
     handler_done: &mut oneshot::Receiver<()>,
-    ping_interval: Option<std::time::Duration>,
+    config: &ResolvedWebSocketConfig,
+    runtime: &WebSocketRuntimeHandle,
 ) -> DriverOutcome {
     let mut control_open = true;
     let mut outbound_open = true;
-    let mut pending_close = None;
-    let mut next_ping = ping_interval.map(|interval| Instant::now() + interval);
+    let mut handler_completed = false;
+    let mut state = DriverState::new();
 
     loop {
         tokio::select! {
@@ -195,38 +239,130 @@ async fn drive(
                     continue;
                 };
                 let disconnect = matches!(&command, ControlCommand::Disconnect(_));
+                if state.close_sent {
+                    continue;
+                }
+                if matches!(&command, ControlCommand::Close(_) | ControlCommand::Disconnect(_)) {
+                    close_command_channels(
+                        control_rx,
+                        outbound_rx,
+                        &mut control_open,
+                        &mut outbound_open,
+                    );
+                }
                 if matches!(&command, ControlCommand::Close(_)) {
-                    outbound_rx.close();
-                    outbound_open = false;
                     for message in take_queued_before_close(outbound_rx) {
                         if let Err(error) = stream.send(message).await {
                             return protocol_outcome(inbound_tx, error);
                         }
                     }
                 }
-                if let ControlCommand::Close(frame) | ControlCommand::Disconnect(frame) = &command {
-                    pending_close = Some(close_info(
-                        frame.as_ref(),
-                        if disconnect {
+                match command {
+                    ControlCommand::Close(frame) | ControlCommand::Disconnect(frame) => {
+                        let initiator = if disconnect {
                             WebSocketCloseInitiator::Runtime
                         } else {
                             WebSocketCloseInitiator::Local
-                        },
-                        false,
-                    ));
-                }
-                if let Err(error) = write_control(stream, command).await {
-                    return protocol_outcome(inbound_tx, error);
-                }
-                if disconnect {
-                    return DriverOutcome {
-                        close_info: pending_close.unwrap_or_else(runtime_close_info),
-                        handler_completed: false,
-                    };
+                        };
+                        if let Err(error) = initiate_close(
+                            stream,
+                            &mut state,
+                            frame,
+                            initiator,
+                            config.close_timeout,
+                        )
+                        .await
+                        {
+                            return protocol_outcome(inbound_tx, error);
+                        }
+                    }
+                    command => {
+                        if let Err(error) = write_control(stream, command).await {
+                            return protocol_outcome(inbound_tx, error);
+                        }
+                    }
                 }
             }
 
-            command = outbound_rx.recv(), if outbound_open => {
+            _ = wait_until(state.close_deadline), if state.close_sent => {
+                return state.outcome(handler_completed);
+            }
+
+            _ = wait_until(pong_deadline(&state, config)), if !state.close_sent => {
+                runtime.record_heartbeat_timeout();
+                state.pending_ping = None;
+                close_command_channels(
+                    control_rx,
+                    outbound_rx,
+                    &mut control_open,
+                    &mut outbound_open,
+                );
+                let frame = CloseFrame {
+                    code: CloseCode::Away,
+                    reason: "Tiempo de espera de Pong agotado".into(),
+                };
+                if let Err(error) = initiate_close(
+                    stream,
+                    &mut state,
+                    Some(frame),
+                    WebSocketCloseInitiator::Timeout,
+                    config.close_timeout,
+                )
+                .await
+                {
+                    return protocol_outcome(inbound_tx, error);
+                }
+            }
+
+            _ = wait_until(lifetime_deadline(&state, config)), if !state.close_sent => {
+                close_command_channels(
+                    control_rx,
+                    outbound_rx,
+                    &mut control_open,
+                    &mut outbound_open,
+                );
+                let frame = CloseFrame {
+                    code: CloseCode::Away,
+                    reason: "Duracion maxima de conexion agotada".into(),
+                };
+                if let Err(error) = initiate_close(
+                    stream,
+                    &mut state,
+                    Some(frame),
+                    WebSocketCloseInitiator::Timeout,
+                    config.close_timeout,
+                )
+                .await
+                {
+                    return protocol_outcome(inbound_tx, error);
+                }
+            }
+
+            _ = wait_until(idle_deadline(&state, config)), if !state.close_sent => {
+                close_command_channels(
+                    control_rx,
+                    outbound_rx,
+                    &mut control_open,
+                    &mut outbound_open,
+                );
+                let frame = CloseFrame {
+                    code: CloseCode::Away,
+                    reason: "Tiempo de inactividad agotado".into(),
+                };
+                if let Err(error) = initiate_close(
+                    stream,
+                    &mut state,
+                    Some(frame),
+                    WebSocketCloseInitiator::Timeout,
+                    config.close_timeout,
+                )
+                .await
+                {
+                    return protocol_outcome(inbound_tx, error);
+                }
+            }
+
+            command = outbound_rx.recv(), if outbound_open && !state.close_sent => {
                 let Some(OutboundCommand::Message(message)) = command else {
                     outbound_open = false;
                     continue;
@@ -239,8 +375,18 @@ async fn drive(
             incoming = stream.next() => {
                 match incoming {
                     Some(Ok(message)) => {
-                        if let Some(interval) = ping_interval {
-                            next_ping = Some(Instant::now() + interval);
+                        state.last_inbound_frame = Instant::now();
+                        if message.is_text() || message.is_binary() {
+                            state.last_application_message = state.last_inbound_frame;
+                        }
+                        if let WebSocketMessage::Pong(payload) = &message {
+                            if state
+                                .pending_ping
+                                .as_ref()
+                                .is_some_and(|(expected, _)| expected == payload)
+                            {
+                                state.pending_ping = None;
+                            }
                         }
                         if message.is_ping() || message.is_close() {
                             if let Err(error) = stream.flush().await {
@@ -248,48 +394,188 @@ async fn drive(
                             }
                         }
                         if let WebSocketMessage::Close(frame) = &message {
-                            pending_close = Some(close_info(
-                                frame.as_ref(),
-                                WebSocketCloseInitiator::Peer,
-                                true,
-                            ));
+                            state.close_received = true;
+                            if state.close_info.is_none() {
+                                state.close_info = Some(close_info(
+                                    frame.as_ref(),
+                                    WebSocketCloseInitiator::Peer,
+                                    true,
+                                ));
+                            }
+                            state.close_sent = true;
                         }
-                        if !inbound_tx.is_closed() {
-                            let _ = inbound_tx.send(Ok(message)).await;
+                        if deliver_inbound(inbound_tx, message, config.send_timeout).await
+                            == InboundDelivery::TimedOut
+                            && !state.close_sent
+                        {
+                            close_command_channels(
+                                control_rx,
+                                outbound_rx,
+                                &mut control_open,
+                                &mut outbound_open,
+                            );
+                            let frame = CloseFrame {
+                                code: CloseCode::Policy,
+                                reason: "El handler WebSocket no consume mensajes a tiempo".into(),
+                            };
+                            if let Err(error) = initiate_close(
+                                stream,
+                                &mut state,
+                                Some(frame),
+                                WebSocketCloseInitiator::Runtime,
+                                config.close_timeout,
+                            )
+                            .await
+                            {
+                                return protocol_outcome(inbound_tx, error);
+                            }
+                        }
+                        if state.close_received {
+                            return state.outcome(handler_completed);
                         }
                     }
                     Some(Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed))
-                        if pending_close.is_some() =>
+                        if state.close_sent =>
                     {
-                        return DriverOutcome {
-                            close_info: pending_close.expect("el cierre pendiente fue comprobado"),
-                            handler_completed: false,
+                        state.close_received = true;
+                        return state.outcome(handler_completed);
+                    }
+                    Some(Err(tokio_tungstenite::tungstenite::Error::Capacity(
+                        CapacityError::MessageTooLong { .. },
+                    ))) => {
+                        close_command_channels(
+                            control_rx,
+                            outbound_rx,
+                            &mut control_open,
+                            &mut outbound_open,
+                        );
+                        let frame = CloseFrame {
+                            code: CloseCode::Size,
+                            reason: "Mensaje WebSocket demasiado grande".into(),
                         };
+                        if let Err(error) = initiate_close(
+                            stream,
+                            &mut state,
+                            Some(frame),
+                            WebSocketCloseInitiator::ProtocolError,
+                            config.close_timeout,
+                        )
+                        .await
+                        {
+                            return protocol_outcome(inbound_tx, error);
+                        }
                     }
                     Some(Err(error)) => return protocol_outcome(inbound_tx, error),
-                    None => {
-                        return DriverOutcome {
-                            close_info: pending_close.unwrap_or_else(peer_disconnect_info),
-                            handler_completed: false,
-                        };
-                    }
+                    None => return state.outcome(handler_completed),
                 }
             }
 
-            _ = wait_for_ping(next_ping) => {
-                if let Err(error) = stream.send(WebSocketMessage::Ping(Bytes::new())).await {
+            _ = wait_until(ping_deadline(&state, config)), if !state.close_sent => {
+                let payload = Bytes::copy_from_slice(&state.next_ping_token.to_be_bytes());
+                state.next_ping_token = state.next_ping_token.wrapping_add(1);
+                if let Err(error) = stream.send(WebSocketMessage::Ping(payload.clone())).await {
                     return protocol_outcome(inbound_tx, error);
                 }
-                next_ping = ping_interval.map(|interval| Instant::now() + interval);
+                state.pending_ping = Some((payload, Instant::now()));
             }
 
-            _ = &mut *handler_done => {
-                return DriverOutcome {
-                    close_info: pending_close.unwrap_or_else(handler_close_info),
-                    handler_completed: true,
-                };
+            _ = &mut *handler_done, if !handler_completed => {
+                handler_completed = true;
+                if !state.close_sent {
+                    return DriverOutcome {
+                        close_info: state.close_info.unwrap_or_else(handler_close_info),
+                        handler_completed: true,
+                    };
+                }
             }
         }
+    }
+}
+
+fn close_command_channels(
+    control_rx: &mut mpsc::Receiver<ControlCommand>,
+    outbound_rx: &mut mpsc::Receiver<OutboundCommand>,
+    control_open: &mut bool,
+    outbound_open: &mut bool,
+) {
+    control_rx.close();
+    outbound_rx.close();
+    *control_open = false;
+    *outbound_open = false;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InboundDelivery {
+    Delivered,
+    ReceiverClosed,
+    TimedOut,
+}
+
+async fn deliver_inbound(
+    inbound_tx: &mpsc::Sender<Result<WebSocketMessage, WebSocketError>>,
+    message: WebSocketMessage,
+    timeout: Duration,
+) -> InboundDelivery {
+    if inbound_tx.is_closed() {
+        return InboundDelivery::ReceiverClosed;
+    }
+    match tokio::time::timeout(timeout, inbound_tx.send(Ok(message))).await {
+        Ok(Ok(())) => InboundDelivery::Delivered,
+        Ok(Err(_)) => InboundDelivery::ReceiverClosed,
+        Err(_) => InboundDelivery::TimedOut,
+    }
+}
+
+async fn initiate_close(
+    stream: &mut WebSocketTransport,
+    state: &mut DriverState,
+    frame: Option<CloseFrame>,
+    initiator: WebSocketCloseInitiator,
+    close_timeout: Duration,
+) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+    if state.close_sent {
+        return Ok(());
+    }
+    state.close_info = Some(close_info(frame.as_ref(), initiator, false));
+    stream.send(WebSocketMessage::Close(frame)).await?;
+    state.close_sent = true;
+    state.close_deadline = Some(Instant::now() + close_timeout);
+    Ok(())
+}
+
+fn ping_deadline(state: &DriverState, config: &ResolvedWebSocketConfig) -> Option<Instant> {
+    if state.pending_ping.is_some() {
+        None
+    } else {
+        config
+            .ping_interval
+            .map(|interval| state.last_inbound_frame + interval)
+    }
+}
+
+fn pong_deadline(state: &DriverState, config: &ResolvedWebSocketConfig) -> Option<Instant> {
+    state
+        .pending_ping
+        .as_ref()
+        .map(|(_, sent_at)| *sent_at + config.pong_timeout)
+}
+
+fn idle_deadline(state: &DriverState, config: &ResolvedWebSocketConfig) -> Option<Instant> {
+    config
+        .idle_timeout
+        .map(|timeout| state.last_application_message + timeout)
+}
+
+fn lifetime_deadline(state: &DriverState, config: &ResolvedWebSocketConfig) -> Option<Instant> {
+    config
+        .max_connection_lifetime
+        .map(|lifetime| state.opened_at + lifetime)
+}
+
+async fn wait_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => pending::<()>().await,
     }
 }
 
@@ -319,13 +605,6 @@ async fn write_control(
         }
     };
     stream.send(message).await
-}
-
-async fn wait_for_ping(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => pending::<()>().await,
-    }
 }
 
 fn protocol_outcome(
@@ -372,15 +651,6 @@ fn handler_close_info() -> WebSocketCloseInfo {
         code: 1000,
         reason: String::new(),
         initiator: WebSocketCloseInitiator::Handler,
-        clean: false,
-    }
-}
-
-fn runtime_close_info() -> WebSocketCloseInfo {
-    WebSocketCloseInfo {
-        code: 1001,
-        reason: "El servidor se esta cerrando".to_string(),
-        initiator: WebSocketCloseInitiator::Runtime,
         clean: false,
     }
 }

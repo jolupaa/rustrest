@@ -358,23 +358,25 @@ async fn websocket_config_negotiates_protocol_pings_and_limits_message_size() {
         .unwrap();
     assert!(ping.is_ping(), "expected keepalive ping, got {ping:?}");
 
-    // A message over max_message_size is never echoed: the server side
-    // errors out and the connection ends (close frame or abrupt error).
+    // A message over max_message_size closes with RFC 6455 code 1009.
     let big = "x".repeat(8 * 1024);
     client.send(Message::Text(big.into())).await.unwrap();
-    loop {
+    let close = loop {
         match tokio::time::timeout(Duration::from_secs(2), client.next())
             .await
             .expect("connection should settle in time")
         {
             Some(Ok(message)) if message.is_ping() || message.is_pong() => continue,
-            Some(Ok(message)) if message.is_close() => break,
+            Some(Ok(Message::Close(Some(frame)))) => break frame,
+            Some(Ok(Message::Close(None))) => panic!("oversized close should include code 1009"),
             Some(Ok(message)) => {
                 panic!("oversized message should not produce a reply, got {message:?}")
             }
-            Some(Err(_)) | None => break,
+            Some(Err(error)) => panic!("oversized message should close cleanly: {error}"),
+            None => panic!("oversized message should produce Close 1009"),
         }
-    }
+    };
+    assert_eq!(u16::from(close.code), 1009);
     server.abort();
 }
 
@@ -602,9 +604,295 @@ async fn websocket_backpressure_disconnect_closes_slow_consumer_with_1013() {
     .expect("Close 1013 should arrive before the deadline")
     .expect("Close 1013 should include a frame");
     assert_eq!(u16::from(close.code), 1013);
+    client.flush().await.unwrap();
 
     wait_for_connections(&runtime, 0, 1).await;
     let stats = runtime.stats();
     assert_eq!(stats.saturated_sends, 1);
     assert_eq!(stats.closed_connections, 1);
+}
+
+async fn receive_close_frame(
+    client: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+) -> tokio_tungstenite::tungstenite::protocol::CloseFrame {
+    tokio::time::timeout(IO_TIMEOUT, async {
+        loop {
+            match client.next().await {
+                Some(Ok(Message::Close(Some(frame)))) => break frame,
+                Some(Ok(Message::Close(None))) => panic!("Close frame should include a code"),
+                Some(Ok(_)) => continue,
+                Some(Err(error)) => panic!("connection failed before Close: {error}"),
+                None => panic!("connection ended before Close"),
+            }
+        }
+    })
+    .await
+    .expect("Close should arrive before the deadline")
+}
+
+#[tokio::test]
+async fn websocket_heartbeat_ping_does_not_require_handler_recv() {
+    let (addr, _server) = spawn_app(|app| {
+        app.websocket_with(
+            "/ws",
+            WebSocketConfig::new()
+                .ping_interval(Duration::from_millis(80))
+                .pong_timeout(Duration::from_millis(20)),
+            |socket| async move {
+                std::future::pending::<()>().await;
+                drop(socket);
+            },
+        );
+    })
+    .await;
+    let (mut client, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    let ping = tokio::time::timeout(IO_TIMEOUT, client.next())
+        .await
+        .expect("heartbeat Ping should arrive")
+        .unwrap()
+        .unwrap();
+    assert!(ping.is_ping());
+}
+
+#[tokio::test]
+async fn websocket_heartbeat_matching_pong_keeps_connection_alive() {
+    let (addr, _server) = spawn_app(|app| {
+        app.websocket_with(
+            "/ws",
+            WebSocketConfig::new()
+                .ping_interval(Duration::from_millis(80))
+                .pong_timeout(Duration::from_millis(30)),
+            |socket| async move {
+                std::future::pending::<()>().await;
+                drop(socket);
+            },
+        );
+    })
+    .await;
+    let (mut client, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    let first = tokio::time::timeout(IO_TIMEOUT, client.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let payload = match first {
+        Message::Ping(payload) => payload,
+        message => panic!("expected Ping, got {message:?}"),
+    };
+    client.send(Message::Pong(payload)).await.unwrap();
+
+    let second = tokio::time::timeout(IO_TIMEOUT, client.next())
+        .await
+        .expect("a matching Pong should allow the next heartbeat")
+        .unwrap()
+        .unwrap();
+    assert!(second.is_ping(), "expected another Ping, got {second:?}");
+}
+
+#[tokio::test]
+async fn websocket_heartbeat_missing_pong_closes_with_1001() {
+    let (addr, runtime, _server) = spawn_app_with_runtime(|app| {
+        app.websocket_with(
+            "/ws",
+            WebSocketConfig::new()
+                .ping_interval(Duration::from_millis(80))
+                .pong_timeout(Duration::from_millis(20))
+                .close_timeout(Duration::from_millis(50)),
+            |_socket| async move { std::future::pending::<()>().await },
+        );
+    })
+    .await;
+    let (mut client, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+    let ping = tokio::time::timeout(IO_TIMEOUT, client.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(ping.is_ping());
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let close = receive_close_frame(&mut client).await;
+    assert_eq!(u16::from(close.code), 1001);
+    wait_for_connections(&runtime, 0, 1).await;
+    assert_eq!(runtime.stats().heartbeat_timeouts, 1);
+}
+
+#[tokio::test]
+async fn websocket_close_idle_timeout_uses_1001() {
+    let (addr, _server) = spawn_app(|app| {
+        app.websocket_with(
+            "/ws",
+            WebSocketConfig::new()
+                .disable_ping()
+                .idle_timeout(Duration::from_millis(50))
+                .close_timeout(Duration::from_millis(50)),
+            |_socket| async move { std::future::pending::<()>().await },
+        );
+    })
+    .await;
+    let (mut client, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    let close = receive_close_frame(&mut client).await;
+    assert_eq!(u16::from(close.code), 1001);
+}
+
+#[tokio::test]
+async fn websocket_close_lifetime_expires_while_messages_flow() {
+    let (addr, _server) = spawn_app(|app| {
+        app.websocket_with(
+            "/ws",
+            WebSocketConfig::new()
+                .disable_ping()
+                .idle_timeout(Duration::from_secs(1))
+                .max_connection_lifetime(Duration::from_millis(100))
+                .close_timeout(Duration::from_millis(50)),
+            |_socket| async move { std::future::pending::<()>().await },
+        );
+    })
+    .await;
+    let (mut client, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    for _ in 0..4 {
+        client.send(Message::Text("active".into())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let close = receive_close_frame(&mut client).await;
+    assert_eq!(u16::from(close.code), 1001);
+}
+
+#[tokio::test]
+async fn websocket_close_handshake_reports_clean_local_close() {
+    let (close_tx, mut close_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (addr, _server) = spawn_app(move |app| {
+        let close_tx = close_tx.clone();
+        app.websocket("/ws", move |mut socket| {
+            let close_tx = close_tx.clone();
+            async move {
+                socket.close_with(1000, "finalizado").await.unwrap();
+                close_tx.send(socket.closed().await).unwrap();
+            }
+        });
+    })
+    .await;
+    let (mut client, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    let frame = receive_close_frame(&mut client).await;
+    assert_eq!(u16::from(frame.code), 1000);
+    assert_eq!(frame.reason, "finalizado");
+    client.flush().await.unwrap();
+
+    let close = tokio::time::timeout(IO_TIMEOUT, close_rx.recv())
+        .await
+        .expect("handler should observe closure")
+        .expect("handler should publish close info");
+    assert_eq!(close.code, 1000);
+    assert_eq!(close.reason, "finalizado");
+    assert_eq!(close.initiator, rustrest::WebSocketCloseInitiator::Local);
+    assert!(close.clean);
+}
+
+#[tokio::test]
+async fn websocket_close_rejects_control_sends_after_closing_starts() {
+    let (late_send_tx, mut late_send_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (addr, _server) = spawn_app(move |app| {
+        let late_send_tx = late_send_tx.clone();
+        app.websocket("/ws", move |socket| {
+            let late_send_tx = late_send_tx.clone();
+            async move {
+                let (_receiver, sender) = socket.split();
+                sender.close().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                late_send_tx.send(sender.ping(Vec::new()).await).unwrap();
+            }
+        });
+    })
+    .await;
+    let (mut client, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    let frame = receive_close_frame(&mut client).await;
+    assert_eq!(u16::from(frame.code), 1000);
+    let late_send = tokio::time::timeout(IO_TIMEOUT, late_send_rx.recv())
+        .await
+        .expect("late send should finish before the deadline")
+        .expect("handler should publish the late send result");
+    assert!(matches!(late_send, Err(WsError::Closed)));
+}
+
+#[tokio::test]
+async fn websocket_close_slow_inbound_consumer_uses_1008() {
+    let (addr, _server) = spawn_app(|app| {
+        app.websocket_with(
+            "/ws",
+            WebSocketConfig::new()
+                .disable_ping()
+                .inbound_capacity(1)
+                .send_timeout(Duration::from_millis(30))
+                .close_timeout(Duration::from_millis(50)),
+            |socket| async move {
+                std::future::pending::<()>().await;
+                drop(socket);
+            },
+        );
+    })
+    .await;
+    let (mut client, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    client.send(Message::Text("first".into())).await.unwrap();
+    client.send(Message::Text("second".into())).await.unwrap();
+
+    let frame = receive_close_frame(&mut client).await;
+    assert_eq!(u16::from(frame.code), 1008);
+}
+
+#[tokio::test]
+async fn websocket_close_waits_for_peer_after_handler_returns() {
+    let (requested_tx, mut requested_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (addr, runtime, _server) = spawn_app_with_runtime(move |app| {
+        let requested_tx = requested_tx.clone();
+        app.websocket_with(
+            "/ws",
+            WebSocketConfig::new().close_timeout(Duration::from_millis(200)),
+            move |socket| {
+                let requested_tx = requested_tx.clone();
+                async move {
+                    let (_receiver, sender) = socket.split();
+                    sender.close().await.unwrap();
+                    requested_tx.send(()).unwrap();
+                }
+            },
+        );
+    })
+    .await;
+    let (mut client, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+    tokio::time::timeout(IO_TIMEOUT, requested_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    assert_eq!(runtime.stats().active_connections, 1);
+    let frame = receive_close_frame(&mut client).await;
+    assert_eq!(u16::from(frame.code), 1000);
+    client.flush().await.unwrap();
+    wait_for_connections(&runtime, 0, 1).await;
 }

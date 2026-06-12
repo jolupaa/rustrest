@@ -47,6 +47,7 @@ struct WebSocketCounters {
     rejected_connections: u64,
     closed_connections: u64,
     saturated_sends: u64,
+    heartbeat_timeouts: u64,
 }
 
 #[derive(Clone)]
@@ -117,6 +118,7 @@ impl WebSocketRuntimeHandle {
             rejected_connections: registry.counters.rejected_connections,
             closed_connections: registry.counters.closed_connections,
             saturated_sends: registry.counters.saturated_sends,
+            heartbeat_timeouts: registry.counters.heartbeat_timeouts,
             ..WebSocketStats::default()
         }
     }
@@ -245,6 +247,10 @@ impl WebSocketRuntimeHandle {
 
     pub(crate) fn record_saturated_send(&self) {
         self.registry().counters.saturated_sends += 1;
+    }
+
+    pub(crate) fn record_heartbeat_timeout(&self) {
+        self.registry().counters.heartbeat_timeouts += 1;
     }
 
     fn release(&self, id: WebSocketId) {
