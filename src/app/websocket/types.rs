@@ -4,6 +4,8 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use super::{WsBrokerErrorCategory, WsNodeId, WsPublicationId};
+
 pub use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -69,7 +71,21 @@ pub struct WebSocketStats {
     pub saturated_sends: u64,
     pub heartbeat_timeouts: u64,
     pub active_rooms: usize,
+    pub room_joins: u64,
+    pub room_leaves: u64,
+    pub local_broadcasts: u64,
+    pub partial_broadcasts: u64,
+    pub broker_publications: u64,
+    pub broker_errors: u64,
     pub broker_connected: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WsRemotePublish {
+    #[default]
+    NotConfigured,
+    Published,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -110,6 +126,40 @@ pub enum WebSocketObservation<'a> {
     },
     ForcedShutdown {
         id: WebSocketId,
+    },
+    RoomJoined {
+        id: WebSocketId,
+        route: &'a str,
+        room: &'a str,
+    },
+    RoomLeft {
+        id: WebSocketId,
+        route: &'a str,
+        room: &'a str,
+    },
+    Broadcast {
+        route: Option<&'a str>,
+        room_count: usize,
+        matched: usize,
+        enqueued: usize,
+        rejected: usize,
+        disconnected: usize,
+        remote: WsRemotePublish,
+    },
+    BrokerConnected {
+        node: WsNodeId,
+    },
+    BrokerDisconnected {
+        node: WsNodeId,
+        reason: WsBrokerErrorCategory,
+    },
+    BrokerLagged {
+        node: WsNodeId,
+        skipped: u64,
+    },
+    BrokerInvalidPublication {
+        origin: WsNodeId,
+        publication: WsPublicationId,
     },
 }
 

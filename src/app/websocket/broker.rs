@@ -103,6 +103,28 @@ pub enum WsBrokerError {
     SubscriptionClosed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WsBrokerErrorCategory {
+    Unavailable,
+    Timeout,
+    Lagged,
+    InvalidPublication,
+    SubscriptionClosed,
+}
+
+impl WsBrokerError {
+    pub fn category(&self) -> WsBrokerErrorCategory {
+        match self {
+            Self::Unavailable => WsBrokerErrorCategory::Unavailable,
+            Self::Timeout => WsBrokerErrorCategory::Timeout,
+            Self::Lagged(_) => WsBrokerErrorCategory::Lagged,
+            Self::InvalidPublication(_) => WsBrokerErrorCategory::InvalidPublication,
+            Self::SubscriptionClosed => WsBrokerErrorCategory::SubscriptionClosed,
+        }
+    }
+}
+
 impl std::fmt::Display for WsBrokerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

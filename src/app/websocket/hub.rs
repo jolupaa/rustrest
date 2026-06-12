@@ -11,7 +11,7 @@ use super::socket::{InternalWebSocketSender, LocalEnqueueOutcome, validate_close
 use super::{
     WebSocketConnectionSnapshot, WebSocketEvent, WebSocketId, WebSocketLifecycleState,
     WebSocketMessage, WebSocketRuntimeHandle, WsBroadcastError, WsBroker, WsBrokerError,
-    WsBrokerPayload, WsBrokerPublication, WsBrokerTarget, WsError, WsNodeId,
+    WsBrokerPayload, WsBrokerPublication, WsBrokerTarget, WsError, WsNodeId, WsRemotePublish,
 };
 
 const DEFAULT_MAX_ROOMS_PER_CONNECTION: usize = 32;
@@ -77,14 +77,6 @@ pub struct WsBroadcastReport {
     pub rejected: usize,
     pub disconnected: usize,
     pub remote: WsRemotePublish,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum WsRemotePublish {
-    #[default]
-    NotConfigured,
-    Published,
 }
 
 impl WsHub {
@@ -221,7 +213,8 @@ impl WsHub {
             WsBrokerPayload::Text(text) => WebSocketMessage::text(text),
             WsBrokerPayload::Binary(bytes) => WebSocketMessage::binary(bytes),
         };
-        let _ = target.send_local(message).await;
+        let report = target.send_local(message).await;
+        target.record_broadcast(&report);
     }
 }
 
@@ -357,9 +350,11 @@ impl WsTarget {
         }
         let mut report = self.send_local(message.clone()).await;
         if !self.publish_remote {
+            self.record_broadcast(&report);
             return Ok(report);
         }
         let Some(broker) = &self.hub.config.broker else {
+            self.record_broadcast(&report);
             return Ok(report);
         };
         let publication = WsBrokerPublication::new(
@@ -376,16 +371,27 @@ impl WsTarget {
         match published {
             Ok(Ok(())) => {
                 report.remote = WsRemotePublish::Published;
+                self.hub.runtime.record_broker_publication();
+                self.record_broadcast(&report);
                 Ok(report)
             }
-            Ok(Err(source)) => Err(WsBroadcastError::Broker {
-                source,
-                local_report: report,
-            }),
-            Err(_) => Err(WsBroadcastError::Broker {
-                source: WsBrokerError::Timeout,
-                local_report: report,
-            }),
+            Ok(Err(source)) => {
+                self.hub.runtime.record_broker_error(&source);
+                self.record_broadcast(&report);
+                Err(WsBroadcastError::Broker {
+                    source,
+                    local_report: report,
+                })
+            }
+            Err(_) => {
+                let source = WsBrokerError::Timeout;
+                self.hub.runtime.record_broker_error(&source);
+                self.record_broadcast(&report);
+                Err(WsBroadcastError::Broker {
+                    source,
+                    local_report: report,
+                })
+            }
         }
     }
 
@@ -440,6 +446,12 @@ impl WsTarget {
             (None, true) => WsBrokerTarget::AllRoutes,
             (None, false) => unreachable!("un destino por rooms siempre tiene una ruta"),
         }
+    }
+
+    fn record_broadcast(&self, report: &WsBroadcastReport) {
+        self.hub
+            .runtime
+            .record_broadcast(self.route.as_deref(), self.rooms.len(), report);
     }
 
     pub async fn send_text(&self, text: &str) -> Result<WsBroadcastReport, WsBroadcastError> {

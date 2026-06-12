@@ -10,13 +10,16 @@ use tokio::sync::{Notify, watch};
 use tokio::task::AbortHandle;
 
 use super::ResolvedWebSocketConfig;
-use super::broker::{WsBroker, WsBrokerPublication, WsNodeId, WsPublicationId, allocate_node_id};
+use super::broker::{
+    WsBroker, WsBrokerError, WsBrokerErrorCategory, WsBrokerPublication, WsNodeId, WsPublicationId,
+    allocate_node_id,
+};
 use super::socket::{InternalWebSocketSender, validate_close};
 use super::types::{
     WebSocketCloseInfo, WebSocketConnectionSnapshot, WebSocketId, WebSocketLifecycleState,
     WebSocketObservation, WebSocketObserver, WebSocketStats,
 };
-use super::{WebSocketTimeout, WsError};
+use super::{WebSocketTimeout, WsBroadcastReport, WsError};
 
 struct RuntimeInner {
     next_id: AtomicU64,
@@ -76,6 +79,12 @@ struct WebSocketCounters {
     bytes_sent: u64,
     saturated_sends: u64,
     heartbeat_timeouts: u64,
+    room_joins: u64,
+    room_leaves: u64,
+    local_broadcasts: u64,
+    partial_broadcasts: u64,
+    broker_publications: u64,
+    broker_errors: u64,
 }
 
 #[derive(Clone)]
@@ -203,6 +212,12 @@ impl WebSocketRuntimeHandle {
             saturated_sends: registry.counters.saturated_sends,
             heartbeat_timeouts: registry.counters.heartbeat_timeouts,
             active_rooms: registry.rooms.len(),
+            room_joins: registry.counters.room_joins,
+            room_leaves: registry.counters.room_leaves,
+            local_broadcasts: registry.counters.local_broadcasts,
+            partial_broadcasts: registry.counters.partial_broadcasts,
+            broker_publications: registry.counters.broker_publications,
+            broker_errors: registry.counters.broker_errors,
             broker_connected: registry.broker_connected,
             ..WebSocketStats::default()
         }
@@ -348,70 +363,102 @@ impl WebSocketRuntimeHandle {
     }
 
     pub(crate) fn join(&self, id: WebSocketId, rooms: &[String]) -> Result<(), WsError> {
-        let mut registry = self.registry();
         let (route, additions) = {
-            let entry = registry
-                .connections
-                .get_mut(&id)
-                .ok_or(WsError::ConnectionNotFound(id))?;
-            let requested = rooms.iter().cloned().collect::<BTreeSet<_>>();
-            for room in &requested {
-                validate_room(room, entry.max_room_name_bytes)?;
-            }
-            let additions = requested
-                .difference(&entry.rooms)
-                .cloned()
-                .collect::<Vec<_>>();
-            if entry.rooms.len() + additions.len() > entry.max_rooms_per_connection {
-                return Err(WsError::RoomLimit);
-            }
+            let mut registry = self.registry();
+            let (route, additions) = {
+                let entry = registry
+                    .connections
+                    .get_mut(&id)
+                    .ok_or(WsError::ConnectionNotFound(id))?;
+                let requested = rooms.iter().cloned().collect::<BTreeSet<_>>();
+                for room in &requested {
+                    validate_room(room, entry.max_room_name_bytes)?;
+                }
+                let additions = requested
+                    .difference(&entry.rooms)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if entry.rooms.len() + additions.len() > entry.max_rooms_per_connection {
+                    return Err(WsError::RoomLimit);
+                }
+                for room in &additions {
+                    entry.rooms.insert(room.clone());
+                }
+                (entry.route.clone(), additions)
+            };
             for room in &additions {
-                entry.rooms.insert(room.clone());
+                registry
+                    .rooms
+                    .entry((route.clone(), room.clone()))
+                    .or_default()
+                    .insert(id);
             }
-            (entry.route.clone(), additions)
+            registry.counters.room_joins = registry
+                .counters
+                .room_joins
+                .saturating_add(u64::try_from(additions.len()).unwrap_or(u64::MAX));
+            (route, additions)
         };
-        for room in additions {
-            registry
-                .rooms
-                .entry((route.clone(), room))
-                .or_default()
-                .insert(id);
+        for room in &additions {
+            self.observe(&WebSocketObservation::RoomJoined {
+                id,
+                route: &route,
+                room,
+            });
         }
         Ok(())
     }
 
     pub(crate) fn leave(&self, id: WebSocketId, rooms: &[String]) -> Result<(), WsError> {
-        let mut registry = self.registry();
         let (route, removals) = {
-            let entry = registry
-                .connections
-                .get_mut(&id)
-                .ok_or(WsError::ConnectionNotFound(id))?;
-            let requested = rooms.iter().cloned().collect::<BTreeSet<_>>();
-            let removals = requested
-                .intersection(&entry.rooms)
-                .cloned()
-                .collect::<Vec<_>>();
-            for room in &removals {
-                entry.rooms.remove(room);
-            }
-            (entry.route.clone(), removals)
+            let mut registry = self.registry();
+            let (route, removals) = {
+                let entry = registry
+                    .connections
+                    .get_mut(&id)
+                    .ok_or(WsError::ConnectionNotFound(id))?;
+                let requested = rooms.iter().cloned().collect::<BTreeSet<_>>();
+                let removals = requested
+                    .intersection(&entry.rooms)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for room in &removals {
+                    entry.rooms.remove(room);
+                }
+                (entry.route.clone(), removals)
+            };
+            remove_room_memberships(&mut registry.rooms, &route, id, removals.clone());
+            registry.counters.room_leaves = registry
+                .counters
+                .room_leaves
+                .saturating_add(u64::try_from(removals.len()).unwrap_or(u64::MAX));
+            (route, removals)
         };
-        remove_room_memberships(&mut registry.rooms, &route, id, removals);
+        self.observe_room_leaves(id, &route, &removals);
         Ok(())
     }
 
     pub(crate) fn leave_all(&self, id: WebSocketId) -> Result<(), WsError> {
-        let mut registry = self.registry();
         let (route, rooms) = {
-            let entry = registry
-                .connections
-                .get_mut(&id)
-                .ok_or(WsError::ConnectionNotFound(id))?;
-            let rooms = std::mem::take(&mut entry.rooms).into_iter().collect();
-            (entry.route.clone(), rooms)
+            let mut registry = self.registry();
+            let (route, rooms) = {
+                let entry = registry
+                    .connections
+                    .get_mut(&id)
+                    .ok_or(WsError::ConnectionNotFound(id))?;
+                let rooms = std::mem::take(&mut entry.rooms)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                (entry.route.clone(), rooms)
+            };
+            remove_room_memberships(&mut registry.rooms, &route, id, rooms.clone());
+            registry.counters.room_leaves = registry
+                .counters
+                .room_leaves
+                .saturating_add(u64::try_from(rooms.len()).unwrap_or(u64::MAX));
+            (route, rooms)
         };
-        remove_room_memberships(&mut registry.rooms, &route, id, rooms);
+        self.observe_room_leaves(id, &route, &rooms);
         Ok(())
     }
 
@@ -625,13 +672,13 @@ impl WebSocketRuntimeHandle {
         let mut retry_delay = Duration::from_millis(100);
         loop {
             if *shutdown.borrow() {
-                self.set_broker_connected(false);
+                self.set_broker_disconnected(WsBrokerErrorCategory::SubscriptionClosed);
                 return;
             }
             let subscribed = tokio::select! {
                 changed = shutdown.changed() => {
                     let _ = changed;
-                    self.set_broker_connected(false);
+                    self.set_broker_disconnected(WsBrokerErrorCategory::SubscriptionClosed);
                     return;
                 }
                 result = tokio::time::timeout(
@@ -641,12 +688,23 @@ impl WebSocketRuntimeHandle {
             };
             let mut stream = match subscribed {
                 Ok(Ok(stream)) => {
-                    self.set_broker_connected(true);
+                    self.set_broker_connected();
                     retry_delay = Duration::from_millis(100);
                     stream
                 }
-                Ok(Err(_)) | Err(_) => {
-                    self.set_broker_connected(false);
+                Ok(Err(error)) => {
+                    self.record_broker_error(&error);
+                    self.set_broker_disconnected(error.category());
+                    if !wait_for_broker_retry(&mut shutdown, retry_delay).await {
+                        return;
+                    }
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(1));
+                    continue;
+                }
+                Err(_) => {
+                    let error = WsBrokerError::Timeout;
+                    self.record_broker_error(&error);
+                    self.set_broker_disconnected(error.category());
                     if !wait_for_broker_retry(&mut shutdown, retry_delay).await {
                         return;
                     }
@@ -659,16 +717,25 @@ impl WebSocketRuntimeHandle {
                 tokio::select! {
                     changed = shutdown.changed() => {
                         let _ = changed;
-                        self.set_broker_connected(false);
+                        self.set_broker_disconnected(WsBrokerErrorCategory::SubscriptionClosed);
                         return;
                     }
                     item = stream.next() => match item {
                         Some(Ok(publication)) => self.handle_broker_publication(publication).await,
-                        Some(Err(_)) | None => break,
+                        Some(Err(error)) => {
+                            self.record_broker_error(&error);
+                            self.set_broker_disconnected(error.category());
+                            break;
+                        }
+                        None => {
+                            self.set_broker_disconnected(
+                                WsBrokerErrorCategory::SubscriptionClosed,
+                            );
+                            break;
+                        }
                     }
                 }
             }
-            self.set_broker_connected(false);
             if !wait_for_broker_retry(&mut shutdown, retry_delay).await {
                 return;
             }
@@ -681,9 +748,16 @@ impl WebSocketRuntimeHandle {
             return;
         }
         let hub = super::WsHub::from_runtime(self.clone());
-        if hub.validate_broker_publication(&publication).is_err()
-            || !self.mark_publication_seen(publication.origin, publication.id)
-        {
+        if hub.validate_broker_publication(&publication).is_err() {
+            let error = WsBrokerError::InvalidPublication("publicacion remota rechazada".into());
+            self.record_broker_error(&error);
+            self.observe(&WebSocketObservation::BrokerInvalidPublication {
+                origin: publication.origin,
+                publication: publication.id,
+            });
+            return;
+        }
+        if !self.mark_publication_seen(publication.origin, publication.id) {
             return;
         }
         hub.deliver_broker_publication(publication).await;
@@ -704,8 +778,26 @@ impl WebSocketRuntimeHandle {
         true
     }
 
-    fn set_broker_connected(&self, connected: bool) {
-        self.registry().broker_connected = connected;
+    fn set_broker_connected(&self) {
+        let changed = {
+            let mut registry = self.registry();
+            let changed = !registry.broker_connected;
+            registry.broker_connected = true;
+            changed
+        };
+        if changed {
+            self.observe(&WebSocketObservation::BrokerConnected {
+                node: self.inner.node_id,
+            });
+        }
+    }
+
+    fn set_broker_disconnected(&self, reason: WsBrokerErrorCategory) {
+        self.registry().broker_connected = false;
+        self.observe(&WebSocketObservation::BrokerDisconnected {
+            node: self.inner.node_id,
+            reason,
+        });
     }
 
     fn active_count(&self) -> usize {
@@ -804,8 +896,59 @@ impl WebSocketRuntimeHandle {
         self.observe(&WebSocketObservation::HandlerFailed { id });
     }
 
+    pub(crate) fn record_broadcast(
+        &self,
+        route: Option<&str>,
+        room_count: usize,
+        report: &WsBroadcastReport,
+    ) {
+        {
+            let mut registry = self.registry();
+            registry.counters.local_broadcasts =
+                registry.counters.local_broadcasts.saturating_add(1);
+            if report.rejected > 0 || report.disconnected > 0 {
+                registry.counters.partial_broadcasts =
+                    registry.counters.partial_broadcasts.saturating_add(1);
+            }
+        }
+        self.observe(&WebSocketObservation::Broadcast {
+            route,
+            room_count,
+            matched: report.matched,
+            enqueued: report.enqueued,
+            rejected: report.rejected,
+            disconnected: report.disconnected,
+            remote: report.remote,
+        });
+    }
+
+    pub(crate) fn record_broker_publication(&self) {
+        let mut registry = self.registry();
+        registry.counters.broker_publications =
+            registry.counters.broker_publications.saturating_add(1);
+    }
+
+    pub(crate) fn record_broker_error(&self, error: &WsBrokerError) {
+        {
+            let mut registry = self.registry();
+            registry.counters.broker_errors = registry.counters.broker_errors.saturating_add(1);
+        }
+        if let WsBrokerError::Lagged(skipped) = error {
+            self.observe(&WebSocketObservation::BrokerLagged {
+                node: self.inner.node_id,
+                skipped: *skipped,
+            });
+        }
+    }
+
+    fn observe_room_leaves(&self, id: WebSocketId, route: &str, rooms: &[String]) {
+        for room in rooms {
+            self.observe(&WebSocketObservation::RoomLeft { id, route, room });
+        }
+    }
+
     fn release(&self, id: WebSocketId) {
-        let became_empty = {
+        let (became_empty, route, rooms) = {
             let mut registry = self.registry();
             let Some(entry) = registry.connections.remove(&id) else {
                 return;
@@ -815,16 +958,17 @@ impl WebSocketRuntimeHandle {
             if let Some(ip) = entry.remote_addr.map(|addr| addr.ip()) {
                 decrement_count(&mut registry.ip_counts, &ip);
             }
-            remove_room_memberships(
-                &mut registry.rooms,
-                &entry.route,
-                id,
-                entry.rooms.into_iter().collect(),
-            );
+            let rooms = entry.rooms.into_iter().collect::<Vec<_>>();
+            remove_room_memberships(&mut registry.rooms, &entry.route, id, rooms.clone());
+            registry.counters.room_leaves = registry
+                .counters
+                .room_leaves
+                .saturating_add(u64::try_from(rooms.len()).unwrap_or(u64::MAX));
             registry.counters.closed_connections += 1;
-            registry.connections.is_empty()
+            (registry.connections.is_empty(), entry.route, rooms)
         };
 
+        self.observe_room_leaves(id, &route, &rooms);
         if became_empty {
             self.inner.empty.notify_waiters();
         }
@@ -937,6 +1081,55 @@ fn trace_websocket_observation(event: &WebSocketObservation<'_>) {
         }
         WebSocketObservation::ForcedShutdown { id } => {
             tracing::warn!(ws.id = %id, "websocket force-aborted during shutdown");
+        }
+        WebSocketObservation::RoomJoined { id, route, room } => {
+            tracing::debug!(ws.id = %id, ws.route = *route, ws.room = *room, "websocket joined room");
+        }
+        WebSocketObservation::RoomLeft { id, route, room } => {
+            tracing::debug!(ws.id = %id, ws.route = *route, ws.room = *room, "websocket left room");
+        }
+        WebSocketObservation::Broadcast {
+            route,
+            room_count,
+            matched,
+            enqueued,
+            rejected,
+            disconnected,
+            remote,
+        } => {
+            tracing::debug!(
+                ws.route = ?route,
+                ws.room_count = room_count,
+                ws.matched = matched,
+                ws.enqueued = enqueued,
+                ws.rejected = rejected,
+                ws.disconnected = disconnected,
+                ws.remote = ?remote,
+                "websocket broadcast completed"
+            );
+        }
+        WebSocketObservation::BrokerConnected { node } => {
+            tracing::info!(ws.node = node.get(), "websocket broker connected");
+        }
+        WebSocketObservation::BrokerDisconnected { node, reason } => {
+            tracing::warn!(ws.node = node.get(), ws.reason = ?reason, "websocket broker disconnected");
+        }
+        WebSocketObservation::BrokerLagged { node, skipped } => {
+            tracing::warn!(
+                ws.node = node.get(),
+                ws.skipped = skipped,
+                "websocket broker lagged"
+            );
+        }
+        WebSocketObservation::BrokerInvalidPublication {
+            origin,
+            publication,
+        } => {
+            tracing::warn!(
+                ws.origin = origin.get(),
+                ws.publication = publication.get(),
+                "websocket broker publication rejected"
+            );
         }
     }
 }

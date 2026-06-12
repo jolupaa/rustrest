@@ -14,17 +14,15 @@ use base64::Engine;
 use hyper::upgrade::OnUpgrade;
 
 pub use broker::{
-    InMemoryWsBroker, WsBroker, WsBrokerError, WsBrokerPayload, WsBrokerPublication,
-    WsBrokerStream, WsBrokerTarget, WsNodeId, WsPublicationId,
+    InMemoryWsBroker, WsBroker, WsBrokerError, WsBrokerErrorCategory, WsBrokerPayload,
+    WsBrokerPublication, WsBrokerStream, WsBrokerTarget, WsNodeId, WsPublicationId,
 };
 pub(crate) use config::ResolvedWebSocketConfig;
 pub use config::{BackpressurePolicy, OriginPolicy, WebSocketConfig};
 pub use error::{
     WebSocketCapacityError, WebSocketError, WebSocketTimeout, WsBroadcastError, WsError,
 };
-pub use hub::{
-    WsBroadcastReport, WsHub, WsHubBuilder, WsLocalSocket, WsRemotePublish, WsRoute, WsTarget,
-};
+pub use hub::{WsBroadcastReport, WsHub, WsHubBuilder, WsLocalSocket, WsRoute, WsTarget};
 pub use runtime::WebSocketRuntimeHandle;
 use socket::NormalizedWebSocketHandler;
 pub use socket::{
@@ -34,7 +32,7 @@ pub use socket::{
 pub use types::{
     WebSocketCloseInfo, WebSocketCloseInitiator, WebSocketConnectionSnapshot,
     WebSocketErrorCategory, WebSocketId, WebSocketLifecycleState, WebSocketObservation,
-    WebSocketObserver, WebSocketStats,
+    WebSocketObserver, WebSocketStats, WsRemotePublish,
 };
 
 pub(crate) use runtime::{AdmissionError, ConnectionPermit};

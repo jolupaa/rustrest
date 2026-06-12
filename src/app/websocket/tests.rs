@@ -2,6 +2,7 @@ use futures_util::StreamExt;
 use hyper::header::SEC_WEBSOCKET_ACCEPT;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -12,6 +13,98 @@ use super::*;
 
 fn resolved_config(app: WebSocketConfig, route: WebSocketConfig) -> ResolvedWebSocketConfig {
     ResolvedWebSocketConfig::from_layers(&app, &route)
+}
+
+#[derive(Clone)]
+struct MetadataObserver(Arc<Mutex<Vec<String>>>);
+
+impl WebSocketObserver for MetadataObserver {
+    fn observe(&self, event: &WebSocketObservation<'_>) {
+        let metadata = match event {
+            WebSocketObservation::RoomJoined { id, route, room } => {
+                format!("join:{id}:{route}:{room}")
+            }
+            WebSocketObservation::RoomLeft { id, route, room } => {
+                format!("leave:{id}:{route}:{room}")
+            }
+            WebSocketObservation::Broadcast {
+                route,
+                room_count,
+                matched,
+                enqueued,
+                rejected,
+                disconnected,
+                remote,
+            } => format!(
+                "broadcast:{route:?}:{room_count}:{matched}:{enqueued}:{rejected}:{disconnected}:{remote:?}"
+            ),
+            WebSocketObservation::BrokerConnected { node } => {
+                format!("broker_connected:{}", node.get())
+            }
+            WebSocketObservation::BrokerDisconnected { node, reason } => {
+                format!("broker_disconnected:{}:{reason:?}", node.get())
+            }
+            WebSocketObservation::BrokerLagged { node, skipped } => {
+                format!("broker_lagged:{}:{skipped}", node.get())
+            }
+            WebSocketObservation::BrokerInvalidPublication {
+                origin,
+                publication,
+            } => format!("broker_invalid:{}:{}", origin.get(), publication.get()),
+            _ => return,
+        };
+        self.0.lock().unwrap().push(metadata);
+    }
+}
+
+#[tokio::test]
+async fn websocket_room_observation_tracks_metadata_and_stats_without_payloads() {
+    let hub = WsHub::local();
+    let runtime = hub.runtime();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    runtime.set_observer(Arc::new(MetadataObserver(events.clone())));
+    let config = resolved_config(WebSocketConfig::new(), WebSocketConfig::new());
+    let permit = runtime
+        .admit("/chat/:channel", None, None, &config)
+        .unwrap();
+
+    runtime
+        .join(permit.id(), &["general".into(), "equipo-7".into()])
+        .unwrap();
+    let report = hub
+        .route("/chat/:channel")
+        .all()
+        .send_text("payload-secreto")
+        .await
+        .unwrap();
+    assert_eq!(report.matched, 1);
+    assert_eq!(report.disconnected, 1);
+    runtime.leave(permit.id(), &["general".into()]).unwrap();
+    runtime.leave_all(permit.id()).unwrap();
+
+    let stats = runtime.stats();
+    assert_eq!(stats.active_rooms, 0);
+    assert_eq!(stats.room_joins, 2);
+    assert_eq!(stats.room_leaves, 2);
+    assert_eq!(stats.local_broadcasts, 1);
+    assert_eq!(stats.partial_broadcasts, 1);
+    let events = events.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.contains("join:1:/chat/:channel:general"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.contains("leave:1:/chat/:channel:general"))
+    );
+    assert!(events.iter().any(|event| event.starts_with("broadcast:")));
+    assert!(
+        events
+            .iter()
+            .all(|event| !event.contains("payload-secreto"))
+    );
 }
 
 #[tokio::test]
@@ -111,6 +204,94 @@ async fn websocket_broker_subscription_recovers() {
     .unwrap();
 
     assert!(broker.subscriptions.load(Ordering::SeqCst) >= 2);
+    runtime.begin_shutdown().await;
+}
+
+struct ObservableBroker {
+    subscriptions: AtomicUsize,
+}
+
+impl WsBroker for ObservableBroker {
+    fn publish<'a>(
+        &'a self,
+        _publication: WsBrokerPublication,
+    ) -> futures_util::future::BoxFuture<'a, Result<(), WsBrokerError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn subscribe<'a>(
+        &'a self,
+        _node: WsNodeId,
+    ) -> futures_util::future::BoxFuture<'a, Result<WsBrokerStream, WsBrokerError>> {
+        let subscription = self.subscriptions.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if subscription == 0 {
+                return Ok(
+                    Box::pin(futures_util::stream::iter([Err(WsBrokerError::Lagged(2))]))
+                        as WsBrokerStream,
+                );
+            }
+            let publication = WsBrokerPublication::new(
+                WsPublicationId::new(44),
+                WsNodeId::new(999),
+                WsBrokerTarget::RouteRooms {
+                    route: "".into(),
+                    rooms: vec!["general".into()],
+                },
+                WsBrokerPayload::Text("payload-no-observable".into()),
+            );
+            let stream = futures_util::stream::once(async move { Ok(publication) })
+                .chain(futures_util::stream::pending());
+            Ok(Box::pin(stream) as WsBrokerStream)
+        })
+    }
+}
+
+#[tokio::test]
+async fn websocket_broker_observation_tracks_health_lag_and_invalid_publications() {
+    let broker = Arc::new(ObservableBroker {
+        subscriptions: AtomicUsize::new(0),
+    });
+    let hub = WsHub::builder()
+        .broker(broker)
+        .node_id(WsNodeId::new(55))
+        .build()
+        .unwrap();
+    let runtime = hub.runtime();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    runtime.set_observer(Arc::new(MetadataObserver(events.clone())));
+
+    runtime.start_broker().await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let stats = runtime.stats();
+            if stats.broker_connected && stats.broker_errors >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let report = hub.all().send_text("otro-payload-secreto").await.unwrap();
+    assert_eq!(report.remote, WsRemotePublish::Published);
+
+    let stats = runtime.stats();
+    assert!(stats.broker_connected);
+    assert_eq!(stats.broker_publications, 1);
+    assert_eq!(stats.broker_errors, 2);
+    {
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| event == "broker_connected:55"));
+        assert!(events.iter().any(|event| event == "broker_lagged:55:2"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event == "broker_disconnected:55:Lagged")
+        );
+        assert!(events.iter().any(|event| event == "broker_invalid:999:44"));
+        assert!(events.iter().all(|event| !event.contains("payload")));
+    }
     runtime.begin_shutdown().await;
 }
 

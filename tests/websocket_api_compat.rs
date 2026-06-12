@@ -6,9 +6,9 @@ use rustrest::{
     WebSocketCloseInfo, WebSocketCloseInitiator, WebSocketConfig, WebSocketError, WebSocketEvent,
     WebSocketHandler, WebSocketLifecycleState, WebSocketMessage, WebSocketObservation,
     WebSocketObserver, WebSocketReceiver, WebSocketRuntimeHandle, WebSocketSender, WebSocketStats,
-    WsBroadcast, WsBroadcastError, WsBroadcastReport, WsBroker, WsBrokerError, WsBrokerPayload,
-    WsBrokerPublication, WsBrokerStream, WsBrokerTarget, WsError, WsHub, WsLocalSocket, WsNodeId,
-    WsPublicationId, WsRemotePublish, WsRoute, WsTarget,
+    WsBroadcast, WsBroadcastError, WsBroadcastReport, WsBroker, WsBrokerError,
+    WsBrokerErrorCategory, WsBrokerPayload, WsBrokerPublication, WsBrokerStream, WsBrokerTarget,
+    WsError, WsHub, WsLocalSocket, WsNodeId, WsPublicationId, WsRemotePublish, WsRoute, WsTarget,
 };
 
 struct Observer;
@@ -197,6 +197,7 @@ fn existing_websocket_surface_still_compiles() {
     let _remote: WsRemotePublish = WsRemotePublish::NotConfigured;
     let _broker_stream: Option<WsBrokerStream> = None;
     let _broker_error: Option<WsBrokerError> = None;
+    let _broker_error_category: WsBrokerErrorCategory = WsBrokerError::Unavailable.category();
     let _publication = WsBrokerPublication::new(
         WsPublicationId::new(1),
         WsNodeId::new(42),

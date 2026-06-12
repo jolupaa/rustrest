@@ -35,7 +35,7 @@ pub use app::{
     WebSocketHandler, WebSocketId, WebSocketLifecycleState, WebSocketMessage, WebSocketObservation,
     WebSocketObserver, WebSocketReceiver, WebSocketRuntimeHandle, WebSocketSender, WebSocketStats,
     WebSocketTimeout, WsBroadcast, WsBroadcastError, WsBroadcastReport, WsBroker, WsBrokerError,
-    WsBrokerPayload, WsBrokerPublication, WsBrokerStream, WsBrokerTarget, WsError, WsHub,
-    WsHubBuilder, WsLocalSocket, WsNodeId, WsPublicationId, WsRemotePublish, WsRoute, WsTarget,
-    middleware, sign_value, verify_value,
+    WsBrokerErrorCategory, WsBrokerPayload, WsBrokerPublication, WsBrokerStream, WsBrokerTarget,
+    WsError, WsHub, WsHubBuilder, WsLocalSocket, WsNodeId, WsPublicationId, WsRemotePublish,
+    WsRoute, WsTarget, middleware, sign_value, verify_value,
 };
