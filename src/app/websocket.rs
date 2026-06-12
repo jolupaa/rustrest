@@ -343,10 +343,13 @@ fn spawn_websocket(
     });
 }
 
-/// A clonable fan-out channel for WebSocket rooms: handlers `subscribe()`
-/// and forward received messages to their socket, while any holder of the
-/// `WsBroadcast` can `send` to every current subscriber. Backed by
-/// `tokio::sync::broadcast` (lagging subscribers skip the oldest messages).
+/// A raw process-local Tokio broadcast channel for WebSocket messages.
+///
+/// This helper does not track connections, routes, rooms, per-socket
+/// backpressure, delivery reports, or external brokers. Subscribers must
+/// forward received messages to their sockets and handle
+/// [`tokio::sync::broadcast::error::RecvError::Lagged`] explicitly. Use
+/// [`WsHub`] for route-scoped rooms and managed fan-out.
 #[derive(Clone)]
 pub struct WsBroadcast {
     sender: tokio::sync::broadcast::Sender<WebSocketMessage>,

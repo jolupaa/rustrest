@@ -222,6 +222,23 @@ async fn ws_broadcast_fans_out_to_subscribers() {
     assert_eq!(room.send_text("nadie"), 0);
 }
 
+#[tokio::test]
+async fn ws_broadcast_reports_lag() {
+    let room = WsBroadcast::new(1);
+    let mut receiver = room.subscribe();
+
+    assert_eq!(room.send_text("primero"), 1);
+    assert_eq!(room.send_text("segundo"), 1);
+    assert!(matches!(
+        receiver.recv().await,
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(1))
+    ));
+    assert_eq!(
+        receiver.recv().await.unwrap(),
+        WebSocketMessage::text("segundo")
+    );
+}
+
 #[test]
 fn websocket_runtime_accounts_for_permits() {
     let runtime = WebSocketRuntimeHandle::local();
