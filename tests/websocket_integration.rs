@@ -2,7 +2,10 @@ use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use rustrest::{App, WebSocketConfig, WebSocketEvent, WebSocketRuntimeHandle};
+use rustrest::{
+    App, BackpressurePolicy, WebSocketCapacityError, WebSocketConfig, WebSocketEvent,
+    WebSocketRuntimeHandle, WsError,
+};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -545,4 +548,63 @@ async fn websocket_runtime_releases_permit_after_transport_close() {
     drop(client);
     wait_for_connections(&runtime, 0, 1).await;
     assert_eq!(runtime.stats().accepted_connections, 1);
+}
+
+#[tokio::test]
+async fn websocket_backpressure_disconnect_closes_slow_consumer_with_1013() {
+    let (saturated_tx, mut saturated_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (addr, runtime, _server) = spawn_app_with_runtime(move |app| {
+        app.websocket_with(
+            "/ws",
+            WebSocketConfig::new()
+                .outbound_capacity(1)
+                .backpressure_policy(BackpressurePolicy::Disconnect),
+            move |socket| {
+                let saturated_tx = saturated_tx.clone();
+                async move {
+                    let (_receiver, sender) = socket.split();
+                    for sequence in 0..100_000_u32 {
+                        match sender.send_text(&format!("message-{sequence}")).await {
+                            Ok(()) => {}
+                            Err(WsError::Capacity(WebSocketCapacityError::OutboundQueue)) => {
+                                saturated_tx.send(()).unwrap();
+                                return;
+                            }
+                            Err(error) => panic!("unexpected send error: {error}"),
+                        }
+                    }
+                    panic!("outbound queue did not saturate");
+                }
+            },
+        );
+    })
+    .await;
+
+    let (mut client, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+    tokio::time::timeout(IO_TIMEOUT, saturated_rx.recv())
+        .await
+        .expect("outbound queue should saturate before the deadline")
+        .expect("handler should report saturation");
+
+    let close = tokio::time::timeout(IO_TIMEOUT, async {
+        loop {
+            match client.next().await {
+                Some(Ok(Message::Close(frame))) => break frame,
+                Some(Ok(_)) => continue,
+                Some(Err(error)) => panic!("connection failed before Close: {error}"),
+                None => panic!("connection ended before Close"),
+            }
+        }
+    })
+    .await
+    .expect("Close 1013 should arrive before the deadline")
+    .expect("Close 1013 should include a frame");
+    assert_eq!(u16::from(close.code), 1013);
+
+    wait_for_connections(&runtime, 0, 1).await;
+    let stats = runtime.stats();
+    assert_eq!(stats.saturated_sends, 1);
+    assert_eq!(stats.closed_connections, 1);
 }

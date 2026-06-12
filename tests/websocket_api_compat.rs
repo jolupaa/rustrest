@@ -5,7 +5,7 @@ use rustrest::{
     App, IntoWebSocketHandler, Request, Response, Router, WebSocket, WebSocketCloseInfo,
     WebSocketCloseInitiator, WebSocketConfig, WebSocketError, WebSocketEvent, WebSocketHandler,
     WebSocketMessage, WebSocketObservation, WebSocketObserver, WebSocketReceiver,
-    WebSocketRuntimeHandle, WebSocketSender, WebSocketStats, WsBroadcast,
+    WebSocketRuntimeHandle, WebSocketSender, WebSocketStats, WsBroadcast, WsError,
 };
 
 struct Observer;
@@ -47,6 +47,8 @@ fn existing_websocket_surface_still_compiles() {
         let _: Result<(), WebSocketError> = socket.ping(Vec::<u8>::new()).await;
         let _: Result<(), WebSocketError> = socket.pong(Vec::<u8>::new()).await;
         let _: Result<(), WebSocketError> = socket.close().await;
+        let _: Result<(), WebSocketError> = socket.close_with(1000, "finalizado").await;
+        let _: WebSocketCloseInfo = socket.closed().await;
         let _ = socket.id();
         let _: Option<std::net::SocketAddr> = socket.remote_addr();
         let _: &str = socket.route();
@@ -56,8 +58,13 @@ fn existing_websocket_surface_still_compiles() {
         let _: Option<std::net::SocketAddr> = sender.remote_addr();
         let _: &str = sender.route();
         let _: Option<&str> = sender.protocol();
-        let _: Result<(), WebSocketError> = cloned_sender.send_text("desde clone").await;
+        let _: Result<(), WsError> = sender.send(WebSocketMessage::text("split")).await;
+        let _: Result<(), WsError> = sender.try_send(WebSocketMessage::text("inmediato"));
+        let _: Result<(), WsError> = cloned_sender.send_text("desde clone").await;
+        let _: Result<(), WsError> = sender.close_with(1000, "finalizado").await;
+        let _: WebSocketCloseInfo = sender.closed().await;
         let _: Result<Option<WebSocketMessage>, WebSocketError> = receiver.recv().await;
+        let _: WebSocketCloseInfo = receiver.closed().await;
     })
     .into_websocket_handler();
     let _: () = app.websocket("/ws", |_socket| async move {});

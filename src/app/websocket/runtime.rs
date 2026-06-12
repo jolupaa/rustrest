@@ -46,6 +46,7 @@ struct WebSocketCounters {
     accepted_connections: u64,
     rejected_connections: u64,
     closed_connections: u64,
+    saturated_sends: u64,
 }
 
 #[derive(Clone)]
@@ -115,6 +116,7 @@ impl WebSocketRuntimeHandle {
             accepted_connections: registry.counters.accepted_connections,
             rejected_connections: registry.counters.rejected_connections,
             closed_connections: registry.counters.closed_connections,
+            saturated_sends: registry.counters.saturated_sends,
             ..WebSocketStats::default()
         }
     }
@@ -239,6 +241,10 @@ impl WebSocketRuntimeHandle {
         entry.internal_sender = Some(internal_sender);
         entry.driver_abort = Some(driver_abort);
         true
+    }
+
+    pub(crate) fn record_saturated_send(&self) {
+        self.registry().counters.saturated_sends += 1;
     }
 
     fn release(&self, id: WebSocketId) {

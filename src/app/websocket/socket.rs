@@ -1,16 +1,24 @@
 use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyper::body::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{mpsc, watch};
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
-use super::WebSocketError;
 use super::driver::{CONTROL_CHANNEL_CAPACITY, ControlCommand, DriverChannels, OutboundCommand};
-use super::types::{WebSocketCloseInfo, WebSocketId};
+use super::runtime::WebSocketRuntimeHandle;
+use super::types::{WebSocketCloseInfo, WebSocketCloseInitiator, WebSocketId};
+use super::{
+    BackpressurePolicy, ResolvedWebSocketConfig, WebSocketCapacityError, WebSocketError,
+    WebSocketTimeout, WsError,
+};
 
 pub use super::types::{WebSocketEvent, WebSocketMessage};
 
@@ -64,6 +72,10 @@ struct SocketShared {
     protocol: Option<String>,
     outbound: mpsc::Sender<OutboundCommand>,
     control: mpsc::Sender<ControlCommand>,
+    backpressure_policy: BackpressurePolicy,
+    send_timeout: Duration,
+    close_rx: watch::Receiver<Option<WebSocketCloseInfo>>,
+    runtime: WebSocketRuntimeHandle,
 }
 
 pub(crate) struct SocketMetadata {
@@ -75,11 +87,11 @@ pub(crate) struct SocketMetadata {
 
 pub(crate) fn channel_pair(
     metadata: SocketMetadata,
-    inbound_capacity: usize,
-    outbound_capacity: usize,
+    config: &ResolvedWebSocketConfig,
+    runtime: WebSocketRuntimeHandle,
 ) -> (WebSocket, InternalWebSocketSender, DriverChannels) {
-    let (inbound_tx, inbound) = mpsc::channel(inbound_capacity);
-    let (outbound, outbound_rx) = mpsc::channel(outbound_capacity);
+    let (inbound_tx, inbound) = mpsc::channel(config.inbound_capacity);
+    let (outbound, outbound_rx) = mpsc::channel(config.outbound_capacity);
     let (control, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
     let (close_tx, close_rx) = watch::channel(None);
     let shared = Arc::new(SocketShared {
@@ -89,6 +101,10 @@ pub(crate) fn channel_pair(
         protocol: metadata.protocol,
         outbound,
         control,
+        backpressure_policy: config.backpressure_policy,
+        send_timeout: config.send_timeout,
+        close_rx: close_rx.clone(),
+        runtime,
     });
     let socket = WebSocket {
         receiver: WebSocketReceiver { inbound, close_rx },
@@ -134,22 +150,31 @@ impl WebSocket {
     }
 
     pub async fn send(&mut self, message: WebSocketMessage) -> Result<(), WebSocketError> {
-        self.sender.send(message).await
+        self.sender.send(message).await.map_err(compatibility_error)
     }
 
     pub async fn send_text(&mut self, text: &str) -> Result<(), WebSocketError> {
-        self.sender.send_text(text).await
+        self.sender
+            .send_text(text)
+            .await
+            .map_err(compatibility_error)
     }
 
     pub async fn send_binary(&mut self, bytes: impl Into<Bytes>) -> Result<(), WebSocketError> {
-        self.sender.send_binary(bytes).await
+        self.sender
+            .send_binary(bytes)
+            .await
+            .map_err(compatibility_error)
     }
 
     pub async fn send_json<T>(&mut self, value: &T) -> Result<(), WebSocketError>
     where
         T: Serialize,
     {
-        self.sender.send_json(value).await
+        self.sender
+            .send_json(value)
+            .await
+            .map_err(compatibility_error)
     }
 
     pub async fn recv_json<T>(&mut self) -> Result<Option<T>, WebSocketError>
@@ -163,7 +188,10 @@ impl WebSocket {
     where
         T: Serialize,
     {
-        self.sender.send_event(event, data).await
+        self.sender
+            .send_event(event, data)
+            .await
+            .map_err(compatibility_error)
     }
 
     pub async fn recv_event<T>(&mut self) -> Result<Option<WebSocketEvent<T>>, WebSocketError>
@@ -174,15 +202,30 @@ impl WebSocket {
     }
 
     pub async fn ping(&mut self, payload: impl Into<Bytes>) -> Result<(), WebSocketError> {
-        self.sender.ping(payload).await
+        self.sender.ping(payload).await.map_err(compatibility_error)
     }
 
     pub async fn pong(&mut self, payload: impl Into<Bytes>) -> Result<(), WebSocketError> {
-        self.sender.pong(payload).await
+        self.sender.pong(payload).await.map_err(compatibility_error)
     }
 
     pub async fn close(&mut self) -> Result<(), WebSocketError> {
-        self.sender.close().await
+        self.sender.close().await.map_err(compatibility_error)
+    }
+
+    pub async fn close_with(
+        &mut self,
+        code: u16,
+        reason: impl Into<String>,
+    ) -> Result<(), WebSocketError> {
+        self.sender
+            .close_with(code, reason)
+            .await
+            .map_err(compatibility_error)
+    }
+
+    pub async fn closed(&mut self) -> WebSocketCloseInfo {
+        self.receiver.closed().await
     }
 }
 
@@ -203,7 +246,29 @@ impl WebSocketSender {
         &self.shared.route
     }
 
-    pub async fn send(&self, message: WebSocketMessage) -> Result<(), WebSocketError> {
+    pub fn try_send(&self, message: WebSocketMessage) -> Result<(), WsError> {
+        match message {
+            WebSocketMessage::Ping(payload) => self.try_send_control(ControlCommand::Ping(payload)),
+            WebSocketMessage::Pong(payload) => self.try_send_control(ControlCommand::Pong(payload)),
+            WebSocketMessage::Close(frame) => self.try_send_control(ControlCommand::Close(frame)),
+            message => {
+                let permit =
+                    self.shared.outbound.clone().try_reserve_owned().map_err(
+                        |error| match error {
+                            mpsc::error::TrySendError::Full(_) => {
+                                self.shared.runtime.record_saturated_send();
+                                WsError::Capacity(WebSocketCapacityError::OutboundQueue)
+                            }
+                            mpsc::error::TrySendError::Closed(_) => WsError::Closed,
+                        },
+                    )?;
+                permit.send(OutboundCommand::Message(message));
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn send(&self, message: WebSocketMessage) -> Result<(), WsError> {
         match message {
             WebSocketMessage::Ping(payload) => {
                 self.send_control(ControlCommand::Ping(payload)).await
@@ -212,24 +277,19 @@ impl WebSocketSender {
                 self.send_control(ControlCommand::Pong(payload)).await
             }
             WebSocketMessage::Close(frame) => self.send_control(ControlCommand::Close(frame)).await,
-            message => self
-                .shared
-                .outbound
-                .send(OutboundCommand::Message(message))
-                .await
-                .map_err(|_| closed_error()),
+            message => self.send_application(message).await,
         }
     }
 
-    pub async fn send_text(&self, text: &str) -> Result<(), WebSocketError> {
+    pub async fn send_text(&self, text: &str) -> Result<(), WsError> {
         self.send(WebSocketMessage::text(text.to_string())).await
     }
 
-    pub async fn send_binary(&self, bytes: impl Into<Bytes>) -> Result<(), WebSocketError> {
+    pub async fn send_binary(&self, bytes: impl Into<Bytes>) -> Result<(), WsError> {
         self.send(WebSocketMessage::binary(bytes.into())).await
     }
 
-    pub async fn send_json<T>(&self, value: &T) -> Result<(), WebSocketError>
+    pub async fn send_json<T>(&self, value: &T) -> Result<(), WsError>
     where
         T: Serialize,
     {
@@ -237,7 +297,7 @@ impl WebSocketSender {
         self.send_text(&text).await
     }
 
-    pub async fn send_event<T>(&self, event: &str, data: &T) -> Result<(), WebSocketError>
+    pub async fn send_event<T>(&self, event: &str, data: &T) -> Result<(), WsError>
     where
         T: Serialize,
     {
@@ -248,26 +308,89 @@ impl WebSocketSender {
         .await
     }
 
-    pub async fn ping(&self, payload: impl Into<Bytes>) -> Result<(), WebSocketError> {
+    pub async fn ping(&self, payload: impl Into<Bytes>) -> Result<(), WsError> {
         self.send_control(ControlCommand::Ping(payload.into()))
             .await
     }
 
-    pub async fn pong(&self, payload: impl Into<Bytes>) -> Result<(), WebSocketError> {
+    pub async fn pong(&self, payload: impl Into<Bytes>) -> Result<(), WsError> {
         self.send_control(ControlCommand::Pong(payload.into()))
             .await
     }
 
-    pub async fn close(&self) -> Result<(), WebSocketError> {
-        self.send_control(ControlCommand::Close(None)).await
+    pub async fn close(&self) -> Result<(), WsError> {
+        self.close_with(1000, "").await
     }
 
-    async fn send_control(&self, command: ControlCommand) -> Result<(), WebSocketError> {
+    pub async fn close_with(&self, code: u16, reason: impl Into<String>) -> Result<(), WsError> {
+        let frame = CloseFrame {
+            code: CloseCode::from(code),
+            reason: reason.into().into(),
+        };
+        self.send_control(ControlCommand::Close(Some(frame))).await
+    }
+
+    pub async fn closed(&self) -> WebSocketCloseInfo {
+        let mut close_rx = self.shared.close_rx.clone();
+        wait_for_close(&mut close_rx).await
+    }
+
+    async fn send_application(&self, message: WebSocketMessage) -> Result<(), WsError> {
+        match self.shared.backpressure_policy {
+            BackpressurePolicy::Wait => {
+                let permit = tokio::time::timeout(
+                    self.shared.send_timeout,
+                    self.shared.outbound.clone().reserve_owned(),
+                )
+                .await
+                .map_err(|_| {
+                    self.shared.runtime.record_saturated_send();
+                    WsError::Timeout(WebSocketTimeout::Send)
+                })?
+                .map_err(|_| WsError::Closed)?;
+                permit.send(OutboundCommand::Message(message));
+                Ok(())
+            }
+            BackpressurePolicy::Reject => self.try_send(message),
+            BackpressurePolicy::Disconnect => match self.try_send(message) {
+                Ok(()) => Ok(()),
+                Err(WsError::Capacity(_)) => {
+                    self.disconnect_slow_consumer().await?;
+                    Err(WsError::Capacity(WebSocketCapacityError::OutboundQueue))
+                }
+                Err(error) => Err(error),
+            },
+        }
+    }
+
+    async fn disconnect_slow_consumer(&self) -> Result<(), WsError> {
+        let frame = CloseFrame {
+            code: CloseCode::Again,
+            reason: "Cliente WebSocket demasiado lento".into(),
+        };
+        self.send_control(ControlCommand::Disconnect(Some(frame)))
+            .await
+    }
+
+    fn try_send_control(&self, command: ControlCommand) -> Result<(), WsError> {
+        self.shared
+            .control
+            .try_send(command)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    self.shared.runtime.record_saturated_send();
+                    WsError::Capacity(WebSocketCapacityError::OutboundQueue)
+                }
+                mpsc::error::TrySendError::Closed(_) => WsError::Closed,
+            })
+    }
+
+    async fn send_control(&self, command: ControlCommand) -> Result<(), WsError> {
         self.shared
             .control
             .send(command)
             .await
-            .map_err(|_| closed_error())
+            .map_err(|_| WsError::Closed)
     }
 }
 
@@ -299,8 +422,179 @@ impl WebSocketReceiver {
     {
         self.recv_json::<WebSocketEvent<T>>().await
     }
+
+    pub async fn closed(&mut self) -> WebSocketCloseInfo {
+        wait_for_close(&mut self.close_rx).await
+    }
 }
 
-fn closed_error() -> WebSocketError {
-    WebSocketError::Protocol(tokio_tungstenite::tungstenite::Error::ConnectionClosed)
+fn compatibility_error(error: WsError) -> WebSocketError {
+    match error {
+        WsError::WebSocket(error) => error,
+        error => WebSocketError::Protocol(tokio_tungstenite::tungstenite::Error::Io(
+            io::Error::other(error.to_string()),
+        )),
+    }
+}
+
+async fn wait_for_close(
+    close_rx: &mut watch::Receiver<Option<WebSocketCloseInfo>>,
+) -> WebSocketCloseInfo {
+    loop {
+        if let Some(close_info) = close_rx.borrow().clone() {
+            return close_info;
+        }
+        if close_rx.changed().await.is_err() {
+            return WebSocketCloseInfo {
+                code: 1006,
+                reason: "El driver WebSocket termino sin publicar el cierre".to_string(),
+                initiator: WebSocketCloseInitiator::ProtocolError,
+                clean: false,
+            };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::app::websocket::runtime::WebSocketRuntimeHandle;
+    use crate::app::websocket::{
+        BackpressurePolicy, ResolvedWebSocketConfig, WebSocketCapacityError, WebSocketConfig,
+        WebSocketTimeout, WsError,
+    };
+
+    fn sender_with_policy(
+        policy: BackpressurePolicy,
+        send_timeout: Duration,
+    ) -> (WebSocketSender, DriverChannels, WebSocketRuntimeHandle) {
+        let runtime = WebSocketRuntimeHandle::local();
+        let config = ResolvedWebSocketConfig::from_layers(
+            &WebSocketConfig::new(),
+            &WebSocketConfig::new()
+                .outbound_capacity(1)
+                .backpressure_policy(policy)
+                .send_timeout(send_timeout),
+        );
+        let (socket, _internal_sender, channels) = channel_pair(
+            SocketMetadata {
+                id: WebSocketId(1),
+                remote_addr: None,
+                route: "/ws".to_string(),
+                protocol: None,
+            },
+            &config,
+            runtime.clone(),
+        );
+        let (_receiver, sender) = socket.split();
+        (sender, channels, runtime)
+    }
+
+    #[tokio::test]
+    async fn websocket_backpressure_try_send_reports_capacity_immediately() {
+        let (sender, _channels, runtime) =
+            sender_with_policy(BackpressurePolicy::Wait, Duration::from_secs(1));
+
+        sender.try_send(WebSocketMessage::text("first")).unwrap();
+        let error = sender
+            .try_send(WebSocketMessage::text("second"))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WsError::Capacity(WebSocketCapacityError::OutboundQueue)
+        ));
+        assert_eq!(runtime.stats().saturated_sends, 1);
+    }
+
+    #[tokio::test]
+    async fn websocket_backpressure_wait_times_out() {
+        let (sender, _channels, runtime) =
+            sender_with_policy(BackpressurePolicy::Wait, Duration::from_millis(20));
+        sender.try_send(WebSocketMessage::text("first")).unwrap();
+
+        let error = sender
+            .send(WebSocketMessage::text("second"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, WsError::Timeout(WebSocketTimeout::Send)));
+        assert_eq!(runtime.stats().saturated_sends, 1);
+    }
+
+    #[tokio::test]
+    async fn websocket_backpressure_reject_does_not_wait() {
+        let (sender, _channels, runtime) =
+            sender_with_policy(BackpressurePolicy::Reject, Duration::from_secs(1));
+        sender.try_send(WebSocketMessage::text("first")).unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_millis(50),
+            sender.send(WebSocketMessage::text("second")),
+        )
+        .await
+        .expect("Reject must return without waiting")
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WsError::Capacity(WebSocketCapacityError::OutboundQueue)
+        ));
+        assert_eq!(runtime.stats().saturated_sends, 1);
+    }
+
+    #[tokio::test]
+    async fn websocket_backpressure_disconnect_queues_close_1013() {
+        let (sender, mut channels, runtime) =
+            sender_with_policy(BackpressurePolicy::Disconnect, Duration::from_secs(1));
+        sender.try_send(WebSocketMessage::text("first")).unwrap();
+
+        let error = sender
+            .send(WebSocketMessage::text("second"))
+            .await
+            .unwrap_err();
+        let command = channels.control_rx.recv().await.unwrap();
+
+        assert!(matches!(
+            error,
+            WsError::Capacity(WebSocketCapacityError::OutboundQueue)
+        ));
+        let ControlCommand::Disconnect(Some(frame)) = command else {
+            panic!("Disconnect must enqueue a Close frame");
+        };
+        assert_eq!(u16::from(frame.code), 1013);
+        assert_eq!(runtime.stats().saturated_sends, 1);
+    }
+
+    #[tokio::test]
+    async fn websocket_split_handles_observe_published_close() {
+        let runtime = WebSocketRuntimeHandle::local();
+        let config = ResolvedWebSocketConfig::from_layers(
+            &WebSocketConfig::new(),
+            &WebSocketConfig::new().outbound_capacity(1),
+        );
+        let (socket, _internal_sender, channels) = channel_pair(
+            SocketMetadata {
+                id: WebSocketId(1),
+                remote_addr: None,
+                route: "/ws".to_string(),
+                protocol: None,
+            },
+            &config,
+            runtime,
+        );
+        let (mut receiver, sender) = socket.split();
+        let expected = WebSocketCloseInfo {
+            code: 1000,
+            reason: "finalizado".to_string(),
+            initiator: super::super::WebSocketCloseInitiator::Local,
+            clean: true,
+        };
+        channels.close_tx.send(Some(expected.clone())).unwrap();
+
+        assert_eq!(sender.closed().await, expected);
+        assert_eq!(receiver.closed().await, expected);
+    }
 }

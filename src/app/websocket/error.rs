@@ -113,3 +113,9 @@ impl From<WebSocketError> for WsError {
         Self::WebSocket(value)
     }
 }
+
+impl From<serde_json::Error> for WsError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::WebSocket(value.into())
+    }
+}

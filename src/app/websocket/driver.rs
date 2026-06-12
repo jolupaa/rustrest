@@ -451,8 +451,8 @@ mod tests {
                 route: "/ws".to_string(),
                 protocol: None,
             },
-            8,
-            8,
+            &config,
+            runtime.clone(),
         );
         let (start_tx, start_rx) = oneshot::channel();
         let (driver_start_tx, driver_start_rx) = oneshot::channel();

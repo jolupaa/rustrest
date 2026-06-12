@@ -312,8 +312,8 @@ fn spawn_websocket(
                         route,
                         protocol,
                     },
-                    config.inbound_capacity,
-                    config.outbound_capacity,
+                    &config,
+                    runtime.clone(),
                 );
                 let driver =
                     driver::spawn(upgraded, config, handler, socket, channels, permit).await;
