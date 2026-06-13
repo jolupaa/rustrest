@@ -103,7 +103,7 @@ impl TestRequest<'_> {
             return self
                 .client
                 .app
-                .error_response(HttpError::new(413, "Payload Too Large"));
+                .error_response(HttpError::payload_too_large("Payload Too Large"));
         }
         self.client.app.run_request(request).await
     }

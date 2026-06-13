@@ -634,10 +634,10 @@ Global error handler:
 ```rust
 app.error_handler(|err: HttpError| {
     Response::json(&serde_json::json!({
-        "error": err.message(),
-        "status": err.status(),
+        "error": err.public_message(),
+        "status": err.status().as_u16(),
     }))
-    .status(err.status())
+    .status(err.status().as_u16())
 });
 ```
 

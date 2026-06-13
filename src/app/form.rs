@@ -31,8 +31,9 @@ impl Request {
     /// Deserializes an `application/x-www-form-urlencoded` body into `T`.
     /// Repeated keys map onto `Vec` fields.
     pub fn form<T: DeserializeOwned>(&self) -> Result<T, HttpError> {
-        serde_html_form::from_bytes(self.bytes())
-            .map_err(|err| HttpError::bad_request(format!("Invalid form body: {}", err)))
+        serde_html_form::from_bytes(self.bytes()).map_err(|err| {
+            HttpError::bad_request(format!("Invalid form body: {}", err)).with_source(err)
+        })
     }
 
     /// Parses a `multipart/form-data` body into its parts. The whole body is

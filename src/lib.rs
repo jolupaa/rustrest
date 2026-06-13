@@ -25,8 +25,8 @@ pub mod app;
 #[cfg(feature = "tls")]
 pub use app::tls;
 pub use app::{
-    App, BackpressurePolicy, Cookie, Cookies, ErrorHandler, Form, FromRequest, Handler, Headers,
-    HttpError, InMemoryWsBroker, IntoHandler, IntoHttpError, IntoMiddleware, IntoResponse,
+    App, BackpressurePolicy, BoxError, Cookie, Cookies, ErrorHandler, Form, FromRequest, Handler,
+    Headers, HttpError, InMemoryWsBroker, IntoHandler, IntoHttpError, IntoMiddleware, IntoResponse,
     IntoWebSocketHandler, IntoWebSocketOutput, Json, Middleware, MultipartPart, Next, OriginPolicy,
     Path, Query, Request, RequestBuilder, Response, RouteHandle, RouteInfo, Router, SameSite,
     Sessions, SseEvent, State, StateStore, TestClient, TestRequest, TrailingSlash, WebSocket,

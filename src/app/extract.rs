@@ -35,9 +35,9 @@ where
     T: DeserializeOwned,
 {
     fn from_request(req: &Request) -> Result<Self, HttpError> {
-        req.json()
-            .map(Json)
-            .map_err(|err| HttpError::bad_request(format!("Invalid JSON: {}", err)))
+        req.json().map(Json).map_err(|err| {
+            HttpError::bad_request(format!("Invalid JSON: {}", err)).with_source(err)
+        })
     }
 }
 
@@ -46,13 +46,11 @@ where
     T: DeserializeOwned,
 {
     fn from_request(req: &Request) -> Result<Self, HttpError> {
-        let map_error =
-            |err: String| HttpError::bad_request(format!("Invalid path parameters: {}", err));
-
         // Structs deserialize from the param map; a single captured param can
         // also deserialize directly into a scalar (`Path<u32>` for `/:id`).
-        let encoded =
-            serde_urlencoded::to_string(&req.params).map_err(|err| map_error(err.to_string()))?;
+        let encoded = serde_urlencoded::to_string(&req.params).map_err(|err| {
+            HttpError::bad_request(format!("Invalid path parameters: {}", err)).with_source(err)
+        })?;
         match serde_urlencoded::from_str(&encoded) {
             Ok(value) => Ok(Path(value)),
             Err(struct_error) => {
@@ -62,7 +60,10 @@ where
                         return Ok(Path(value));
                     }
                 }
-                Err(map_error(struct_error.to_string()))
+                Err(
+                    HttpError::bad_request(format!("Invalid path parameters: {}", struct_error))
+                        .with_source(struct_error),
+                )
             }
         }
     }
@@ -83,7 +84,9 @@ where
     fn from_request(req: &Request) -> Result<Self, HttpError> {
         serde_html_form::from_str(req.raw_query.as_deref().unwrap_or(""))
             .map(Query)
-            .map_err(|err| HttpError::bad_request(format!("Invalid query string: {}", err)))
+            .map_err(|err| {
+                HttpError::bad_request(format!("Invalid query string: {}", err)).with_source(err)
+            })
     }
 }
 
@@ -137,7 +140,9 @@ where
     fn from_request(req: &Request) -> Result<Self, HttpError> {
         deserialize_string_map(&req.cookies)
             .map(Cookies)
-            .map_err(|err| HttpError::bad_request(format!("Invalid cookies: {}", err)))
+            .map_err(|err| {
+                HttpError::bad_request(format!("Invalid cookies: {}", err)).with_source(err)
+            })
     }
 }
 
@@ -148,7 +153,9 @@ where
     fn from_request(req: &Request) -> Result<Self, HttpError> {
         deserialize_string_map(&req.headers)
             .map(Headers)
-            .map_err(|err| HttpError::bad_request(format!("Invalid headers: {}", err)))
+            .map_err(|err| {
+                HttpError::bad_request(format!("Invalid headers: {}", err)).with_source(err)
+            })
     }
 }
 

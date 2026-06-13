@@ -95,7 +95,9 @@ impl Response {
     pub fn json<T: Serialize>(value: &T) -> Self {
         match serde_json::to_string(value) {
             Ok(body) => Self::bytes(Bytes::from(body), "application/json"),
-            Err(_) => Self::internal_server_error(),
+            Err(error) => Self::from_error(
+                HttpError::internal_server_error("Internal Server Error").with_source(error),
+            ),
         }
     }
 
@@ -113,9 +115,17 @@ impl Response {
 
     pub fn from_error(error: HttpError) -> Self {
         let status = error.status();
-        let body = format!("{} {}", status, error.message());
+        let body = serde_json::json!({
+            "type": format!("about:blank#{}", error.code()),
+            "title": status.canonical_reason().unwrap_or("HTTP Error"),
+            "status": status.as_u16(),
+            "detail": error.public_message(),
+            "code": error.code(),
+        })
+        .to_string();
         let mut response =
-            Self::bytes(Bytes::from(body), "text/plain; charset=utf-8").status(status);
+            Self::bytes(Bytes::from(body), "application/problem+json").status(status.as_u16());
+        response.headers = error.headers().clone();
         response.error = Some(error);
         response
     }

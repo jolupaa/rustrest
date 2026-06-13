@@ -11,6 +11,8 @@ mod types;
 
 use super::{HttpError, Request, Response};
 use base64::Engine;
+use hyper::StatusCode;
+use hyper::header::{HeaderName, HeaderValue, RETRY_AFTER};
 use hyper::upgrade::OnUpgrade;
 
 pub use broker::{
@@ -57,15 +59,22 @@ impl HandshakeRejection {
         self
     }
 
-    fn into_response(self) -> Response {
-        self.headers.into_iter().fold(
-            Response::send(self.message).status(self.status),
-            |response, (name, value)| response.header(name, value),
-        )
-    }
-
     pub(crate) fn into_http_error(self) -> HttpError {
-        HttpError::new(self.status, self.message)
+        let error = match StatusCode::from_u16(self.status) {
+            Ok(StatusCode::BAD_REQUEST) => HttpError::bad_request(self.message),
+            Ok(StatusCode::FORBIDDEN) => HttpError::forbidden(self.message),
+            Ok(StatusCode::UPGRADE_REQUIRED) => HttpError::upgrade_required(self.message),
+            Ok(status) => HttpError::new(status, "websocket_handshake_rejected", self.message),
+            Err(error) => HttpError::internal_server_error("Error interno").with_source(error),
+        };
+        self.headers
+            .into_iter()
+            .fold(error, |error, (name, value)| {
+                error.header(
+                    HeaderName::from_static(name),
+                    HeaderValue::from_static(value),
+                )
+            })
     }
 }
 
@@ -242,7 +251,7 @@ impl Request {
         });
         let protocol = match validate_handshake(&self, &config) {
             Ok(protocol) => protocol,
-            Err(rejection) => return rejection.into_response(),
+            Err(rejection) => return Response::from_error(rejection.into_http_error()),
         };
 
         self.into_websocket_response(config, protocol, handler)
@@ -262,7 +271,7 @@ impl Request {
             &config,
         ) {
             Ok(permit) => permit,
-            Err(error) => return error.into_response(),
+            Err(error) => return Response::from_error(error.into_http_error()),
         };
         let mut response = match Response::websocket(&self) {
             Ok(response) => response,
@@ -290,22 +299,29 @@ impl Request {
 }
 
 impl AdmissionError {
-    fn into_response(self) -> Response {
+    fn into_http_error(self) -> HttpError {
         match self {
-            Self::Shutdown => Response::send("El runtime WebSocket se esta cerrando").status(503),
-            Self::ProcessCapacity => {
-                Response::send("La capacidad global de conexiones WebSocket esta agotada")
-                    .status(503)
-            }
-            Self::RouteCapacity => {
-                Response::send("La capacidad de conexiones WebSocket para esta ruta esta agotada")
-                    .status(503)
-            }
-            Self::IpCapacity => Response::send(
+            Self::Shutdown => HttpError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "websocket_shutdown",
+                "El runtime WebSocket se esta cerrando",
+            ),
+            Self::ProcessCapacity => HttpError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "websocket_process_capacity",
+                "La capacidad global de conexiones WebSocket esta agotada",
+            ),
+            Self::RouteCapacity => HttpError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "websocket_route_capacity",
+                "La capacidad de conexiones WebSocket para esta ruta esta agotada",
+            ),
+            Self::IpCapacity => HttpError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "websocket_ip_capacity",
                 "El limite de conexiones WebSocket para esta direccion IP esta agotado",
             )
-            .status(429)
-            .header("retry-after", "1"),
+            .header(RETRY_AFTER, HeaderValue::from_static("1")),
         }
     }
 }

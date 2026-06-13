@@ -526,9 +526,9 @@ impl App {
             Ok(collected) => collected.to_bytes(),
             Err(err) => {
                 let error = if err.downcast_ref::<LengthLimitError>().is_some() {
-                    HttpError::new(413, "Payload Too Large")
+                    HttpError::payload_too_large("Payload Too Large").with_source(err)
                 } else {
-                    HttpError::bad_request("Could not read request body")
+                    HttpError::bad_request("Could not read request body").with_source(err)
                 };
                 return self.error_response(error).into_hyper();
             }
@@ -563,17 +563,27 @@ impl App {
         match self.config.request_timeout {
             Some(timeout) => match tokio::time::timeout(timeout, self.dispatch(request)).await {
                 Ok(response) => response,
-                Err(_) => self.error_response(HttpError::new(408, "Request Timeout")),
+                Err(_) => self.error_response(HttpError::request_timeout("Request Timeout")),
             },
             None => self.dispatch(request).await,
         }
     }
 
     /// Builds a response for an error, routing it through the registered
-    /// `error_handler` if one is set, otherwise a default plain-text response.
+    /// `error_handler` if one is set, otherwise a default problem response.
     pub(crate) fn error_response(&self, error: HttpError) -> Response {
         match &self.error_handler {
-            Some(handler) => handler(error),
+            Some(handler) => {
+                let headers = error.headers().clone();
+                let mut response = handler(error);
+                for name in headers.keys() {
+                    response.headers.remove(name);
+                }
+                for (name, value) in &headers {
+                    response.headers.append(name, value.clone());
+                }
+                response
+            }
             None => Response::from_error(error),
         }
     }
@@ -704,8 +714,8 @@ impl App {
             Err(_) => panic_response(),
         };
         if let Some(err) = response.take_error() {
-            if let Some(handler) = &self.error_handler {
-                response = handler(err);
+            if self.error_handler.is_some() {
+                response = self.error_response(err);
             }
         }
         if is_head {

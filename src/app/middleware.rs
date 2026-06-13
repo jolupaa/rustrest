@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flate2::Compression;
 use flate2::write::{GzEncoder, ZlibEncoder};
-use hyper::header::{CONTENT_ENCODING, VARY};
+use hyper::header::{CONTENT_ENCODING, HeaderValue, RETRY_AFTER, VARY};
 
 use super::{HttpError, IntoMiddleware, Middleware, Next, Request, Response};
 
@@ -67,16 +67,12 @@ pub fn gzip() -> Middleware {
                 .map_body_bytes(|body| {
                     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
                     encoder.write_all(body).map_err(|err| {
-                        HttpError::internal_server_error(format!(
-                            "Could not compress response: {}",
-                            err
-                        ))
+                        HttpError::internal_server_error("Could not compress response")
+                            .with_source(err)
                     })?;
                     encoder.finish().map_err(|err| {
-                        HttpError::internal_server_error(format!(
-                            "Could not finish gzip encoding: {}",
-                            err
-                        ))
+                        HttpError::internal_server_error("Could not finish gzip encoding")
+                            .with_source(err)
                     })
                 })
                 .is_ok()
@@ -150,8 +146,9 @@ impl Encoding {
     }
 
     fn encode(self, body: &[u8]) -> Result<Vec<u8>, HttpError> {
-        let failed =
-            |err: std::io::Error| HttpError::internal_server_error(format!("Compression: {err}"));
+        let failed = |err: std::io::Error| {
+            HttpError::internal_server_error("Could not compress response").with_source(err)
+        };
         match self {
             #[cfg(feature = "brotli")]
             Encoding::Brotli => {
@@ -310,7 +307,7 @@ pub fn timeout(duration: Duration) -> Middleware {
         Box::pin(async move {
             match tokio::time::timeout(duration, next(req)).await {
                 Ok(res) => res,
-                Err(_) => Response::from_error(HttpError::new(408, "Request Timeout")),
+                Err(_) => Response::from_error(HttpError::request_timeout("Request Timeout")),
             }
         })
     })
@@ -320,8 +317,8 @@ pub fn timeout(duration: Duration) -> Middleware {
 /// `window` from one IP (requests without a peer address — e.g. from the test
 /// client — share a single bucket). Over the limit the middleware
 /// short-circuits with `429 Too Many Requests` and a `Retry-After` header in
-/// seconds. The 429 is returned directly rather than through the error
-/// handler so `Retry-After` is always preserved.
+/// seconds. The structured error still flows through a registered global
+/// error handler, while its `Retry-After` header is preserved.
 pub fn rate_limit(max_requests: u32, window: Duration) -> Middleware {
     /// Per-client window state: window start and requests seen in it. The
     /// `None` key holds clients with no known peer address.
@@ -342,9 +339,15 @@ pub fn rate_limit(max_requests: u32, window: Duration) -> Middleware {
                 (*count > max_requests).then(|| window.saturating_sub(now.duration_since(*start)))
             };
             match over_limit {
-                Some(remaining) => Response::send("Too Many Requests")
-                    .status(429)
-                    .header("retry-after", &remaining.as_secs().max(1).to_string()),
+                Some(remaining) => {
+                    let retry_after = remaining.as_secs().max(1).to_string();
+                    let retry_after =
+                        HeaderValue::from_str(&retry_after).expect("retry seconds are valid");
+                    Response::from_error(
+                        HttpError::too_many_requests("Too Many Requests")
+                            .header(RETRY_AFTER, retry_after),
+                    )
+                }
                 None => next(req).await,
             }
         })

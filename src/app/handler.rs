@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures_util::FutureExt;
+use hyper::header::{ALLOW, HeaderValue};
 
 use super::{HttpError, IntoResponse, Request, Response};
 
@@ -129,8 +130,10 @@ pub(crate) fn method_not_allowed_handler(allow: String) -> Handler {
         move |_req: Request| -> Pin<Box<dyn Future<Output = Response> + Send>> {
             let allow = allow.clone();
             Box::pin(async move {
-                Response::from_error(HttpError::new(405, "Method Not Allowed"))
-                    .header("allow", &allow)
+                let allow = HeaderValue::from_str(&allow).expect("generated Allow header is valid");
+                Response::from_error(
+                    HttpError::method_not_allowed("Method Not Allowed").header(ALLOW, allow),
+                )
             })
         },
     )

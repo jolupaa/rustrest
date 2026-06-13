@@ -2,8 +2,12 @@ use super::router::{match_pattern, parse_pattern, path_segments};
 use super::*;
 use futures_util::stream;
 use http_body_util::BodyExt;
+use hyper::StatusCode;
 use hyper::body::Bytes;
-use hyper::header::{CONTENT_ENCODING, LOCATION, SET_COOKIE};
+use hyper::header::{
+    ALLOW, CONTENT_ENCODING, HeaderValue, LOCATION, RETRY_AFTER, SEC_WEBSOCKET_VERSION, SET_COOKIE,
+    WWW_AUTHENTICATE,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -33,6 +37,98 @@ fn dummy_request(body: &str) -> Request {
         secure_transport: false,
         header_pairs: Vec::new(),
     }
+}
+
+#[test]
+fn http_error_preserves_code_headers_and_private_source() {
+    let error = HttpError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limited",
+        "Demasiadas solicitudes",
+    )
+    .header(RETRY_AFTER, HeaderValue::from_static("30"))
+    .with_source(std::io::Error::other("redis unavailable"));
+
+    assert_eq!(error.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(error.code(), "rate_limited");
+    assert_eq!(error.public_message(), "Demasiadas solicitudes");
+    assert_eq!(error.headers().get(RETRY_AFTER).unwrap(), "30");
+    assert_eq!(error.source().unwrap().to_string(), "redis unavailable");
+}
+
+#[test]
+fn problem_details_never_exposes_internal_source() {
+    let response = Response::from_error(
+        HttpError::internal_server_error("Error interno")
+            .with_source(std::io::Error::other("database password leaked")),
+    );
+    let json: serde_json::Value = serde_json::from_slice(response.body_bytes().unwrap()).unwrap();
+
+    assert_eq!(json["status"], 500);
+    assert_eq!(json["code"], "internal_server_error");
+    assert_eq!(json["detail"], "Error interno");
+    assert!(!response.body_text().contains("database password"));
+}
+
+#[test]
+fn unauthorized_problem_preserves_authenticate_header() {
+    let response = Response::from_error(HttpError::unauthorized("Autenticacion requerida").header(
+        WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer realm=\"api\""),
+    ));
+
+    assert_eq!(
+        response.headers.get(WWW_AUTHENTICATE).unwrap(),
+        "Bearer realm=\"api\""
+    );
+}
+
+#[test]
+fn problem_response_preserves_duplicate_authenticate_headers() {
+    let response = Response::from_error(
+        HttpError::unauthorized("Autenticacion requerida")
+            .header(
+                WWW_AUTHENTICATE,
+                HeaderValue::from_static("Bearer realm=\"api\""),
+            )
+            .append_header(
+                WWW_AUTHENTICATE,
+                HeaderValue::from_static("Basic realm=\"legacy\""),
+            ),
+    );
+
+    let values: Vec<_> = response
+        .headers
+        .get_all(WWW_AUTHENTICATE)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(values, ["Bearer realm=\"api\"", "Basic realm=\"legacy\""]);
+}
+
+#[test]
+fn http_error_header_replaces_duplicate_values() {
+    let error = HttpError::unauthorized("Autenticacion requerida")
+        .append_header(
+            WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"api\""),
+        )
+        .append_header(
+            WWW_AUTHENTICATE,
+            HeaderValue::from_static("Basic realm=\"legacy\""),
+        )
+        .header(
+            WWW_AUTHENTICATE,
+            HeaderValue::from_static("Digest realm=\"replacement\""),
+        );
+
+    let values: Vec<_> = error
+        .headers()
+        .get_all(WWW_AUTHENTICATE)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(values, ["Digest realm=\"replacement\""]);
 }
 
 #[test]
@@ -101,6 +197,74 @@ async fn websocket_dispatch_uses_app_runtime_and_releases_failed_spawn() {
     assert_eq!(runtime.stats().accepted_connections, 1);
     assert_eq!(runtime.stats().active_connections, 0);
     assert_eq!(runtime.stats().closed_connections, 1);
+}
+
+#[tokio::test]
+async fn websocket_handshake_rejections_use_global_error_handler() {
+    let mut app = App::new();
+    app.error_handler(|err: HttpError| {
+        let status = err.status();
+        Response::json(&serde_json::json!({ "code": err.code() })).status(status.as_u16())
+    });
+    app.websocket("/ws", |_socket| async move {});
+
+    let request = Request::builder()
+        .method("GET")
+        .path("/ws")
+        .header("host", "localhost")
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "12")
+        .build();
+
+    let response = app.dispatch(request).await;
+
+    assert_eq!(response.status, 426);
+    assert_eq!(response.content_type, "application/json");
+    assert_eq!(response.body_text(), r#"{"code":"upgrade_required"}"#);
+    assert_eq!(response.headers.get(SEC_WEBSOCKET_VERSION).unwrap(), "13");
+}
+
+#[tokio::test]
+async fn websocket_admission_rejections_use_global_error_handler() {
+    let defaults = WebSocketConfig::new().max_connections_per_ip(1);
+    let mut app = App::new();
+    app.websocket_defaults(defaults.clone());
+    app.error_handler(|err: HttpError| {
+        let status = err.status();
+        Response::json(&serde_json::json!({ "code": err.code() })).status(status.as_u16())
+    });
+    app.websocket("/ws", |_socket| async move {});
+
+    let runtime = app.websocket_runtime();
+    let config =
+        super::websocket::ResolvedWebSocketConfig::from_layers(&defaults, &WebSocketConfig::new());
+    let _permit = runtime
+        .admit(
+            "/ws",
+            Some("127.0.0.1:4501".parse().unwrap()),
+            None,
+            &config,
+        )
+        .unwrap();
+    let request = Request::builder()
+        .method("GET")
+        .path("/ws")
+        .header("host", "localhost")
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .remote_addr("127.0.0.1:4502".parse().unwrap())
+        .build();
+
+    let response = app.dispatch(request).await;
+
+    assert_eq!(response.status, 429);
+    assert_eq!(response.content_type, "application/json");
+    assert_eq!(response.body_text(), r#"{"code":"websocket_ip_capacity"}"#);
+    assert_eq!(response.headers.get(RETRY_AFTER).unwrap(), "1");
 }
 
 #[test]
@@ -278,10 +442,10 @@ async fn http_errors_keep_status_and_can_use_global_error_handler() {
     let mut app = App::new();
     app.error_handler(|err: HttpError| {
         Response::json(&ErrorBody {
-            error: err.message(),
-            status: err.status(),
+            error: err.public_message(),
+            status: err.status().as_u16(),
         })
-        .status(err.status())
+        .status(err.status().as_u16())
     });
     app.get("/", |_req: Request| -> Result<Response, HttpError> {
         Err(HttpError::bad_request("Invalid name"))
@@ -291,6 +455,56 @@ async fn http_errors_keep_status_and_can_use_global_error_handler() {
 
     assert_eq!(res.status, 400);
     assert_eq!(res.body_text(), r#"{"error":"Invalid name","status":400}"#);
+}
+
+#[tokio::test]
+async fn global_error_handler_yields_to_mandatory_error_headers() {
+    let mut app = App::new();
+    app.error_handler(|err: HttpError| {
+        let status = err.status();
+        Response::json(&serde_json::json!({ "code": err.code() }))
+            .status(status.as_u16())
+            .header(ALLOW.as_str(), "CUSTOM")
+            .header(RETRY_AFTER.as_str(), "999")
+            .header(WWW_AUTHENTICATE.as_str(), "Custom first")
+            .append_header(WWW_AUTHENTICATE.as_str(), "Custom second")
+    });
+    app.get("/method", |_req: Request| Response::send("ok"));
+    app.get("/rate", |_req: Request| -> Result<Response, HttpError> {
+        Err(HttpError::too_many_requests("Demasiadas solicitudes")
+            .header(RETRY_AFTER, HeaderValue::from_static("30")))
+    });
+    app.get("/auth", |_req: Request| -> Result<Response, HttpError> {
+        Err(HttpError::unauthorized("Autenticacion requerida")
+            .header(
+                WWW_AUTHENTICATE,
+                HeaderValue::from_static("Bearer realm=\"api\""),
+            )
+            .append_header(
+                WWW_AUTHENTICATE,
+                HeaderValue::from_static("Basic realm=\"legacy\""),
+            ))
+    });
+
+    let method = app.dispatch(request_with_method("POST", "/method")).await;
+    assert_eq!(method.headers.get_all(ALLOW).iter().count(), 1);
+    assert_eq!(method.headers.get(ALLOW).unwrap(), "GET, HEAD, OPTIONS");
+
+    let rate = app.dispatch(request_with_method("GET", "/rate")).await;
+    assert_eq!(rate.headers.get_all(RETRY_AFTER).iter().count(), 1);
+    assert_eq!(rate.headers.get(RETRY_AFTER).unwrap(), "30");
+
+    let auth = app.dispatch(request_with_method("GET", "/auth")).await;
+    let challenges: Vec<_> = auth
+        .headers
+        .get_all(WWW_AUTHENTICATE)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(
+        challenges,
+        ["Bearer realm=\"api\"", "Basic realm=\"legacy\""]
+    );
 }
 
 #[tokio::test]
@@ -440,6 +654,10 @@ async fn rate_limit_middleware_throttles_per_ip_and_recovers() {
     }
 
     let mut app = App::new();
+    app.error_handler(|err: HttpError| {
+        let status = err.status();
+        Response::json(&serde_json::json!({ "code": err.code() })).status(status.as_u16())
+    });
     app.layer(middleware::rate_limit(
         2,
         std::time::Duration::from_millis(80),
@@ -453,6 +671,7 @@ async fn rate_limit_middleware_throttles_per_ip_and_recovers() {
     let throttled = app.dispatch(request_from("1.1.1.1:1002")).await;
     assert_eq!(throttled.status, 429);
     assert!(throttled.headers.get("retry-after").is_some());
+    assert_eq!(throttled.body_text(), r#"{"code":"too_many_requests"}"#);
 
     // A different client is unaffected.
     assert_eq!(app.dispatch(request_from("2.2.2.2:1000")).await.status, 200);
@@ -620,10 +839,10 @@ async fn error_handler_formats_404_and_405() {
     let mut app = App::new();
     app.error_handler(|err: HttpError| {
         Response::json(&ErrorBody {
-            error: err.message().to_string(),
-            status: err.status(),
+            error: err.public_message().to_string(),
+            status: err.status().as_u16(),
         })
-        .status(err.status())
+        .status(err.status().as_u16())
     });
     app.get("/exists", |_r: Request| Response::send("ok"));
 
@@ -637,6 +856,7 @@ async fn error_handler_formats_404_and_405() {
     let res = app.dispatch(request_with_method("POST", "/exists")).await;
     assert_eq!(res.status, 405);
     assert_eq!(res.content_type, "application/json");
+    assert_eq!(res.headers.get(ALLOW).unwrap(), "GET, HEAD, OPTIONS");
 }
 
 #[tokio::test]
@@ -845,14 +1065,17 @@ fn send_sets_text_plain_and_200() {
 fn not_found_sets_404() {
     let res = Response::not_found();
     assert_eq!(res.status, 404);
-    assert_eq!(res.body_text(), "404 Not Found");
+    assert_eq!(res.content_type, "application/problem+json");
+    let body: serde_json::Value = serde_json::from_slice(res.body_bytes().unwrap()).unwrap();
+    assert_eq!(body["code"], "not_found");
+    assert_eq!(body["detail"], "Not Found");
 }
 
 #[test]
 fn bad_request_sets_400() {
     let res = Response::bad_request();
     assert_eq!(res.status, 400);
-    assert_eq!(res.content_type, "text/plain; charset=utf-8");
+    assert_eq!(res.content_type, "application/problem+json");
 }
 
 #[test]
@@ -875,7 +1098,7 @@ fn json_serialization_error_degrades_to_500() {
     map.insert((1, 2), 3);
     let res = Response::json(&map);
     assert_eq!(res.status, 500);
-    assert_eq!(res.content_type, "text/plain; charset=utf-8");
+    assert_eq!(res.content_type, "application/problem+json");
 }
 
 #[test]
