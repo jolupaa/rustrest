@@ -967,6 +967,10 @@ The project includes:
 - Core unit tests in `src/app/tests.rs`.
 - A real HTTP integration test in `tests/http_integration.rs`.
 
+## Compatibility and releases
+
+See the [changelog](CHANGELOG.md) for notable changes, the [release policy](docs/releases.md) for compatibility guarantees, and the [migration guides](docs/migrations/README.md) for breaking upgrades.
+
 ## Publishing Preparation
 
 This repository already includes basic crates.io metadata:
