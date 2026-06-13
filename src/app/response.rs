@@ -14,7 +14,8 @@ use hyper::header::{
 use serde::Serialize;
 use sha1::{Digest, Sha1};
 
-use super::{HttpError, IntoHttpError, Request, SseEvent};
+use super::websocket::{ResolvedWebSocketConfig, validate_handshake};
+use super::{HttpError, IntoHttpError, Request, SseEvent, WebSocketConfig};
 
 pub(crate) type ResponseBody = UnsyncBoxBody<Bytes, Infallible>;
 type ResponseStream = Pin<Box<dyn Stream<Item = Result<Frame<Bytes>, Infallible>> + Send>>;
@@ -157,13 +158,13 @@ impl Response {
     }
 
     pub fn websocket(req: &Request) -> Result<Self, HttpError> {
-        if !req.is_websocket_upgrade() {
-            return Err(HttpError::bad_request("Invalid WebSocket upgrade"));
-        }
+        let defaults = WebSocketConfig::default();
+        let config = ResolvedWebSocketConfig::from_layers(&defaults, &defaults);
+        validate_handshake(req, &config).map_err(|rejection| rejection.into_http_error())?;
 
         let key = req
             .header(SEC_WEBSOCKET_KEY.as_str())
-            .ok_or_else(|| HttpError::bad_request("Missing Sec-WebSocket-Key"))?;
+            .ok_or_else(|| HttpError::bad_request("Falta Sec-WebSocket-Key"))?;
         let mut hasher = Sha1::new();
         hasher.update(key.as_bytes());
         hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");

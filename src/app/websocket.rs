@@ -1,251 +1,218 @@
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Duration;
-
-use futures_util::{SinkExt, StreamExt};
-use hyper::upgrade::OnUpgrade;
-use hyper_util::rt::TokioIo;
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::protocol::Role;
+mod broker;
+mod config;
+mod driver;
+mod error;
+mod hub;
+mod runtime;
+mod socket;
+#[cfg(test)]
+mod tests;
+mod types;
 
 use super::{HttpError, Request, Response};
+use base64::Engine;
+use hyper::upgrade::OnUpgrade;
 
-pub use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
+pub use broker::{
+    InMemoryWsBroker, WsBroker, WsBrokerError, WsBrokerErrorCategory, WsBrokerPayload,
+    WsBrokerPublication, WsBrokerStream, WsBrokerTarget, WsNodeId, WsPublicationId,
+};
+pub(crate) use config::ResolvedWebSocketConfig;
+pub use config::{BackpressurePolicy, OriginPolicy, WebSocketConfig};
+pub use error::{
+    WebSocketCapacityError, WebSocketError, WebSocketTimeout, WsBroadcastError, WsError,
+};
+pub use hub::{WsBroadcastReport, WsHub, WsHubBuilder, WsLocalSocket, WsRoute, WsTarget};
+pub use runtime::WebSocketRuntimeHandle;
+use socket::NormalizedWebSocketHandler;
+pub use socket::{
+    IntoWebSocketHandler, IntoWebSocketOutput, WebSocket, WebSocketEvent, WebSocketHandler,
+    WebSocketMessage, WebSocketReceiver, WebSocketSender,
+};
+pub use types::{
+    WebSocketCloseInfo, WebSocketCloseInitiator, WebSocketConnectionSnapshot,
+    WebSocketErrorCategory, WebSocketId, WebSocketLifecycleState, WebSocketObservation,
+    WebSocketObserver, WebSocketStats, WsRemotePublish,
+};
 
-/// Per-route WebSocket options: subprotocol negotiation, incoming message
-/// size limit, and automatic keepalive pings. Pass to
-/// [`Request::websocket_with`] or `websocket_with` on `App`/`Router`.
-#[derive(Clone, Default)]
-pub struct WebSocketConfig {
-    protocols: Vec<String>,
-    max_message_size: Option<usize>,
-    ping_interval: Option<Duration>,
+pub(crate) use runtime::{AdmissionError, ConnectionPermit};
+
+pub(crate) struct HandshakeRejection {
+    status: u16,
+    message: &'static str,
+    headers: Vec<(&'static str, &'static str)>,
 }
 
-impl WebSocketConfig {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Declares the subprotocols the server supports. The first
-    /// client-offered protocol in this list is selected and echoed in the
-    /// `Sec-WebSocket-Protocol` response header.
-    pub fn protocols(mut self, protocols: &[&str]) -> Self {
-        self.protocols = protocols.iter().map(|p| p.to_string()).collect();
-        self
-    }
-
-    /// Caps the size of incoming messages; larger ones error the connection.
-    pub fn max_message_size(mut self, bytes: usize) -> Self {
-        self.max_message_size = Some(bytes);
-        self
-    }
-
-    /// Sends a Ping whenever the connection has been idle in
-    /// [`WebSocket::recv`] for `interval`, keeping intermediaries from
-    /// dropping quiet connections.
-    pub fn ping_interval(mut self, interval: Duration) -> Self {
-        self.ping_interval = Some(interval);
-        self
-    }
-
-    /// Picks the first client-offered subprotocol the server supports.
-    pub(super) fn negotiate(&self, req: &Request) -> Option<String> {
-        for raw in req.headers_all("sec-websocket-protocol") {
-            for candidate in raw.split(',') {
-                let candidate = candidate.trim();
-                if self
-                    .protocols
-                    .iter()
-                    .any(|supported| supported.eq_ignore_ascii_case(candidate))
-                {
-                    return Some(candidate.to_string());
-                }
-            }
-        }
-        None
-    }
-}
-
-type WebSocketInner = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
-
-pub type WebSocketHandler =
-    Arc<dyn Fn(WebSocket) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
-
-pub trait IntoWebSocketHandler {
-    fn into_websocket_handler(self) -> WebSocketHandler;
-}
-
-impl<F, Fut> IntoWebSocketHandler for F
-where
-    F: Fn(WebSocket) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = ()> + Send + 'static,
-{
-    fn into_websocket_handler(self) -> WebSocketHandler {
-        Arc::new(move |socket| Box::pin(self(socket)))
-    }
-}
-
-impl IntoWebSocketHandler for WebSocketHandler {
-    fn into_websocket_handler(self) -> WebSocketHandler {
-        self
-    }
-}
-
-#[derive(Debug)]
-pub enum WebSocketError {
-    Protocol(tokio_tungstenite::tungstenite::Error),
-    Json(serde_json::Error),
-}
-
-impl std::fmt::Display for WebSocketError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WebSocketError::Protocol(err) => write!(f, "websocket protocol error: {}", err),
-            WebSocketError::Json(err) => write!(f, "websocket JSON error: {}", err),
-        }
-    }
-}
-
-impl std::error::Error for WebSocketError {}
-
-impl From<tokio_tungstenite::tungstenite::Error> for WebSocketError {
-    fn from(value: tokio_tungstenite::tungstenite::Error) -> Self {
-        Self::Protocol(value)
-    }
-}
-
-impl From<serde_json::Error> for WebSocketError {
-    fn from(value: serde_json::Error) -> Self {
-        Self::Json(value)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WebSocketEvent<T = serde_json::Value> {
-    pub event: String,
-    pub data: T,
-}
-
-pub struct WebSocket {
-    inner: WebSocketInner,
-    protocol: Option<String>,
-    ping_interval: Option<Duration>,
-}
-
-impl WebSocket {
-    pub(super) fn new(
-        inner: WebSocketInner,
-        protocol: Option<String>,
-        ping_interval: Option<Duration>,
-    ) -> Self {
+impl HandshakeRejection {
+    fn new(status: u16, message: &'static str) -> Self {
         Self {
-            inner,
-            protocol,
-            ping_interval,
+            status,
+            message,
+            headers: Vec::new(),
         }
     }
 
-    /// The subprotocol negotiated during the handshake, if any.
-    pub fn protocol(&self) -> Option<&str> {
-        self.protocol.as_deref()
+    fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
+        self.headers.push((name, value));
+        self
     }
 
-    pub async fn recv(&mut self) -> Result<Option<WebSocketMessage>, WebSocketError> {
-        loop {
-            let next = match self.ping_interval {
-                Some(interval) => match tokio::time::timeout(interval, self.inner.next()).await {
-                    Ok(next) => next,
-                    Err(_) => {
-                        // Idle for a full interval: ping and keep waiting.
-                        self.ping(hyper::body::Bytes::new()).await?;
-                        continue;
-                    }
-                },
-                None => self.inner.next().await,
-            };
-            return match next {
-                Some(Ok(message)) => Ok(Some(message)),
-                Some(Err(err)) => Err(err.into()),
-                None => Ok(None),
-            };
-        }
+    fn into_response(self) -> Response {
+        self.headers.into_iter().fold(
+            Response::send(self.message).status(self.status),
+            |response, (name, value)| response.header(name, value),
+        )
     }
 
-    pub async fn send(&mut self, message: WebSocketMessage) -> Result<(), WebSocketError> {
-        self.inner.send(message).await.map_err(Into::into)
+    pub(crate) fn into_http_error(self) -> HttpError {
+        HttpError::new(self.status, self.message)
     }
+}
 
-    pub async fn send_text(&mut self, text: &str) -> Result<(), WebSocketError> {
-        self.send(WebSocketMessage::text(text.to_string())).await
+pub(crate) fn header_value_contains_token(value: &str, expected: &str) -> bool {
+    value
+        .split(',')
+        .any(|token| token.trim().eq_ignore_ascii_case(expected))
+}
+
+pub(crate) fn is_valid_websocket_key(value: &str) -> bool {
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .is_ok_and(|decoded| decoded.len() == 16)
+}
+
+pub(crate) fn request_header_contains_token(req: &Request, name: &str, expected: &str) -> bool {
+    req.headers_all(name)
+        .into_iter()
+        .any(|value| header_value_contains_token(value, expected))
+        || req
+            .header(name)
+            .is_some_and(|value| header_value_contains_token(value, expected))
+}
+
+pub(crate) fn singleton_header<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
+    let values = req.headers_all(name);
+    match values.as_slice() {
+        [value] => Some(*value),
+        _ => None,
     }
+}
 
-    pub async fn send_binary(
-        &mut self,
-        bytes: impl Into<hyper::body::Bytes>,
-    ) -> Result<(), WebSocketError> {
-        self.send(WebSocketMessage::binary(bytes.into())).await
-    }
-
-    pub async fn send_json<T>(&mut self, value: &T) -> Result<(), WebSocketError>
-    where
-        T: Serialize,
-    {
-        let text = serde_json::to_string(value)?;
-        self.send_text(&text).await
-    }
-
-    pub async fn recv_json<T>(&mut self) -> Result<Option<T>, WebSocketError>
-    where
-        T: DeserializeOwned,
-    {
-        match self.recv().await? {
-            Some(message) if message.is_text() || message.is_binary() => {
-                Ok(Some(serde_json::from_slice(&message.into_data())?))
+fn negotiate_protocol(req: &Request, protocols: &[String]) -> Option<String> {
+    for raw in req.headers_all("sec-websocket-protocol") {
+        for candidate in raw.split(',') {
+            let candidate = candidate.trim();
+            if protocols
+                .iter()
+                .any(|supported| supported.eq_ignore_ascii_case(candidate))
+            {
+                return Some(candidate.to_string());
             }
-            Some(_) => Ok(None),
-            None => Ok(None),
         }
     }
 
-    pub async fn send_event<T>(&mut self, event: &str, data: &T) -> Result<(), WebSocketError>
-    where
-        T: Serialize,
-    {
-        self.send_json(&WebSocketEvent {
-            event: event.to_string(),
-            data,
+    req.header("sec-websocket-protocol").and_then(|raw| {
+        raw.split(',').find_map(|candidate| {
+            let candidate = candidate.trim();
+            protocols
+                .iter()
+                .any(|supported| supported.eq_ignore_ascii_case(candidate))
+                .then(|| candidate.to_string())
         })
-        .await
+    })
+}
+
+pub(crate) fn validate_handshake(
+    req: &Request,
+    config: &ResolvedWebSocketConfig,
+) -> Result<Option<String>, HandshakeRejection> {
+    if req.version() != hyper::Version::HTTP_11 {
+        return Err(HandshakeRejection::new(
+            400,
+            "La actualizacion WebSocket requiere HTTP/1.1",
+        ));
+    }
+    let Some(host) = singleton_header(req, "host").map(str::trim) else {
+        return Err(HandshakeRejection::new(
+            400,
+            "La cabecera Host debe aparecer exactamente una vez y no estar vacia",
+        ));
+    };
+    if host.is_empty() {
+        return Err(HandshakeRejection::new(
+            400,
+            "La cabecera Host debe aparecer exactamente una vez y no estar vacia",
+        ));
+    }
+    if !req.method.eq_ignore_ascii_case("GET") {
+        return Err(HandshakeRejection::new(
+            400,
+            "La actualizacion WebSocket requiere el metodo GET",
+        ));
+    }
+    if !request_header_contains_token(req, "upgrade", "websocket") {
+        return Err(HandshakeRejection::new(
+            400,
+            "La cabecera Upgrade debe incluir websocket",
+        ));
+    }
+    if !request_header_contains_token(req, "connection", "upgrade") {
+        return Err(HandshakeRejection::new(
+            400,
+            "La cabecera Connection debe incluir Upgrade",
+        ));
+    }
+    let Some(version) = singleton_header(req, "sec-websocket-version") else {
+        return Err(HandshakeRejection::new(
+            400,
+            "Sec-WebSocket-Version debe aparecer exactamente una vez",
+        ));
+    };
+    if version.trim() != "13" {
+        return Err(
+            HandshakeRejection::new(426, "La version WebSocket debe ser 13")
+                .with_header("sec-websocket-version", "13"),
+        );
+    }
+    let Some(key) = singleton_header(req, "sec-websocket-key") else {
+        return Err(HandshakeRejection::new(
+            400,
+            "Sec-WebSocket-Key debe aparecer exactamente una vez",
+        ));
+    };
+    if !is_valid_websocket_key(key) {
+        return Err(HandshakeRejection::new(
+            400,
+            "Sec-WebSocket-Key debe codificar exactamente 16 bytes",
+        ));
     }
 
-    pub async fn recv_event<T>(&mut self) -> Result<Option<WebSocketEvent<T>>, WebSocketError>
-    where
-        T: DeserializeOwned,
+    let origins = req.headers_all("origin");
+    if origins.len() > 1 {
+        return Err(HandshakeRejection::new(
+            400,
+            "La cabecera Origin no puede aparecer mas de una vez",
+        ));
+    }
+    if !config
+        .origin_policy
+        .allows_for_transport(origins.first().copied(), host, req.is_secure())
     {
-        self.recv_json::<WebSocketEvent<T>>().await
+        return Err(HandshakeRejection::new(
+            403,
+            "El origen WebSocket no esta permitido",
+        ));
     }
 
-    pub async fn ping(
-        &mut self,
-        payload: impl Into<hyper::body::Bytes>,
-    ) -> Result<(), WebSocketError> {
-        self.send(WebSocketMessage::Ping(payload.into())).await
+    let protocol = negotiate_protocol(req, &config.protocols);
+    if config.require_protocol && protocol.is_none() {
+        return Err(HandshakeRejection::new(
+            400,
+            "Se requiere un subprotocolo WebSocket compatible",
+        ));
     }
 
-    pub async fn pong(
-        &mut self,
-        payload: impl Into<hyper::body::Bytes>,
-    ) -> Result<(), WebSocketError> {
-        self.send(WebSocketMessage::Pong(payload.into())).await
-    }
-
-    pub async fn close(&mut self) -> Result<(), WebSocketError> {
-        self.send(WebSocketMessage::Close(None)).await
-    }
+    Ok(protocol)
 }
 
 impl Request {
@@ -262,59 +229,130 @@ impl Request {
     where
         H: IntoWebSocketHandler,
     {
-        match self.into_websocket_response(config, handler.into_websocket_handler()) {
-            Ok(response) => response,
-            Err(err) => Response::from_error(err),
-        }
+        self.websocket_with_normalized(config, handler.into_normalized_websocket_handler())
+    }
+
+    pub(crate) fn websocket_with_normalized(
+        self,
+        config: WebSocketConfig,
+        handler: NormalizedWebSocketHandler,
+    ) -> Response {
+        let config = self.resolved_websocket_config.clone().unwrap_or_else(|| {
+            ResolvedWebSocketConfig::from_layers(&WebSocketConfig::default(), &config)
+        });
+        let protocol = match validate_handshake(&self, &config) {
+            Ok(protocol) => protocol,
+            Err(rejection) => return rejection.into_response(),
+        };
+
+        self.into_websocket_response(config, protocol, handler)
     }
 
     fn into_websocket_response(
         self,
-        config: WebSocketConfig,
-        handler: WebSocketHandler,
-    ) -> Result<Response, HttpError> {
-        let protocol = config.negotiate(&self);
-        let mut response = Response::websocket(&self)?;
+        config: ResolvedWebSocketConfig,
+        protocol: Option<String>,
+        handler: NormalizedWebSocketHandler,
+    ) -> Response {
+        let route = self.route_pattern().unwrap_or(&self.path).to_string();
+        let permit = match self.websocket_runtime.admit(
+            &route,
+            self.remote_addr,
+            protocol.as_deref(),
+            &config,
+        ) {
+            Ok(permit) => permit,
+            Err(error) => return error.into_response(),
+        };
+        let mut response = match Response::websocket(&self) {
+            Ok(response) => response,
+            Err(error) => return Response::from_error(error),
+        };
         if let Some(protocol) = &protocol {
             response = response.header("sec-websocket-protocol", protocol);
         }
-        let upgrade = self
-            .upgrade
-            .ok_or_else(|| HttpError::bad_request("WebSocket upgrade is not available"))?;
-        spawn_websocket(upgrade, config, protocol, handler);
-        Ok(response)
+        let Some(upgrade) = self.upgrade else {
+            return Response::from_error(HttpError::bad_request(
+                "La actualizacion WebSocket no esta disponible",
+            ));
+        };
+        spawn_websocket(
+            upgrade,
+            config,
+            protocol,
+            handler,
+            permit,
+            route,
+            self.remote_addr,
+        );
+        response
+    }
+}
+
+impl AdmissionError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Shutdown => Response::send("El runtime WebSocket se esta cerrando").status(503),
+            Self::ProcessCapacity => {
+                Response::send("La capacidad global de conexiones WebSocket esta agotada")
+                    .status(503)
+            }
+            Self::RouteCapacity => {
+                Response::send("La capacidad de conexiones WebSocket para esta ruta esta agotada")
+                    .status(503)
+            }
+            Self::IpCapacity => Response::send(
+                "El limite de conexiones WebSocket para esta direccion IP esta agotado",
+            )
+            .status(429)
+            .header("retry-after", "1"),
+        }
     }
 }
 
 fn spawn_websocket(
     upgrade: OnUpgrade,
-    config: WebSocketConfig,
+    config: ResolvedWebSocketConfig,
     protocol: Option<String>,
-    handler: WebSocketHandler,
+    handler: NormalizedWebSocketHandler,
+    permit: ConnectionPermit,
+    route: String,
+    remote_addr: Option<std::net::SocketAddr>,
 ) {
     tokio::spawn(async move {
         match upgrade.await {
             Ok(upgraded) => {
-                let io = TokioIo::new(upgraded);
-                let stream_config = config.max_message_size.map(|bytes| {
-                    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
-                        .max_message_size(Some(bytes))
-                });
-                let stream =
-                    WebSocketStream::from_raw_socket(io, Role::Server, stream_config).await;
-                handler(WebSocket::new(stream, protocol, config.ping_interval)).await;
+                let runtime = permit.runtime();
+                let id = permit.id();
+                let (socket, internal_sender, channels) = socket::channel_pair(
+                    socket::SocketMetadata {
+                        id,
+                        remote_addr,
+                        route,
+                        protocol,
+                    },
+                    &config,
+                    runtime.clone(),
+                );
+                let driver =
+                    driver::spawn(upgraded, config, handler, socket, channels, permit).await;
+                let registered = runtime.register_driver(id, internal_sender, driver.abort_handle);
+                let _ = driver.start_tx.send(registered);
             }
             Err(err) => {
-                eprintln!("WebSocket upgrade failed: {}", err);
+                eprintln!("La actualizacion WebSocket fallo: {err}");
             }
         }
     });
 }
 
-/// A clonable fan-out channel for WebSocket rooms: handlers `subscribe()`
-/// and forward received messages to their socket, while any holder of the
-/// `WsBroadcast` can `send` to every current subscriber. Backed by
-/// `tokio::sync::broadcast` (lagging subscribers skip the oldest messages).
+/// A raw process-local Tokio broadcast channel for WebSocket messages.
+///
+/// This helper does not track connections, routes, rooms, per-socket
+/// backpressure, delivery reports, or external brokers. Subscribers must
+/// forward received messages to their sockets and handle
+/// [`tokio::sync::broadcast::error::RecvError::Lagged`] explicitly. Use
+/// [`WsHub`] for route-scoped rooms and managed fan-out.
 #[derive(Clone)]
 pub struct WsBroadcast {
     sender: tokio::sync::broadcast::Sender<WebSocketMessage>,

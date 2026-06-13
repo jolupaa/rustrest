@@ -17,9 +17,12 @@ use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::{TcpListener, ToSocketAddrs};
 
+use super::router::{MatchedRoute, RouteKind};
+use super::websocket::{header_value_contains_token, is_valid_websocket_key};
 use super::{
     ErrorHandler, HttpError, IntoHandler, IntoMiddleware, Middleware, Next, Request, Response,
-    RouteHandle, Router, StateStore,
+    RouteHandle, Router, StateStore, WebSocketConfig, WebSocketObserver, WebSocketRuntimeHandle,
+    WsHub,
 };
 use super::{
     Handler, ResponseBody, allow_header_value, method_not_allowed_handler, not_found_handler,
@@ -28,6 +31,30 @@ use super::{
 
 /// Default maximum request body we will buffer into memory (64 KB).
 const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
+const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(crate) async fn drain_server_connections(
+    runtime: &WebSocketRuntimeHandle,
+    http_shutdown: impl Future<Output = ()>,
+) {
+    runtime.begin_shutdown().await;
+    let websocket_grace = runtime.shutdown_grace_period();
+    let websocket_shutdown = async {
+        if runtime.drain(websocket_grace).await.is_err() {
+            runtime.abort_remaining();
+            runtime.wait_until_empty().await;
+        }
+    };
+
+    tokio::select! {
+        _ = async { tokio::join!(http_shutdown, websocket_shutdown); } => {}
+        _ = tokio::time::sleep(SERVER_SHUTDOWN_TIMEOUT) => {
+            eprintln!("Timed out waiting for in-flight connections to drain");
+            runtime.abort_remaining();
+            runtime.wait_until_empty().await;
+        }
+    }
+}
 
 /// How request paths with a trailing slash (`/users/`) are treated relative
 /// to the canonical, slash-less route (`/users`). The root path `/` is always
@@ -65,27 +92,40 @@ impl Default for ServerConfig {
 }
 
 fn is_websocket_upgrade_request(req: &hyper::Request<Incoming>) -> bool {
-    req.method().as_str().eq_ignore_ascii_case("GET")
+    req.version() == hyper::Version::HTTP_11
+        && req.method().as_str().eq_ignore_ascii_case("GET")
+        && req.headers().get_all(UPGRADE).iter().any(|value| {
+            value
+                .to_str()
+                .is_ok_and(|value| header_value_contains_token(value, "websocket"))
+        })
+        && req.headers().get_all(CONNECTION).iter().any(|value| {
+            value
+                .to_str()
+                .is_ok_and(|value| header_value_contains_token(value, "upgrade"))
+        })
         && req
             .headers()
-            .get(UPGRADE)
+            .get(SEC_WEBSOCKET_KEY)
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
-        && req
-            .headers()
-            .get(CONNECTION)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value
-                    .split(',')
-                    .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
-            })
-        && req.headers().contains_key(SEC_WEBSOCKET_KEY)
+            .is_some_and(is_valid_websocket_key)
         && req
             .headers()
             .get(SEC_WEBSOCKET_VERSION)
             .and_then(|value| value.to_str().ok())
             == Some("13")
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum TransportSecurity {
+    Plain,
+    Tls,
+}
+
+impl TransportSecurity {
+    fn is_secure(self) -> bool {
+        matches!(self, Self::Tls)
+    }
 }
 
 pub struct App {
@@ -94,17 +134,58 @@ pub struct App {
     state: StateStore,
     error_handler: Option<ErrorHandler>,
     pub(crate) config: ServerConfig,
+    websocket_runtime: WebSocketRuntimeHandle,
+    websocket_hub: WsHub,
+    websocket_defaults: WebSocketConfig,
 }
 
 impl App {
     pub fn new() -> Self {
+        let websocket_hub = WsHub::local();
+        let websocket_runtime = websocket_hub.runtime();
         Self {
             router: Router::new(),
             middlewares: Vec::new(),
             state: StateStore::default(),
             error_handler: None,
             config: ServerConfig::default(),
+            websocket_runtime,
+            websocket_hub,
+            websocket_defaults: WebSocketConfig::new(),
         }
+    }
+
+    pub fn websocket_runtime(&self) -> WebSocketRuntimeHandle {
+        self.websocket_runtime.clone()
+    }
+
+    /// Installs the WebSocket hub used by subsequently served requests.
+    /// Configure it before passing the app to `serve` or `listen`.
+    pub fn websocket_hub(&mut self, hub: WsHub) -> &mut Self {
+        self.websocket_runtime = hub.runtime();
+        self.websocket_hub = hub;
+        self
+    }
+
+    /// Returns a cloneable handle to the app's WebSocket hub.
+    pub fn websocket_hub_handle(&self) -> WsHub {
+        self.websocket_hub.clone()
+    }
+
+    pub fn websocket_defaults(&mut self, config: WebSocketConfig) -> &mut Self {
+        self.websocket_defaults = config;
+        self
+    }
+
+    pub fn websocket_observer(&mut self, observer: Arc<dyn WebSocketObserver>) -> &mut Self {
+        self.websocket_runtime.set_observer(observer);
+        self
+    }
+
+    pub(crate) fn validate_websockets(&self) -> io::Result<()> {
+        self.router
+            .validate_websockets(&self.websocket_defaults)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
     }
 
     /// Sets the maximum request body size buffered into memory. Requests whose
@@ -226,28 +307,35 @@ impl App {
         self.router.all(path, handler)
     }
 
-    pub fn websocket<F, Fut>(&mut self, path: &str, handler: F)
+    pub fn websocket<F, Fut, O>(&mut self, path: &str, handler: F)
     where
         F: Fn(super::WebSocket) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
+        Fut: std::future::Future<Output = O> + Send + 'static,
+        O: super::IntoWebSocketOutput + Send + 'static,
     {
         self.router.websocket(path, handler);
     }
 
-    pub fn ws<F, Fut>(&mut self, path: &str, handler: F)
+    pub fn ws<F, Fut, O>(&mut self, path: &str, handler: F)
     where
         F: Fn(super::WebSocket) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
+        Fut: std::future::Future<Output = O> + Send + 'static,
+        O: super::IntoWebSocketOutput + Send + 'static,
     {
         self.router.ws(path, handler);
     }
 
     /// Like [`App::websocket`], with subprotocols, message size limits, and
     /// keepalive pings from `config`.
-    pub fn websocket_with<F, Fut>(&mut self, path: &str, config: super::WebSocketConfig, handler: F)
-    where
+    pub fn websocket_with<F, Fut, O>(
+        &mut self,
+        path: &str,
+        config: super::WebSocketConfig,
+        handler: F,
+    ) where
         F: Fn(super::WebSocket) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
+        Fut: std::future::Future<Output = O> + Send + 'static,
+        O: super::IntoWebSocketOutput + Send + 'static,
     {
         self.router.websocket_with(path, config, handler);
     }
@@ -294,6 +382,7 @@ impl App {
     /// Binds to `address` and serves connections until the process is killed.
     /// Returns an error only if binding fails; accept errors are non-fatal.
     pub async fn listen(self, address: impl ToSocketAddrs) -> io::Result<()> {
+        self.validate_websockets()?;
         let listener = TcpListener::bind(address).await?;
         if let Ok(local) = listener.local_addr() {
             println!("Server listening at http://{}", local);
@@ -308,6 +397,7 @@ impl App {
         address: impl ToSocketAddrs,
         shutdown: impl Future<Output = ()> + Send,
     ) -> io::Result<()> {
+        self.validate_websockets()?;
         let listener = TcpListener::bind(address).await?;
         if let Ok(local) = listener.local_addr() {
             println!("Server listening at http://{}", local);
@@ -330,6 +420,8 @@ impl App {
         listener: TcpListener,
         shutdown: impl Future<Output = ()> + Send,
     ) -> io::Result<()> {
+        self.validate_websockets()?;
+        self.websocket_runtime.start_broker().await;
         let header_read_timeout = self.config.header_read_timeout;
         let app = Arc::new(self);
         let mut builder = auto::Builder::new(TokioExecutor::new());
@@ -365,7 +457,11 @@ impl App {
                     io,
                     service_fn(move |req: hyper::Request<Incoming>| {
                         let app = Arc::clone(&app);
-                        async move { Ok::<_, Infallible>(app.handle(req, Some(peer)).await) }
+                        async move {
+                            Ok::<_, Infallible>(
+                                app.handle(req, Some(peer), TransportSecurity::Plain).await,
+                            )
+                        }
                     }),
                 )
                 .into_owned();
@@ -381,12 +477,7 @@ impl App {
 
         // Stop accepting new connections, then drain the in-flight ones.
         drop(listener);
-        tokio::select! {
-            _ = graceful.shutdown() => {}
-            _ = tokio::time::sleep(Duration::from_secs(10)) => {
-                eprintln!("Timed out waiting for in-flight connections to drain");
-            }
-        }
+        drain_server_connections(&app.websocket_runtime, graceful.shutdown()).await;
         Ok(())
     }
 
@@ -396,8 +487,10 @@ impl App {
         &self,
         mut req: hyper::Request<Incoming>,
         remote_addr: Option<SocketAddr>,
+        transport_security: TransportSecurity,
     ) -> hyper::Response<ResponseBody> {
         // Read everything that only needs a borrow before consuming the body.
+        let version = req.version();
         let method = req.method().as_str().to_string();
         let path = req.uri().path().to_string();
         let raw_query = req.uri().query().map(|q| q.to_string());
@@ -442,6 +535,7 @@ impl App {
         };
 
         let request = Request {
+            version,
             method,
             path,
             raw_query,
@@ -450,9 +544,13 @@ impl App {
             cookies,
             body,
             params: HashMap::new(),
+            route_pattern: None,
+            websocket_runtime: self.websocket_runtime.clone(),
+            resolved_websocket_config: None,
             state: self.state.clone(),
             upgrade,
             remote_addr,
+            secure_transport: transport_security.is_secure(),
             header_pairs,
         };
 
@@ -483,30 +581,36 @@ impl App {
     /// Resolves a request that did not directly match a route: auto-serves
     /// HEAD from a matching GET, auto-answers OPTIONS with `Allow`, returns 405
     /// when the path exists for other methods, or falls through to 404.
-    fn resolve_miss(
-        &self,
-        method: &str,
-        path: &str,
-    ) -> (Handler, Vec<Middleware>, HashMap<String, String>) {
+    fn resolve_miss(&self, method: &str, path: &str) -> MatchedRoute {
         let allowed = self.router.allowed_methods(path);
         if allowed.is_empty() {
-            (not_found_handler(), Vec::new(), HashMap::new())
+            MatchedRoute {
+                handler: not_found_handler(),
+                middlewares: Vec::new(),
+                params: HashMap::new(),
+                pattern: path.to_string(),
+                kind: RouteKind::Http,
+            }
         } else if method == "HEAD" && allowed.iter().any(|m| m == "GET") {
             self.router
                 .route("GET", path)
                 .expect("GET route present per allowed_methods")
         } else if method == "OPTIONS" {
-            (
-                options_handler(allow_header_value(&allowed)),
-                Vec::new(),
-                HashMap::new(),
-            )
+            MatchedRoute {
+                handler: options_handler(allow_header_value(&allowed)),
+                middlewares: Vec::new(),
+                params: HashMap::new(),
+                pattern: path.to_string(),
+                kind: RouteKind::Http,
+            }
         } else {
-            (
-                method_not_allowed_handler(allow_header_value(&allowed)),
-                Vec::new(),
-                HashMap::new(),
-            )
+            MatchedRoute {
+                handler: method_not_allowed_handler(allow_header_value(&allowed)),
+                middlewares: Vec::new(),
+                params: HashMap::new(),
+                pattern: path.to_string(),
+                kind: RouteKind::Http,
+            }
         }
     }
 
@@ -541,15 +645,39 @@ impl App {
     /// middleware onion ending at the matched handler (or a 404 handler).
     pub(crate) async fn dispatch(&self, mut request: Request) -> Response {
         request.state = self.state.clone();
+        request.websocket_runtime = self.websocket_runtime.clone();
         let is_head = request.method == "HEAD";
-        let (handler, route_middlewares, params) = match self.trailing_slash_miss(&request) {
-            Some(handler) => (handler, Vec::new(), HashMap::new()),
+        let matched = match self.trailing_slash_miss(&request) {
+            Some(handler) => MatchedRoute {
+                handler,
+                middlewares: Vec::new(),
+                params: HashMap::new(),
+                pattern: request.path.clone(),
+                kind: RouteKind::Http,
+            },
             None => match self.router.route(&request.method, &request.path) {
                 Some(found) => found,
                 None => self.resolve_miss(&request.method, &request.path),
             },
         };
+        let MatchedRoute {
+            handler,
+            middlewares: route_middlewares,
+            params,
+            pattern,
+            kind,
+        } = matched;
         request.params = params;
+        request.route_pattern = Some(pattern);
+        request.resolved_websocket_config = match kind {
+            RouteKind::Http => None,
+            RouteKind::WebSocket(route_config) => {
+                Some(super::websocket::ResolvedWebSocketConfig::from_layers(
+                    &self.websocket_defaults,
+                    &route_config,
+                ))
+            }
+        };
 
         // Innermost layer: the matched handler.
         let mut next: Next = Box::new(move |req| (*handler)(req));
@@ -575,10 +703,10 @@ impl App {
             },
             Err(_) => panic_response(),
         };
-        if let Some(err) = response.take_error()
-            && let Some(handler) = &self.error_handler
-        {
-            response = handler(err);
+        if let Some(err) = response.take_error() {
+            if let Some(handler) = &self.error_handler {
+                response = handler(err);
+            }
         }
         if is_head {
             response.clear_body();

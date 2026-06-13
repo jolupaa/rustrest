@@ -1,0 +1,12 @@
+{
+  "outdir": "/reports/server",
+  "servers": [
+    {
+      "agent": "rustrest-production-websocket",
+      "url": "ws://127.0.0.1:3000/autobahn"
+    }
+  ],
+  "cases": ["*"],
+  "exclude-cases": ["9.*", "12.*", "13.*"],
+  "exclude-agent-cases": {}
+}

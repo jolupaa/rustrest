@@ -1,3 +1,6 @@
 /target
 /.worktrees/
 .DS_Store
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/target/

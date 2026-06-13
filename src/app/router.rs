@@ -13,9 +13,10 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use super::decode_component;
 use super::trie::RouteIndex;
+use super::websocket::ResolvedWebSocketConfig;
 use super::{
-    Handler, HttpError, IntoHandler, IntoMiddleware, Middleware, Next, Request, Response,
-    WebSocket, WebSocketConfig, WebSocketHandler,
+    Handler, HttpError, IntoHandler, IntoMiddleware, IntoWebSocketHandler, IntoWebSocketOutput,
+    Middleware, Next, Request, Response, WebSocket, WebSocketConfig, WsError,
 };
 
 pub(crate) const METHOD_ALL: &str = "*";
@@ -38,7 +39,22 @@ struct Route {
     pattern: Vec<Segment>,
     handler: Handler,
     middlewares: Vec<Middleware>,
+    kind: RouteKind,
     meta: RouteMeta,
+}
+
+#[derive(Clone)]
+pub(crate) enum RouteKind {
+    Http,
+    WebSocket(Box<WebSocketConfig>),
+}
+
+pub(crate) struct MatchedRoute {
+    pub handler: Handler,
+    pub middlewares: Vec<Middleware>,
+    pub params: HashMap<String, String>,
+    pub pattern: String,
+    pub kind: RouteKind,
 }
 
 /// Optional documentation attached to a route via [`RouteHandle`], surfaced
@@ -192,38 +208,43 @@ impl Router {
         self.add(METHOD_ALL, path, handler)
     }
 
-    pub fn websocket<F, Fut>(&mut self, path: &str, handler: F)
+    pub fn websocket<F, Fut, O>(&mut self, path: &str, handler: F)
     where
         F: Fn(WebSocket) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+        O: IntoWebSocketOutput + Send + 'static,
     {
-        let handler: WebSocketHandler = Arc::new(move |socket| Box::pin(handler(socket)));
-        self.get(path, move |req: Request| {
-            let handler = Arc::clone(&handler);
-            req.websocket(handler)
-        });
+        self.websocket_with(path, WebSocketConfig::new(), handler);
     }
 
-    pub fn ws<F, Fut>(&mut self, path: &str, handler: F)
+    pub fn ws<F, Fut, O>(&mut self, path: &str, handler: F)
     where
         F: Fn(WebSocket) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+        O: IntoWebSocketOutput + Send + 'static,
     {
         self.websocket(path, handler);
     }
 
     /// Like [`Router::websocket`], with subprotocols, message size limits,
     /// and keepalive pings from `config`.
-    pub fn websocket_with<F, Fut>(&mut self, path: &str, config: WebSocketConfig, handler: F)
+    pub fn websocket_with<F, Fut, O>(&mut self, path: &str, config: WebSocketConfig, handler: F)
     where
         F: Fn(WebSocket) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+        O: IntoWebSocketOutput + Send + 'static,
     {
-        let handler: WebSocketHandler = Arc::new(move |socket| Box::pin(handler(socket)));
-        self.get(path, move |req: Request| {
-            let handler = Arc::clone(&handler);
-            req.websocket_with(config.clone(), handler)
-        });
+        let handler = handler.into_normalized_websocket_handler();
+        let kind = RouteKind::WebSocket(Box::new(config.clone()));
+        self.add_with_kind(
+            "GET",
+            path,
+            move |req: Request| {
+                let handler = Arc::clone(&handler);
+                req.websocket_with_normalized(config.clone(), handler)
+            },
+            kind,
+        );
     }
 
     /// Adds a middleware scoped to this router: it wraps every route in this
@@ -271,11 +292,25 @@ impl Router {
     where
         H: IntoHandler<M>,
     {
+        self.add_with_kind(method, path, handler, RouteKind::Http)
+    }
+
+    fn add_with_kind<H, M>(
+        &mut self,
+        method: &str,
+        path: &str,
+        handler: H,
+        kind: RouteKind,
+    ) -> RouteHandle<'_>
+    where
+        H: IntoHandler<M>,
+    {
         self.routes.push(Route {
             method: method.to_string(),
             pattern: parse_pattern(path),
             handler: handler.into_handler(),
             middlewares: Vec::new(),
+            kind,
             meta: RouteMeta::default(),
         });
         self.index.take();
@@ -299,6 +334,7 @@ impl Router {
             pattern: parse_pattern(path),
             handler,
             middlewares: Vec::new(),
+            kind: RouteKind::Http,
             meta: RouteMeta::default(),
         });
         self.index.take();
@@ -323,6 +359,7 @@ impl Router {
                 pattern,
                 handler: route.handler,
                 middlewares,
+                kind: route.kind,
                 meta: route.meta,
             });
         }
@@ -335,21 +372,31 @@ impl Router {
     /// which beat trailing `*wildcards` (backtracking across branches); on the
     /// same path an exact-method route beats an `all()` route; remaining ties
     /// go to the first-registered route.
-    pub(crate) fn route(
-        &self,
-        method: &str,
-        path: &str,
-    ) -> Option<(Handler, Vec<Middleware>, HashMap<String, String>)> {
+    pub(crate) fn route(&self, method: &str, path: &str) -> Option<MatchedRoute> {
         let segments = path_segments(path);
         let route = &self.routes[self.index().find(method, &segments)?];
         // The index only returns routes whose pattern matches these segments,
         // so the capture pass cannot fail.
         let params = match_pattern(&route.pattern, &segments)?;
-        Some((
-            Arc::clone(&route.handler),
-            route.middlewares.clone(),
+        Some(MatchedRoute {
+            handler: Arc::clone(&route.handler),
+            middlewares: route.middlewares.clone(),
             params,
-        ))
+            pattern: render_pattern(&route.pattern),
+            kind: route.kind.clone(),
+        })
+    }
+
+    pub(crate) fn validate_websockets(
+        &self,
+        app_defaults: &WebSocketConfig,
+    ) -> Result<(), WsError> {
+        for route in &self.routes {
+            if let RouteKind::WebSocket(route_config) = &route.kind {
+                ResolvedWebSocketConfig::from_layers(app_defaults, route_config).validate()?;
+            }
+        }
+        Ok(())
     }
 
     /// Lists every registered route (method + pattern) in registration order,

@@ -3,7 +3,7 @@ use super::*;
 use futures_util::stream;
 use http_body_util::BodyExt;
 use hyper::body::Bytes;
-use hyper::header::{CONTENT_ENCODING, LOCATION, SEC_WEBSOCKET_ACCEPT, SET_COOKIE};
+use hyper::header::{CONTENT_ENCODING, LOCATION, SET_COOKIE};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -11,10 +11,11 @@ use std::io::Read;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn dummy_request(body: &str) -> Request {
     Request {
+        version: hyper::Version::HTTP_11,
         method: "GET".to_string(),
         path: "/".to_string(),
         raw_query: None,
@@ -23,11 +24,163 @@ fn dummy_request(body: &str) -> Request {
         cookies: HashMap::new(),
         body: Bytes::from(body.to_string()),
         params: HashMap::new(),
+        route_pattern: None,
+        websocket_runtime: WebSocketRuntimeHandle::local(),
+        resolved_websocket_config: None,
         state: StateStore::default(),
         upgrade: None,
         remote_addr: None,
+        secure_transport: false,
         header_pairs: Vec::new(),
     }
+}
+
+#[test]
+fn websocket_config_rejects_unbounded_or_inconsistent_values() {
+    assert!(
+        WebSocketConfig::new()
+            .outbound_capacity(0)
+            .validate()
+            .is_err()
+    );
+    assert!(
+        WebSocketConfig::new()
+            .inbound_capacity(0)
+            .validate()
+            .is_err()
+    );
+    assert!(
+        WebSocketConfig::new()
+            .write_buffer_size(1024)
+            .max_write_buffer_size(1024)
+            .validate()
+            .is_err()
+    );
+    assert!(
+        WebSocketConfig::new()
+            .ping_interval(Duration::from_secs(30))
+            .pong_timeout(Duration::from_secs(30))
+            .validate()
+            .is_err()
+    );
+}
+
+#[test]
+fn websocket_routes_validate_against_app_defaults_before_serving() {
+    let mut app = App::new();
+    app.websocket_defaults(WebSocketConfig::new().outbound_capacity(0));
+    app.websocket("/ws", |_socket| async move {});
+
+    let error = app
+        .validate_websockets()
+        .expect_err("invalid defaults must reject startup");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[tokio::test]
+async fn websocket_dispatch_uses_app_runtime_and_releases_failed_spawn() {
+    let mut app = App::new();
+    app.websocket("/ws", |_socket| async move {});
+    let runtime = app.websocket_runtime();
+
+    let request = Request::builder()
+        .method("GET")
+        .path("/ws")
+        .header("host", "localhost")
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .remote_addr("127.0.0.1:4501".parse().unwrap())
+        .build();
+
+    let response = app.dispatch(request).await;
+
+    assert_eq!(response.status, 400);
+    assert_eq!(runtime.stats().accepted_connections, 1);
+    assert_eq!(runtime.stats().active_connections, 0);
+    assert_eq!(runtime.stats().closed_connections, 1);
+}
+
+#[test]
+fn websocket_origin_policy_normalizes_default_ports() {
+    let policy = OriginPolicy::allow(["https://app.example.com"]);
+    assert!(policy.allows(Some("https://app.example.com:443"), "app.example.com"));
+    assert!(!policy.allows(Some("https://evil.example"), "app.example.com"));
+
+    let same_host = OriginPolicy::same_host().allow_missing(false);
+    assert!(same_host.allows(Some("http://localhost:3000"), "localhost:3000"));
+    assert!(!same_host.allows(None, "localhost:3000"));
+}
+
+#[test]
+fn websocket_origin_policy_rejects_invalid_explicit_ports() {
+    let policy = OriginPolicy::any();
+    assert!(!policy.allows(
+        Some("https://app.example.com:not-a-port"),
+        "app.example.com"
+    ));
+
+    let config = WebSocketConfig::new()
+        .origin_policy(OriginPolicy::allow(["https://app.example.com:not-a-port"]));
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn websocket_same_host_origin_uses_transport_default_port() {
+    let policy = OriginPolicy::same_host().allow_missing(false);
+
+    assert!(policy.allows_for_transport(Some("http://app.example.com"), "app.example.com", false,));
+    assert!(!policy.allows_for_transport(
+        Some("https://app.example.com"),
+        "app.example.com",
+        false,
+    ));
+    assert!(policy.allows_for_transport(Some("https://app.example.com"), "app.example.com", true,));
+    assert!(!policy.allows_for_transport(Some("http://app.example.com"), "app.example.com", true,));
+}
+
+#[test]
+fn request_builder_defaults_to_http_11_and_can_mark_secure_transport() {
+    let plain = Request::builder().build();
+    assert_eq!(plain.version(), hyper::Version::HTTP_11);
+    assert!(!plain.is_secure());
+
+    let secure = Request::builder().secure(true).build();
+    assert!(secure.is_secure());
+}
+
+#[tokio::test]
+async fn mounted_websocket_request_records_normalized_route_pattern() {
+    let mut chat = Router::new();
+    chat.websocket("/:channel", |_socket| async move {});
+
+    let mut api = Router::new();
+    api.mount("/chat", chat);
+
+    let mut app = App::new();
+    app.mount("/api", api);
+    app.layer(|req: Request, _next: Next| async move {
+        Response::send(req.route_pattern().unwrap_or("missing"))
+    });
+
+    let response = app
+        .dispatch(request_with_method("GET", "/api/chat/42"))
+        .await;
+
+    assert_eq!(response.body_text(), "/api/chat/:channel");
+}
+
+#[test]
+fn existing_websocket_error_remains_exhaustive() {
+    fn classify(error: WebSocketError) -> &'static str {
+        match error {
+            WebSocketError::Protocol(_) => "protocol",
+            WebSocketError::Json(_) => "json",
+        }
+    }
+    let _ = classify as fn(WebSocketError) -> &'static str;
 }
 
 #[test]
@@ -558,94 +711,22 @@ async fn sse_with_heartbeat_fills_idle_gaps_and_ends_with_source() {
     assert!(text.contains("data: segundo"), "body: {text}");
 }
 
-#[test]
-fn websocket_handshake_sets_upgrade_headers() {
-    let mut req = dummy_request("");
-    req.method = "GET".to_string();
-    req.headers
-        .insert("upgrade".to_string(), "websocket".to_string());
-    req.headers
-        .insert("connection".to_string(), "Upgrade".to_string());
-    req.headers.insert(
-        "sec-websocket-key".to_string(),
-        "dGhlIHNhbXBsZSBub25jZQ==".to_string(),
-    );
-    req.headers
-        .insert("sec-websocket-version".to_string(), "13".to_string());
-
-    assert!(req.is_websocket_upgrade());
-
-    let res = Response::websocket(&req).unwrap().into_hyper();
-
-    assert_eq!(res.status(), 101);
-    assert_eq!(
-        res.headers().get(SEC_WEBSOCKET_ACCEPT).unwrap(),
-        "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-    );
-}
-
-#[test]
-fn websocket_config_negotiates_first_supported_subprotocol() {
-    let mut req = dummy_request("");
-    req.headers.insert(
-        "sec-websocket-protocol".to_string(),
-        "chat, superchat".to_string(),
-    );
-    req.header_pairs.push((
-        "sec-websocket-protocol".to_string(),
-        "chat, superchat".to_string(),
-    ));
-
-    // Client preference order wins among the server-supported protocols.
-    let config = WebSocketConfig::new().protocols(&["superchat", "chat"]);
-    assert_eq!(config.negotiate(&req).as_deref(), Some("chat"));
-
-    let config = WebSocketConfig::new().protocols(&["superchat"]);
-    assert_eq!(config.negotiate(&req).as_deref(), Some("superchat"));
-
-    // No overlap (or no offer) -> no protocol echoed.
-    let config = WebSocketConfig::new().protocols(&["graphql-ws"]);
-    assert_eq!(config.negotiate(&req), None);
-    assert_eq!(WebSocketConfig::new().negotiate(&req), None);
-}
-
-#[tokio::test]
-async fn ws_broadcast_fans_out_to_subscribers() {
-    let room = WsBroadcast::new(8);
-    let mut a = room.subscribe();
-    let mut b = room.subscribe();
-
-    assert_eq!(room.receiver_count(), 2);
-    assert_eq!(room.send_text("hola"), 2);
-
-    assert_eq!(a.recv().await.unwrap(), WebSocketMessage::text("hola"));
-    assert_eq!(b.recv().await.unwrap(), WebSocketMessage::text("hola"));
-
-    // Without subscribers nothing is delivered (and nothing panics).
-    drop(a);
-    drop(b);
-    assert_eq!(room.send_text("nadie"), 0);
-}
-
 #[tokio::test]
 async fn gzip_middleware_skips_websocket_upgrade_responses() {
     let mut app = App::new();
     app.layer(middleware::gzip());
     app.get("/ws", |req: Request| Response::websocket(&req).unwrap());
 
-    let mut req = request_with_method("GET", "/ws");
-    req.headers
-        .insert("accept-encoding".to_string(), "gzip".to_string());
-    req.headers
-        .insert("upgrade".to_string(), "websocket".to_string());
-    req.headers
-        .insert("connection".to_string(), "Upgrade".to_string());
-    req.headers.insert(
-        "sec-websocket-key".to_string(),
-        "dGhlIHNhbXBsZSBub25jZQ==".to_string(),
-    );
-    req.headers
-        .insert("sec-websocket-version".to_string(), "13".to_string());
+    let req = Request::builder()
+        .method("GET")
+        .path("/ws")
+        .header("host", "localhost")
+        .header("accept-encoding", "gzip")
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .build();
 
     let res = app.dispatch(req).await.into_hyper();
 
@@ -932,6 +1013,7 @@ async fn sessions_middleware_assigns_and_persists_session() {
 fn query_params_are_parsed_and_url_decoded() {
     let query = parse_query("q=rust+rest&tag=web&tag=api&empty=&flag&encoded=hello%20world");
     let req = Request {
+        version: hyper::Version::HTTP_11,
         method: "GET".to_string(),
         path: "/buscar".to_string(),
         raw_query: Some(
@@ -942,9 +1024,13 @@ fn query_params_are_parsed_and_url_decoded() {
         cookies: HashMap::new(),
         body: Bytes::new(),
         params: HashMap::new(),
+        route_pattern: None,
+        websocket_runtime: WebSocketRuntimeHandle::local(),
+        resolved_websocket_config: None,
         state: StateStore::default(),
         upgrade: None,
         remote_addr: None,
+        secure_transport: false,
         header_pairs: Vec::new(),
     };
 
@@ -1085,8 +1171,8 @@ fn router_matches_method_and_path_param() {
     assert!(router.route("POST", "/users").is_none());
     assert!(router.route("GET", "/nope/extra").is_none());
 
-    let (_handler, _mws, params) = router.route("GET", "/users/42").expect("should match");
-    assert_eq!(params.get("id").map(String::as_str), Some("42"));
+    let matched = router.route("GET", "/users/42").expect("should match");
+    assert_eq!(matched.params.get("id").map(String::as_str), Some("42"));
 }
 
 #[test]
@@ -1117,8 +1203,8 @@ fn mount_concatenates_prefixes_across_nesting() {
     let mut root = Router::new();
     root.mount("/api", api);
 
-    let (_handler, _mws, params) = root.route("GET", "/api/users/42").expect("should match");
-    assert_eq!(params.get("id").map(String::as_str), Some("42"));
+    let matched = root.route("GET", "/api/users/42").expect("should match");
+    assert_eq!(matched.params.get("id").map(String::as_str), Some("42"));
     // Only `/:id` was registered, so the bare collection path does not match.
     assert!(root.route("GET", "/api/users").is_none());
 }
@@ -1132,13 +1218,19 @@ fn router_prefers_static_over_param_regardless_of_registration_order() {
     });
     router.get("/users/me", |_r: Request| Response::send("me"));
 
-    let (_h, _m, params) = router.route("GET", "/users/me").expect("should match");
+    let params = router
+        .route("GET", "/users/me")
+        .expect("should match")
+        .params;
     assert!(
         params.is_empty(),
         "static /users/me should win over /users/:id, captured {params:?}"
     );
 
-    let (_h, _m, params) = router.route("GET", "/users/42").expect("should match");
+    let params = router
+        .route("GET", "/users/42")
+        .expect("should match")
+        .params;
     assert_eq!(params.get("id").map(String::as_str), Some("42"));
 }
 
@@ -1149,11 +1241,17 @@ fn router_prefers_param_over_wildcard_and_backtracks_across_branches() {
     router.get("/files/*rest", |_r: Request| Response::send("wild"));
     router.get("/files/:name", |_r: Request| Response::send("param"));
 
-    let (_h, _m, params) = router.route("GET", "/files/readme").expect("should match");
+    let params = router
+        .route("GET", "/files/readme")
+        .expect("should match")
+        .params;
     assert_eq!(params.get("name").map(String::as_str), Some("readme"));
 
     // Deeper paths only the wildcard can absorb.
-    let (_h, _m, params) = router.route("GET", "/files/a/b").expect("should match");
+    let params = router
+        .route("GET", "/files/a/b")
+        .expect("should match")
+        .params;
     assert_eq!(params.get("rest").map(String::as_str), Some("a/b"));
 
     // A static branch that dead-ends must backtrack to the param route
@@ -1162,14 +1260,23 @@ fn router_prefers_param_over_wildcard_and_backtracks_across_branches() {
     router.get("/users/:id", |req: Request| {
         Response::send(req.param("id").unwrap_or("?"))
     });
-    let (_h, _m, params) = router.route("GET", "/users/me").expect("should match");
+    let params = router
+        .route("GET", "/users/me")
+        .expect("should match")
+        .params;
     assert_eq!(params.get("id").map(String::as_str), Some("me"));
 
     // Method-aware backtracking: POST /users/me must not shadow GET.
     router.post("/users/me", |_r: Request| Response::send("post me"));
-    let (_h, _m, params) = router.route("GET", "/users/me").expect("should match");
+    let params = router
+        .route("GET", "/users/me")
+        .expect("should match")
+        .params;
     assert_eq!(params.get("id").map(String::as_str), Some("me"));
-    let (_h, _m, params) = router.route("POST", "/users/me").expect("should match");
+    let params = router
+        .route("POST", "/users/me")
+        .expect("should match")
+        .params;
     assert!(params.is_empty());
 }
 
@@ -1180,11 +1287,17 @@ async fn router_prefers_exact_method_over_all_on_same_path() {
     router.all("/health", |_r: Request| Response::send("all"));
     router.get("/health", |_r: Request| Response::send("get"));
 
-    let (handler, _m, _p) = router.route("GET", "/health").expect("should match");
-    assert_eq!(handler(dummy_request("")).await.body_text(), "get");
+    let matched = router.route("GET", "/health").expect("should match");
+    assert_eq!(
+        (matched.handler)(dummy_request("")).await.body_text(),
+        "get"
+    );
 
-    let (handler, _m, _p) = router.route("DELETE", "/health").expect("should match");
-    assert_eq!(handler(dummy_request("")).await.body_text(), "all");
+    let matched = router.route("DELETE", "/health").expect("should match");
+    assert_eq!(
+        (matched.handler)(dummy_request("")).await.body_text(),
+        "all"
+    );
 }
 
 #[test]

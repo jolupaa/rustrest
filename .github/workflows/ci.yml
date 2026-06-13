@@ -1,0 +1,180 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-matrix:
+    name: Rust (${{ matrix.features || 'default' }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "tls"
+          - "tracing"
+          - "brotli"
+          - "tls tracing brotli"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check, test, and document
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          feature_args=()
+          if [[ -n "${FEATURES}" ]]; then
+            feature_args=(--features "${FEATURES}")
+          fi
+          cargo check --all-targets "${feature_args[@]}"
+          cargo test "${feature_args[@]}"
+          cargo doc --no-deps "${feature_args[@]}"
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --check
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: Check declared minimum Rust version
+        run: cargo check --all-targets --all-features
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Lint all targets and features
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  fuzz-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            fuzz -> fuzz/target
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build fuzz targets
+        run: |
+          cargo fuzz build handshake
+          cargo fuzz build event_json
+          cargo fuzz build room_target
+          cargo fuzz build broker_publication
+
+  websocket-load-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release examples
+        run: cargo build --release --example websocket --example websocket_load
+      - name: Start WebSocket server
+        run: |
+          RUSTREST_WS_OBSERVER=off target/release/examples/websocket \
+            >target/ws-load-server.log 2>&1 &
+          echo $! >target/ws-load-server.pid
+          for attempt in $(seq 1 100); do
+            curl --fail --silent http://127.0.0.1:3000/ >/dev/null && exit 0
+            sleep 0.1
+          done
+          cat target/ws-load-server.log
+          exit 1
+      - name: Run real-network load smoke
+        run: |
+          target/release/examples/websocket_load \
+            --idle 100 \
+            --active 20 \
+            --duration-secs 20 \
+            --json-out target/ws-load-smoke.json
+      - name: Upload failed load artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: websocket-load-smoke
+          path: |
+            target/ws-load-smoke.json
+            target/ws-load-server.log
+          if-no-files-found: ignore
+      - name: Stop WebSocket server
+        if: always()
+        run: |
+          if [[ -f target/ws-load-server.pid ]]; then
+            pid="$(cat target/ws-load-server.pid)"
+            kill -INT "${pid}" 2>/dev/null || true
+            for attempt in $(seq 1 150); do
+              kill -0 "${pid}" 2>/dev/null || exit 0
+              sleep 0.1
+            done
+            kill -TERM "${pid}" 2>/dev/null || true
+          fi
+
+  autobahn:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release WebSocket example
+        run: cargo build --release --example websocket
+      - name: Start WebSocket server
+        run: |
+          RUSTREST_WS_OBSERVER=off target/release/examples/websocket \
+            >target/autobahn-server.log 2>&1 &
+          echo $! >target/autobahn-server.pid
+          for attempt in $(seq 1 100); do
+            curl --fail --silent http://127.0.0.1:3000/ >/dev/null && exit 0
+            sleep 0.1
+          done
+          cat target/autobahn-server.log
+          exit 1
+      - name: Run Autobahn RFC 6455 gate
+        run: ./scripts/run-autobahn.sh
+      - name: Upload failed Autobahn artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autobahn-report
+          path: |
+            target/autobahn
+            target/autobahn-server.log
+          if-no-files-found: ignore
+      - name: Stop WebSocket server
+        if: always()
+        run: |
+          if [[ -f target/autobahn-server.pid ]]; then
+            pid="$(cat target/autobahn-server.pid)"
+            kill -INT "${pid}" 2>/dev/null || true
+            for attempt in $(seq 1 150); do
+              kill -0 "${pid}" 2>/dev/null || exit 0
+              sleep 0.1
+            done
+            kill -TERM "${pid}" 2>/dev/null || true
+          fi

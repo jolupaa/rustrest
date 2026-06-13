@@ -20,6 +20,7 @@ use tokio_rustls::TlsAcceptor;
 pub use tokio_rustls::rustls::ServerConfig;
 
 use super::App;
+use super::server::{TransportSecurity, drain_server_connections};
 
 /// Builds a rustls [`ServerConfig`] from PEM certificate-chain and private-key
 /// files, with ALPN advertising HTTP/2 and HTTP/1.1.
@@ -47,6 +48,7 @@ impl App {
         address: impl ToSocketAddrs,
         config: ServerConfig,
     ) -> io::Result<()> {
+        self.validate_websockets()?;
         let listener = TcpListener::bind(address).await?;
         if let Ok(local) = listener.local_addr() {
             println!("Server listening at https://{}", local);
@@ -69,6 +71,8 @@ impl App {
         config: ServerConfig,
         shutdown: impl Future<Output = ()> + Send,
     ) -> io::Result<()> {
+        self.validate_websockets()?;
+        self.websocket_runtime().start_broker().await;
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let app = Arc::new(self);
         let builder = Arc::new(auto::Builder::new(TokioExecutor::new()));
@@ -99,18 +103,20 @@ impl App {
                 match acceptor.accept(stream).await {
                     Ok(tls_stream) => {
                         let io = TokioIo::new(tls_stream);
-                        let connection =
-                            builder
-                                .serve_connection_with_upgrades(
-                                    io,
-                                    service_fn(move |req: hyper::Request<Incoming>| {
-                                        let app = Arc::clone(&app);
-                                        async move {
-                                            Ok::<_, Infallible>(app.handle(req, Some(peer)).await)
-                                        }
-                                    }),
-                                )
-                                .into_owned();
+                        let connection = builder
+                            .serve_connection_with_upgrades(
+                                io,
+                                service_fn(move |req: hyper::Request<Incoming>| {
+                                    let app = Arc::clone(&app);
+                                    async move {
+                                        Ok::<_, Infallible>(
+                                            app.handle(req, Some(peer), TransportSecurity::Tls)
+                                                .await,
+                                        )
+                                    }
+                                }),
+                            )
+                            .into_owned();
                         if let Err(err) = watcher.watch(connection).await {
                             eprintln!("Error serving TLS connection: {:?}", err);
                         }
@@ -122,12 +128,7 @@ impl App {
 
         // Stop accepting new connections, then drain the in-flight ones.
         drop(listener);
-        tokio::select! {
-            _ = graceful.shutdown() => {}
-            _ = tokio::time::sleep(Duration::from_secs(10)) => {
-                eprintln!("Timed out waiting for in-flight connections to drain");
-            }
-        }
+        drain_server_connections(&app.websocket_runtime(), graceful.shutdown()).await;
         Ok(())
     }
 }

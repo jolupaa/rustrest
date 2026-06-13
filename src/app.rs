@@ -38,8 +38,15 @@ pub use sse::SseEvent;
 pub use state::StateStore;
 pub use testing::{TestClient, TestRequest};
 pub use websocket::{
-    IntoWebSocketHandler, WebSocket, WebSocketConfig, WebSocketError, WebSocketEvent,
-    WebSocketHandler, WebSocketMessage, WsBroadcast,
+    BackpressurePolicy, InMemoryWsBroker, IntoWebSocketHandler, IntoWebSocketOutput, OriginPolicy,
+    WebSocket, WebSocketCapacityError, WebSocketCloseInfo, WebSocketCloseInitiator,
+    WebSocketConfig, WebSocketConnectionSnapshot, WebSocketError, WebSocketErrorCategory,
+    WebSocketEvent, WebSocketHandler, WebSocketId, WebSocketLifecycleState, WebSocketMessage,
+    WebSocketObservation, WebSocketObserver, WebSocketReceiver, WebSocketRuntimeHandle,
+    WebSocketSender, WebSocketStats, WebSocketTimeout, WsBroadcast, WsBroadcastError,
+    WsBroadcastReport, WsBroker, WsBrokerError, WsBrokerErrorCategory, WsBrokerPayload,
+    WsBrokerPublication, WsBrokerStream, WsBrokerTarget, WsError, WsHub, WsHubBuilder,
+    WsLocalSocket, WsNodeId, WsPublicationId, WsRemotePublish, WsRoute, WsTarget,
 };
 
 // Crate-internal helpers shared across submodules.
