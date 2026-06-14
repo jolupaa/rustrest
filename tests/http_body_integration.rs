@@ -81,8 +81,421 @@ async fn read_response(stream: &mut TcpStream) -> io::Result<String> {
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "timed out waiting for response"))?
 }
 
+fn assert_problem_code(response: &Response, status: u16, code: &str) {
+    assert_eq!(response.status, status);
+    assert!(
+        response
+            .body_text()
+            .contains(&format!(r#""code":"{code}""#)),
+        "unexpected response: {}",
+        response.body_text()
+    );
+}
+
 #[tokio::test]
-async fn middleware_can_reject_before_request_body_is_sent() {
+async fn route_body_limit_can_reduce_the_server_default() {
+    let mut app = App::new();
+    app.max_body_size(1024 * 1024);
+    app.post("/json", |mut req: Request| async move {
+        req.bytes()
+            .await
+            .map(|body| Response::send(&body.len().to_string()))
+    })
+    .body_limit(1024);
+    app.post("/upload", |mut req: Request| async move {
+        req.bytes()
+            .await
+            .map(|body| Response::send(&body.len().to_string()))
+    })
+    .body_limit(1024 * 1024);
+
+    let client = TestClient::new(app);
+
+    let rejected = client.post("/json").body(vec![0; 2048]).send().await;
+    assert_problem_code(&rejected, 413, "payload_too_large");
+
+    let accepted = client.post("/upload").body(vec![0; 2048]).send().await;
+    assert_eq!(accepted.status, 200);
+    assert_eq!(accepted.body_text(), "2048");
+}
+
+#[tokio::test]
+async fn server_body_limit_is_a_hard_ceiling_for_routes() {
+    let mut app = App::new();
+    app.max_body_size(1024);
+    app.post("/upload", |mut req: Request| async move {
+        req.bytes()
+            .await
+            .map(|body| Response::send(&body.len().to_string()))
+    })
+    .body_limit(1024 * 1024);
+
+    let response = TestClient::new(app)
+        .post("/upload")
+        .body(vec![0; 2048])
+        .send()
+        .await;
+
+    assert_problem_code(&response, 413, "payload_too_large");
+}
+
+#[tokio::test]
+async fn route_timeout_wraps_only_the_selected_route() {
+    let mut app = App::new();
+    app.get("/slow", |_req: Request| async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Response::send("late")
+    })
+    .timeout(Duration::from_millis(20));
+    app.get("/fast", |_req: Request| Response::send("ok"));
+
+    let client = TestClient::new(app);
+
+    let timed_out = client.get("/slow").send().await;
+    assert_problem_code(&timed_out, 408, "request_timeout");
+
+    let fast = client.get("/fast").send().await;
+    assert_eq!(fast.status, 200);
+    assert_eq!(fast.body_text(), "ok");
+}
+
+#[tokio::test]
+async fn known_oversized_content_length_is_rejected_before_middleware_or_body_poll() {
+    let middleware_ran = Arc::new(AtomicBool::new(false));
+    let handler_ran = Arc::new(AtomicBool::new(false));
+    let mut app = App::new();
+    app.max_body_size(1024 * 1024);
+    let middleware_flag = Arc::clone(&middleware_ran);
+    app.layer(move |req: Request, next: Next| {
+        middleware_flag.store(true, Ordering::SeqCst);
+        async move { next(req).await }
+    });
+    let handler_flag = Arc::clone(&handler_ran);
+    app.post("/upload", move |_req: Request| {
+        handler_flag.store(true, Ordering::SeqCst);
+        Response::send("ok")
+    })
+    .body_limit(4);
+
+    let (addr, shutdown, server) = spawn_app(app).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    let response = read_response(&mut stream)
+        .await
+        .expect("server should reject from headers without waiting for the payload");
+    shutdown_server(shutdown, server).await;
+
+    assert!(response.starts_with("HTTP/1.1 413"), "{response}");
+    assert!(
+        response.contains(r#""code":"payload_too_large""#),
+        "{response}"
+    );
+    assert!(!middleware_ran.load(Ordering::SeqCst));
+    assert!(!handler_ran.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn invalid_content_length_is_rejected_before_middleware_or_handler() {
+    let middleware_ran = Arc::new(AtomicBool::new(false));
+    let handler_ran = Arc::new(AtomicBool::new(false));
+    let mut app = App::new();
+    let middleware_flag = Arc::clone(&middleware_ran);
+    app.layer(move |req: Request, next: Next| {
+        middleware_flag.store(true, Ordering::SeqCst);
+        async move { next(req).await }
+    });
+    let handler_flag = Arc::clone(&handler_ran);
+    app.post("/upload", move |_req: Request| {
+        handler_flag.store(true, Ordering::SeqCst);
+        Response::send("ok")
+    });
+    let client = TestClient::new(app);
+
+    let response = client
+        .post("/upload")
+        .header("content-length", "not-a-number")
+        .body("hello")
+        .send()
+        .await;
+
+    assert_problem_code(&response, 400, "invalid_content_length");
+    assert!(!middleware_ran.load(Ordering::SeqCst));
+    assert!(!handler_ran.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn content_length_errors_use_the_global_error_handler() {
+    let mut app = App::new();
+    app.error_handler(|error: HttpError| {
+        Response::send(error.code())
+            .status(error.status().as_u16())
+            .header("x-error-code", error.code())
+    });
+    app.post("/upload", |_req: Request| Response::send("ok"));
+    let client = TestClient::new(app);
+
+    let response = client
+        .post("/upload")
+        .header("content-length", "invalid")
+        .send()
+        .await;
+
+    assert_eq!(response.status, 400);
+    assert_eq!(response.body_text(), "invalid_content_length");
+    assert_eq!(
+        response
+            .headers
+            .get("x-error-code")
+            .and_then(|value| value.to_str().ok()),
+        Some("invalid_content_length")
+    );
+}
+
+#[tokio::test]
+async fn conflicting_content_length_is_rejected_before_middleware_or_handler() {
+    for values in [["5", "6"], ["5, 6", ""]] {
+        let middleware_runs = Arc::new(AtomicUsize::new(0));
+        let handler_runs = Arc::new(AtomicUsize::new(0));
+        let mut app = App::new();
+        let middleware_counter = Arc::clone(&middleware_runs);
+        app.layer(move |req: Request, next: Next| {
+            middleware_counter.fetch_add(1, Ordering::SeqCst);
+            async move { next(req).await }
+        });
+        let handler_counter = Arc::clone(&handler_runs);
+        app.post("/upload", move |_req: Request| {
+            handler_counter.fetch_add(1, Ordering::SeqCst);
+            Response::send("ok")
+        });
+        let client = TestClient::new(app);
+        let mut request = client.post("/upload").header("content-length", values[0]);
+        if !values[1].is_empty() {
+            request = request.header("content-length", values[1]);
+        }
+
+        let response = request.body("hello").send().await;
+
+        assert_problem_code(&response, 400, "invalid_content_length");
+        assert_eq!(middleware_runs.load(Ordering::SeqCst), 0);
+        assert_eq!(handler_runs.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn identical_content_length_values_are_accepted() {
+    let mut app = App::new();
+    app.post("/duplicates", |mut req: Request| async move {
+        req.bytes()
+            .await
+            .map(|body| Response::send(&body.len().to_string()))
+    });
+    app.post("/list", |mut req: Request| async move {
+        req.bytes()
+            .await
+            .map(|body| Response::send(&body.len().to_string()))
+    });
+    let client = TestClient::new(app);
+
+    let duplicate_fields = client
+        .post("/duplicates")
+        .header("content-length", "5")
+        .header("content-length", "5")
+        .body("hello")
+        .send()
+        .await;
+    assert_eq!(duplicate_fields.status, 200);
+    assert_eq!(duplicate_fields.body_text(), "5");
+
+    let identical_list = client
+        .post("/list")
+        .header("content-length", "5, 5")
+        .body("hello")
+        .send()
+        .await;
+    assert_eq!(identical_list.status, 200);
+    assert_eq!(identical_list.body_text(), "5");
+}
+
+async fn assert_http1_content_length_parse_error(content_length_headers: &str) {
+    let middleware_runs = Arc::new(AtomicUsize::new(0));
+    let handler_runs = Arc::new(AtomicUsize::new(0));
+    let mut app = App::new();
+    app.error_handler(|error: HttpError| {
+        Response::send(error.code())
+            .status(error.status().as_u16())
+            .header("x-rustrest-error", "true")
+    });
+    let middleware_counter = Arc::clone(&middleware_runs);
+    app.layer(move |req: Request, next: Next| {
+        middleware_counter.fetch_add(1, Ordering::SeqCst);
+        async move { next(req).await }
+    });
+    let handler_counter = Arc::clone(&handler_runs);
+    app.post("/upload", move |_req: Request| {
+        handler_counter.fetch_add(1, Ordering::SeqCst);
+        Response::send("ok")
+    });
+
+    let (addr, shutdown, server) = spawn_app(app).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\n{content_length_headers}Connection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let response = read_response(&mut stream).await.unwrap();
+    shutdown_server(shutdown, server).await;
+
+    let lower_response = response.to_ascii_lowercase();
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    // Hyper rejects these malformed HTTP/1 messages before RustRest's service_fn.
+    // Transport-generated 400 responses cannot use the framework error handler or problem body.
+    assert!(!lower_response.contains("x-rustrest-error"), "{response}");
+    assert!(
+        !lower_response.contains("application/problem+json"),
+        "{response}"
+    );
+    assert!(!response.contains("invalid_content_length"), "{response}");
+    assert_eq!(middleware_runs.load(Ordering::SeqCst), 0);
+    assert_eq!(handler_runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn http1_invalid_content_length_is_rejected_by_hyper() {
+    assert_http1_content_length_parse_error("Content-Length: invalid\r\n").await;
+}
+
+#[tokio::test]
+async fn http1_empty_content_length_is_rejected_by_hyper() {
+    assert_http1_content_length_parse_error("Content-Length:\r\n").await;
+}
+
+#[tokio::test]
+async fn http1_overflowing_content_length_is_rejected_by_hyper() {
+    assert_http1_content_length_parse_error("Content-Length: 18446744073709551616\r\n").await;
+}
+
+#[tokio::test]
+async fn http1_conflicting_content_length_is_rejected_by_hyper() {
+    assert_http1_content_length_parse_error("Content-Length: 5\r\nContent-Length: 6\r\n").await;
+}
+
+#[tokio::test]
+async fn http1_ambiguous_content_length_list_is_rejected_by_hyper() {
+    assert_http1_content_length_parse_error("Content-Length: 5, 6\r\n").await;
+}
+
+#[tokio::test]
+async fn http1_identical_duplicate_content_length_is_accepted_by_hyper() {
+    let middleware_runs = Arc::new(AtomicUsize::new(0));
+    let handler_runs = Arc::new(AtomicUsize::new(0));
+    let mut app = App::new();
+    let middleware_counter = Arc::clone(&middleware_runs);
+    app.layer(move |req: Request, next: Next| {
+        middleware_counter.fetch_add(1, Ordering::SeqCst);
+        async move { next(req).await }
+    });
+    let handler_counter = Arc::clone(&handler_runs);
+    app.post("/upload", move |mut req: Request| {
+        handler_counter.fetch_add(1, Ordering::SeqCst);
+        async move {
+            req.bytes()
+                .await
+                .map(|body| Response::send(&body.len().to_string()))
+        }
+    });
+
+    let (addr, shutdown, server) = spawn_app(app).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        )
+        .await
+        .unwrap();
+
+    let response = read_response(&mut stream).await.unwrap();
+    shutdown_server(shutdown, server).await;
+
+    // Hyper validates identical duplicates and exposes a normalized Content-Length to RustRest.
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with('5'), "{response}");
+    assert_eq!(middleware_runs.load(Ordering::SeqCst), 1);
+    assert_eq!(handler_runs.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn expect_continue_unauthorized_receives_only_the_final_response() {
+    let mut app = App::new();
+    app.layer(|req: Request, next: Next| async move {
+        if req.header("authorization").is_none() {
+            return Response::from_error(HttpError::unauthorized("Falta autenticacion"));
+        }
+        next(req).await
+    });
+    app.post("/upload", |mut req: Request| async move {
+        req.bytes().await?;
+        Ok::<_, HttpError>(Response::send("ok"))
+    });
+
+    let (addr, shutdown, server) = spawn_app(app).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    let response = read_response(&mut stream).await.unwrap();
+    shutdown_server(shutdown, server).await;
+
+    assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+    assert!(!response.contains("100 Continue"), "{response}");
+}
+
+#[tokio::test]
+async fn expect_continue_authorized_receives_continue_before_sending_body() {
+    let mut app = App::new();
+    app.layer(|req: Request, next: Next| async move {
+        if req.header("authorization").is_none() {
+            return Response::from_error(HttpError::unauthorized("Falta autenticacion"));
+        }
+        next(req).await
+    });
+    app.post("/upload", |mut req: Request| async move {
+        let body = req.bytes().await?;
+        Ok::<_, HttpError>(Response::send(&body.len().to_string()))
+    });
+
+    let (addr, shutdown, server) = spawn_app(app).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"POST /upload HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test\r\nContent-Length: 5\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    let interim = read_headers(&mut stream).await.unwrap();
+    assert_eq!(interim, "HTTP/1.1 100 Continue\r\n\r\n");
+
+    stream.write_all(b"hello").await.unwrap();
+    let response = read_response(&mut stream).await.unwrap();
+    shutdown_server(shutdown, server).await;
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with('5'), "{response}");
+}
+
+#[tokio::test]
+async fn middleware_can_reject_unknown_body_before_request_body_is_sent() {
     let mut app = App::new();
     app.layer(|req: Request, next: Next| async move {
         if req.header("authorization").is_none() {
@@ -95,7 +508,9 @@ async fn middleware_can_reject_before_request_body_is_sent() {
     let (addr, shutdown, server) = spawn_app(app).await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream
-        .write_all(b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048576\r\n\r\n")
+        .write_all(
+            b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )
         .await
         .unwrap();
 

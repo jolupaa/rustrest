@@ -120,6 +120,44 @@ impl Request {
         self.route_pattern.as_deref()
     }
 
+    pub(crate) fn set_body_limit(&mut self, limit: usize) {
+        self.body_limit = limit;
+        self.body.set_default_limit(limit);
+    }
+
+    pub(crate) fn validate_content_length(&self) -> Result<(), HttpError> {
+        let mut content_length: Option<u64> = None;
+
+        for raw_value in self.headers_all("content-length") {
+            for raw_part in raw_value.split(',') {
+                let value = raw_part.trim();
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(HttpError::invalid_content_length());
+                }
+
+                let value = value
+                    .parse::<u64>()
+                    .map_err(|_| HttpError::invalid_content_length())?;
+                match content_length {
+                    Some(previous) if previous != value => {
+                        return Err(HttpError::invalid_content_length());
+                    }
+                    Some(_) => {}
+                    None => content_length = Some(value),
+                }
+            }
+        }
+
+        // Hyper's HTTP/1 parser rejects malformed and conflicting values before
+        // service_fn. This validation covers TestClient and transports that
+        // preserve repeated fields or comma lists for framework-level handling.
+        if content_length.is_some_and(|length| length > self.body_limit as u64) {
+            return Err(HttpError::payload_too_large_limit(self.body_limit));
+        }
+
+        Ok(())
+    }
+
     /// Returns shared application state by type.
     pub fn state<T>(&self) -> Option<std::sync::Arc<T>>
     where

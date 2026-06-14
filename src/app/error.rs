@@ -75,6 +75,14 @@ impl HttpError {
         ))
     }
 
+    pub fn invalid_content_length() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_content_length",
+            "El encabezado Content-Length no es valido",
+        )
+    }
+
     pub fn body_read(source: BoxError) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,

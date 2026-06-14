@@ -185,8 +185,10 @@ impl App {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
     }
 
-    /// Sets the maximum request body size buffered into memory. Requests whose
-    /// body exceeds this return `413 Payload Too Large`. Defaults to 64 KB.
+    /// Sets the hard maximum request body size buffered into memory. Route-level
+    /// limits may lower, but never raise, this ceiling. Requests whose body
+    /// exceeds the effective limit return `413 Payload Too Large`. Defaults to
+    /// 64 KB.
     pub fn max_body_size(&mut self, bytes: usize) -> &mut Self {
         self.config.max_body_size = bytes;
         self
@@ -581,6 +583,7 @@ impl App {
                 params: HashMap::new(),
                 pattern: path.to_string(),
                 kind: RouteKind::Http,
+                body_limit: None,
             }
         } else if method == "HEAD" && allowed.iter().any(|m| m == "GET") {
             self.router
@@ -593,6 +596,7 @@ impl App {
                 params: HashMap::new(),
                 pattern: path.to_string(),
                 kind: RouteKind::Http,
+                body_limit: None,
             }
         } else {
             MatchedRoute {
@@ -601,6 +605,7 @@ impl App {
                 params: HashMap::new(),
                 pattern: path.to_string(),
                 kind: RouteKind::Http,
+                body_limit: None,
             }
         }
     }
@@ -645,6 +650,7 @@ impl App {
                 params: HashMap::new(),
                 pattern: request.path.clone(),
                 kind: RouteKind::Http,
+                body_limit: None,
             },
             None => match self.router.route(&request.method, &request.path) {
                 Some(found) => found,
@@ -657,7 +663,12 @@ impl App {
             params,
             pattern,
             kind,
+            body_limit,
         } = matched;
+        let effective_body_limit = body_limit
+            .unwrap_or(self.config.max_body_size)
+            .min(self.config.max_body_size);
+        request.set_body_limit(effective_body_limit);
         request.params = params;
         request.route_pattern = Some(pattern);
         request.resolved_websocket_config = match kind {
@@ -669,6 +680,14 @@ impl App {
                 ))
             }
         };
+
+        if let Err(error) = request.validate_content_length() {
+            let mut response = self.error_response(error);
+            if is_head {
+                response.clear_body();
+            }
+            return response;
+        }
 
         // Innermost layer: the matched handler.
         let mut next: Next = Box::new(move |req| (*handler)(req));

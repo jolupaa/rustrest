@@ -66,6 +66,10 @@ impl RequestBody {
         }
     }
 
+    pub(crate) fn set_default_limit(&mut self, limit: usize) {
+        self.default_limit = limit;
+    }
+
     /// Collects the body while enforcing `limit` exactly across all chunks.
     pub async fn collect(&mut self, limit: usize) -> Result<Bytes, HttpError> {
         if let BodyState::Buffered(bytes) = &self.state {

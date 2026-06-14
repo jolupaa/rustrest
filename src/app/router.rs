@@ -5,7 +5,7 @@ use std::io::SeekFrom;
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::Stream;
 use hyper::body::Bytes;
@@ -55,15 +55,17 @@ pub(crate) struct MatchedRoute {
     pub params: HashMap<String, String>,
     pub pattern: String,
     pub kind: RouteKind,
+    pub body_limit: Option<usize>,
 }
 
-/// Optional documentation attached to a route via [`RouteHandle`], surfaced
-/// in [`RouteInfo`] and the generated OpenAPI document.
+/// Metadata and transport policy attached to a route via [`RouteHandle`].
+/// Documentation fields are surfaced in [`RouteInfo`] and OpenAPI.
 #[derive(Clone, Default)]
 pub(crate) struct RouteMeta {
     summary: Option<String>,
     description: Option<String>,
     tags: Vec<String>,
+    body_limit: Option<usize>,
 }
 
 /// Splits a path into non-empty segments (trailing/duplicate slashes ignored).
@@ -384,6 +386,7 @@ impl Router {
             params,
             pattern: render_pattern(&route.pattern),
             kind: route.kind.clone(),
+            body_limit: route.meta.body_limit,
         })
     }
 
@@ -481,8 +484,8 @@ fn render_pattern(pattern: &[Segment]) -> String {
 }
 
 /// A handle to a just-registered route, returned by the route methods so that
-/// per-route middleware can be attached: `app.get("/admin", h).layer(auth)`.
-/// The handle is ignorable when no per-route middleware is needed.
+/// middleware and transport policy can be scoped to it. The handle is
+/// ignorable when no route-specific configuration is needed.
 pub struct RouteHandle<'a> {
     router: &'a mut Router,
     index: usize,
@@ -495,6 +498,21 @@ impl RouteHandle<'_> {
         self.router.routes[self.index]
             .middlewares
             .push(middleware.into_middleware());
+        self
+    }
+
+    /// Sets the maximum request body size for this route. The application-level
+    /// maximum remains a hard ceiling.
+    pub fn body_limit(self, bytes: usize) -> Self {
+        self.router.routes[self.index].meta.body_limit = Some(bytes);
+        self
+    }
+
+    /// Applies an execution timeout to this route only.
+    pub fn timeout(self, timeout: Duration) -> Self {
+        self.router.routes[self.index]
+            .middlewares
+            .push(super::middleware::timeout(timeout));
         self
     }
 
