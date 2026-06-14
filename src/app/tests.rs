@@ -18,25 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn dummy_request(body: &str) -> Request {
-    Request {
-        version: hyper::Version::HTTP_11,
-        method: "GET".to_string(),
-        path: "/".to_string(),
-        raw_query: None,
-        query: HashMap::new(),
-        headers: HashMap::new(),
-        cookies: HashMap::new(),
-        body: Bytes::from(body.to_string()),
-        params: HashMap::new(),
-        route_pattern: None,
-        websocket_runtime: WebSocketRuntimeHandle::local(),
-        resolved_websocket_config: None,
-        state: StateStore::default(),
-        upgrade: None,
-        remote_addr: None,
-        secure_transport: false,
-        header_pairs: Vec::new(),
-    }
+    Request::builder().body(body.to_string()).build()
 }
 
 #[test]
@@ -974,13 +956,13 @@ fn response_body_accessors_and_no_desync_for_streams() {
     assert_eq!(stream_res.body_bytes(), None);
 }
 
-#[test]
-fn request_builder_builds_full_request() {
+#[tokio::test]
+async fn request_builder_builds_full_request() {
     struct Cfg {
         name: &'static str,
     }
 
-    let req = Request::builder()
+    let mut req = Request::builder()
         .method("POST")
         .path("/users/42?active=true&tag=a&tag=b")
         .header("X-Tag", "uno")
@@ -1001,7 +983,7 @@ fn request_builder_builds_full_request() {
     assert_eq!(req.headers_all("x-tag"), vec!["uno", "dos"]);
     assert_eq!(req.cookie("sid"), Some("abc"));
     assert_eq!(req.param("id"), Some("42"));
-    assert_eq!(req.bytes(), br#"{"n":1}"#);
+    assert_eq!(req.bytes().await.unwrap(), br#"{"n":1}"#[..]);
     assert_eq!(req.state::<Cfg>().unwrap().name, "test");
 }
 
@@ -1017,7 +999,9 @@ async fn test_client_drives_app_without_tcp() {
         let lang = req.query("lang").unwrap_or("en");
         Response::send(&format!("hola {} ({})", name, lang))
     });
-    app.post("/echo", |req: Request| Response::send(&req.text()));
+    app.post("/echo", |mut req: Request| async move {
+        req.text().await.map(|text| Response::send(&text))
+    });
 
     let client = TestClient::new(app);
 
@@ -1038,7 +1022,10 @@ async fn test_client_honors_body_limit_and_timeout() {
     let mut app = App::new();
     app.max_body_size(4);
     app.request_timeout(std::time::Duration::from_millis(30));
-    app.post("/up", |_r: Request| Response::send("ok"));
+    app.post("/up", |mut req: Request| async move {
+        req.bytes().await?;
+        Ok::<_, HttpError>(Response::send("ok"))
+    });
     app.get("/slow", |_r: Request| async {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         Response::send("late")
@@ -1245,7 +1232,8 @@ fn query_params_are_parsed_and_url_decoded() {
         query,
         headers: HashMap::new(),
         cookies: HashMap::new(),
-        body: Bytes::new(),
+        body: RequestBody::buffered(Bytes::new(), super::body::DEFAULT_BODY_LIMIT),
+        body_limit: super::body::DEFAULT_BODY_LIMIT,
         params: HashMap::new(),
         route_pattern: None,
         websocket_runtime: WebSocketRuntimeHandle::local(),
@@ -1275,15 +1263,15 @@ fn request_cookies_are_parsed_from_cookie_header() {
     assert_eq!(req.cookie("empty"), Some(""));
 }
 
-#[test]
-fn request_json_deserializes_body() {
+#[tokio::test]
+async fn request_json_deserializes_body() {
     #[derive(Deserialize, PartialEq, Debug)]
     struct User {
         id: u32,
         name: String,
     }
-    let req = dummy_request(r#"{"id":1,"name":"Ada"}"#);
-    let user: User = req.json().unwrap();
+    let mut req = dummy_request(r#"{"id":1,"name":"Ada"}"#);
+    let user: User = req.json().await.unwrap();
     assert_eq!(
         user,
         User {
@@ -1293,39 +1281,39 @@ fn request_json_deserializes_body() {
     );
 }
 
-#[test]
-fn request_json_errors_on_invalid_body() {
-    let req = dummy_request("not json");
-    assert!(req.json::<serde_json::Value>().is_err());
+#[tokio::test]
+async fn request_json_errors_on_invalid_body() {
+    let mut req = dummy_request("not json");
+    assert!(req.json::<serde_json::Value>().await.is_err());
 }
 
-#[test]
-fn request_form_parses_urlencoded_body() {
+#[tokio::test]
+async fn request_form_parses_urlencoded_body() {
     #[derive(Deserialize)]
     struct Login {
         user: String,
         tags: Vec<String>,
     }
 
-    let req = Request::builder()
+    let mut req = Request::builder()
         .method("POST")
         .header("content-type", "application/x-www-form-urlencoded")
         .body("user=ada+lovelace&tags=a&tags=b")
         .build();
 
-    let form: Login = req.form().unwrap();
+    let form: Login = req.form().await.unwrap();
     assert_eq!(form.user, "ada lovelace");
     assert_eq!(form.tags, vec!["a", "b"]);
 
     let Form(extracted) = req.extract::<Form<Login>>().unwrap();
     assert_eq!(extracted.user, "ada lovelace");
 
-    let bad = dummy_request("%%%not-a-form=%zz");
-    assert!(bad.form::<Login>().is_err());
+    let mut bad = dummy_request("%%%not-a-form=%zz");
+    assert!(bad.form::<Login>().await.is_err());
 }
 
-#[test]
-fn request_multipart_parses_fields_and_binary_files() {
+#[tokio::test]
+async fn request_multipart_parses_fields_and_binary_files() {
     let mut body = Vec::new();
     body.extend_from_slice(
         b"--XBOUND\r\ncontent-disposition: form-data; name=\"campo\"\r\n\r\nhola\r\n",
@@ -1336,13 +1324,13 @@ fn request_multipart_parses_fields_and_binary_files() {
     body.extend_from_slice(&[0xFF, 0x00, 0xFE]);
     body.extend_from_slice(b"\r\n--XBOUND--\r\n");
 
-    let req = Request::builder()
+    let mut req = Request::builder()
         .method("POST")
         .header("content-type", "multipart/form-data; boundary=XBOUND")
         .body(body)
         .build();
 
-    let parts = req.multipart().unwrap();
+    let parts = req.multipart().await.unwrap();
     assert_eq!(parts.len(), 2);
 
     assert_eq!(parts[0].name, "campo");
@@ -1358,19 +1346,20 @@ fn request_multipart_parses_fields_and_binary_files() {
     assert_eq!(&parts[1].data[..], &[0xFF, 0x00, 0xFE]);
 
     // Without a multipart content type the call fails cleanly.
-    assert!(dummy_request("x").multipart().is_err());
+    assert!(dummy_request("x").multipart().await.is_err());
 }
 
-#[test]
-fn request_body_bytes_preserve_non_utf8_and_text_is_lossy() {
-    // Bytes that are not valid UTF-8 must survive intact through `bytes()`,
-    // while `text()` exposes a lossy view for text consumers.
+#[tokio::test]
+async fn request_body_bytes_preserve_non_utf8_and_text_is_strict() {
     let raw: &[u8] = &[0xff, 0xfe, b'h', b'i'];
-    let mut req = dummy_request("");
-    req.body = Bytes::copy_from_slice(raw);
+    let mut req = Request::builder().body(Bytes::copy_from_slice(raw)).build();
 
-    assert_eq!(req.bytes(), raw);
-    assert_eq!(req.text(), String::from_utf8_lossy(raw));
+    assert_eq!(req.bytes().await.unwrap(), raw);
+    assert_eq!(req.text().await.unwrap_err().code(), "invalid_utf8");
+    assert_eq!(
+        req.text_lossy().await.unwrap(),
+        String::from_utf8_lossy(raw)
+    );
 }
 
 #[test]

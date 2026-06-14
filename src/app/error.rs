@@ -69,6 +69,53 @@ impl HttpError {
         )
     }
 
+    pub fn payload_too_large_limit(limit: usize) -> Self {
+        Self::payload_too_large(format!(
+            "El cuerpo de la solicitud supera el limite de {limit} bytes"
+        ))
+    }
+
+    pub fn body_read(source: BoxError) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "body_read",
+            "No se pudo leer el cuerpo de la solicitud",
+        )
+        .with_source(source)
+    }
+
+    pub fn body_already_consumed() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "body_already_consumed",
+            "El cuerpo de la solicitud ya fue consumido",
+        )
+    }
+
+    pub fn body_not_buffered() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "body_not_buffered",
+            "El cuerpo de la solicitud requiere lectura asincrona",
+        )
+    }
+
+    pub fn invalid_utf8() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_utf8",
+            "El cuerpo de la solicitud no es UTF-8 valido",
+        )
+    }
+
+    pub fn invalid_json() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_json",
+            "El cuerpo de la solicitud no contiene JSON valido",
+        )
+    }
+
     pub fn request_timeout(public_message: impl Into<Cow<'static, str>>) -> Self {
         Self::new(
             StatusCode::REQUEST_TIMEOUT,

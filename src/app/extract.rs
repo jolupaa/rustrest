@@ -6,11 +6,19 @@ use serde::de::DeserializeOwned;
 
 use super::{HttpError, Request};
 
+/// Synchronous extraction from request metadata.
+///
+/// The body-based compatibility implementations (`Json<T>`, `Form<T>`,
+/// `Bytes`, and `String`) only work when the request body is already buffered,
+/// as it is for `RequestBuilder`. Network handlers should use the async body
+/// methods on [`Request`] directly.
 pub trait FromRequest: Sized {
     fn from_request(req: &Request) -> Result<Self, HttpError>;
 }
 
+/// JSON extracted synchronously from an already buffered request body.
 pub struct Json<T>(pub T);
+/// Form data extracted synchronously from an already buffered request body.
 pub struct Form<T>(pub T);
 pub struct Path<T>(pub T);
 pub struct Query<T>(pub T);
@@ -26,7 +34,7 @@ where
     T: DeserializeOwned,
 {
     fn from_request(req: &Request) -> Result<Self, HttpError> {
-        req.form().map(Form)
+        super::form::deserialize_form(req.buffered_bytes()?).map(Form)
     }
 }
 
@@ -35,9 +43,9 @@ where
     T: DeserializeOwned,
 {
     fn from_request(req: &Request) -> Result<Self, HttpError> {
-        req.json().map(Json).map_err(|err| {
-            HttpError::bad_request(format!("Invalid JSON: {}", err)).with_source(err)
-        })
+        serde_json::from_slice(req.buffered_bytes()?)
+            .map(Json)
+            .map_err(|err| HttpError::invalid_json().with_source(err))
     }
 }
 
@@ -103,13 +111,14 @@ where
 
 impl FromRequest for Bytes {
     fn from_request(req: &Request) -> Result<Self, HttpError> {
-        Ok(req.body.clone())
+        Ok(req.buffered_bytes()?.clone())
     }
 }
 
 impl FromRequest for String {
     fn from_request(req: &Request) -> Result<Self, HttpError> {
-        Ok(req.text().into_owned())
+        String::from_utf8(req.buffered_bytes()?.to_vec())
+            .map_err(|err| HttpError::invalid_utf8().with_source(err))
     }
 }
 

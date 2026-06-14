@@ -1,6 +1,4 @@
-use rustrest::{
-    App, HttpError, Json, Next, Path, Query, Request, Response, Router, State, middleware,
-};
+use rustrest::{App, HttpError, Next, Path, Query, Request, Response, Router, State, middleware};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -51,10 +49,10 @@ fn users_router() -> Router {
         }))
     });
 
-    router.post("/", |req: Request| -> Result<Response, HttpError> {
-        let Json(mut user) = req.extract::<Json<User>>()?;
+    router.post("/", |mut req: Request| async move {
+        let mut user: User = req.json().await?;
         user.id = 100;
-        Ok(Response::json(&user).status(201))
+        Ok::<_, HttpError>(Response::json(&user).status(201))
     });
 
     router.fallback(|_req: Request| {

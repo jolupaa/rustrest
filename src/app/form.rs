@@ -30,22 +30,28 @@ impl MultipartPart {
 impl Request {
     /// Deserializes an `application/x-www-form-urlencoded` body into `T`.
     /// Repeated keys map onto `Vec` fields.
-    pub fn form<T: DeserializeOwned>(&self) -> Result<T, HttpError> {
-        serde_html_form::from_bytes(self.bytes()).map_err(|err| {
-            HttpError::bad_request(format!("Invalid form body: {}", err)).with_source(err)
-        })
+    pub async fn form<T: DeserializeOwned>(&mut self) -> Result<T, HttpError> {
+        let body = self.bytes().await?;
+        deserialize_form(&body)
     }
 
     /// Parses a `multipart/form-data` body into its parts. The whole body is
-    /// already buffered (bounded by `max_body_size`), so parsing is in-memory.
-    pub fn multipart(&self) -> Result<Vec<MultipartPart>, HttpError> {
+    /// collected with the request body limit before parsing in memory.
+    pub async fn multipart(&mut self) -> Result<Vec<MultipartPart>, HttpError> {
         let content_type = self
             .header("content-type")
             .ok_or_else(|| HttpError::bad_request("Expected multipart/form-data"))?;
         let boundary = multipart_boundary(content_type)
             .ok_or_else(|| HttpError::bad_request("Missing multipart boundary"))?;
-        parse_multipart(self.bytes(), &boundary)
+        let body = self.bytes().await?;
+        parse_multipart(&body, &boundary)
     }
+}
+
+pub(crate) fn deserialize_form<T: DeserializeOwned>(body: &[u8]) -> Result<T, HttpError> {
+    serde_html_form::from_bytes(body).map_err(|err| {
+        HttpError::bad_request(format!("Invalid form body: {}", err)).with_source(err)
+    })
 }
 
 /// Extracts the boundary parameter from a `multipart/form-data` content type.

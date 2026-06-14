@@ -36,15 +36,17 @@ pub fn router() -> Router {
     });
 
     // POST / -> create (JSON body)
-    router.post("/", |req: Request| match req.json::<User>() {
-        Ok(user) => Response::json(&user),
-        Err(_) => Response::bad_request(),
+    router.post("/", |mut req: Request| async move {
+        match req.json::<User>().await {
+            Ok(user) => Response::json(&user),
+            Err(_) => Response::bad_request(),
+        }
     });
 
     // PUT /:id -> update (path param + body)
-    router.put("/:id", |req: Request| {
+    router.put("/:id", |mut req: Request| async move {
         let id = req.param("id").unwrap_or("0").to_string();
-        match req.json::<User>() {
+        match req.json::<User>().await {
             Ok(mut user) => {
                 user.id = id.parse().unwrap_or(user.id);
                 Response::json(&user)

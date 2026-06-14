@@ -21,7 +21,7 @@ The goal is to provide a small, direct, easy-to-understand API for building HTTP
 - Router guards; app and router fallbacks.
 - Graceful shutdown (`listen_with_shutdown` / `serve_with_shutdown`) and a panic-proof accept loop.
 - Configurable body limit (413), request timeout (408), and header-read timeout.
-- Binary-safe request bodies: `req.bytes()`, `req.text()`, `req.json::<T>()`, `req.form::<T>()`, and `req.multipart()`.
+- Streaming, binary-safe request bodies with async `bytes`, strict `text`, JSON, form, and multipart helpers.
 - Client address via `req.remote_addr()`; duplicate headers via `req.headers_all()`.
 - Parsed query strings; request and response cookies (plus a `Cookie` builder with `SameSite`/`Secure`/`Max-Age`).
 - Signed values (HMAC-SHA256) and a minimal in-memory `Sessions` middleware.
@@ -310,12 +310,12 @@ req.query_all("tag");
 req.header("authorization");
 req.headers_all("x-forwarded-for");
 req.cookie("sid");
-req.bytes();              // raw body bytes
-req.text();               // lossy UTF-8 view of the body
-req.json::<MyType>();
-req.form::<MyForm>();
-req.multipart();
-req.extract::<Json<MyType>>();
+req.bytes().await?;              // collected raw body bytes
+req.text().await?;               // strict UTF-8 text
+req.text_lossy().await?;         // explicitly lossy UTF-8 text
+req.json::<MyType>().await?;
+req.form::<MyForm>().await?;
+req.multipart().await?;
 req.state::<Config>();
 req.remote_addr();
 req.last_event_id();      // SSE reconnection header
@@ -323,7 +323,7 @@ req.is_websocket_upgrade();
 req.websocket(|socket| async move { ... });
 ```
 
-The request body is fully buffered as bytes, capped by `app.max_body_size(...)` (64 KB by default; oversized bodies get `413`).
+The incoming request body is streamed into the handler and is only buffered when a body helper is awaited. Collection is capped by `app.max_body_size(...)` (64 KB by default; oversized bodies get `413`). Body-based synchronous extractors remain available for requests built with `Request::builder()`; network handlers should use the async methods above.
 
 ## Typed Extractors
 
@@ -367,9 +367,9 @@ app.get("/users/:id", |req: Request| -> Result<Response, rustrest::HttpError> {
     )))
 });
 
-app.post("/users", |req: Request| -> Result<Response, rustrest::HttpError> {
-    let Json(user) = req.extract::<Json<CreateUser>>()?;
-    Ok(Response::send(&format!("Creating {}", user.name)).status(201))
+app.post("/users", |mut req: Request| async move {
+    let user: CreateUser = req.json().await?;
+    Ok::<_, rustrest::HttpError>(Response::send(&format!("Creating {}", user.name)).status(201))
 });
 ```
 

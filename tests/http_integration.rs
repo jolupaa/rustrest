@@ -1,4 +1,4 @@
-use rustrest::app::{App, Request, Response};
+use rustrest::app::{App, HttpError, Request, Response};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -62,7 +62,10 @@ async fn request_exposes_client_peer_address() {
 async fn oversized_body_returns_413() {
     let mut app = App::new();
     app.max_body_size(16);
-    app.post("/upload", |_req: Request| Response::send("ok"));
+    app.post("/upload", |mut req: Request| async move {
+        req.bytes().await?;
+        Ok::<_, HttpError>(Response::send("ok"))
+    });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

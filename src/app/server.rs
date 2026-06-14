@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::FutureExt;
-use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::header::{CONNECTION, COOKIE, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE};
 use hyper::service::service_fn;
@@ -20,17 +19,15 @@ use tokio::net::{TcpListener, ToSocketAddrs};
 use super::router::{MatchedRoute, RouteKind};
 use super::websocket::{header_value_contains_token, is_valid_websocket_key};
 use super::{
-    ErrorHandler, HttpError, IntoHandler, IntoMiddleware, Middleware, Next, Request, Response,
-    RouteHandle, Router, StateStore, WebSocketConfig, WebSocketObserver, WebSocketRuntimeHandle,
-    WsHub,
+    ErrorHandler, HttpError, IntoHandler, IntoMiddleware, Middleware, Next, Request, RequestBody,
+    Response, RouteHandle, Router, StateStore, WebSocketConfig, WebSocketObserver,
+    WebSocketRuntimeHandle, WsHub,
 };
 use super::{
     Handler, ResponseBody, allow_header_value, method_not_allowed_handler, not_found_handler,
     options_handler, panic_response, parse_cookies, parse_query,
 };
 
-/// Default maximum request body we will buffer into memory (64 KB).
-const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
 const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) async fn drain_server_connections(
@@ -83,7 +80,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            max_body_size: DEFAULT_MAX_BODY_BYTES,
+            max_body_size: super::body::DEFAULT_BODY_LIMIT,
             request_timeout: None,
             header_read_timeout: None,
             trailing_slash: TrailingSlash::default(),
@@ -481,58 +478,41 @@ impl App {
         Ok(())
     }
 
-    /// Translates a hyper request into a [`Request`] (method, path, query,
-    /// headers, size-bounded body), dispatches it, and converts the result.
+    /// Translates a hyper request into a [`Request`] without consuming its
+    /// body, dispatches it, and converts the result.
     pub(crate) async fn handle(
         &self,
         mut req: hyper::Request<Incoming>,
         remote_addr: Option<SocketAddr>,
         transport_security: TransportSecurity,
     ) -> hyper::Response<ResponseBody> {
-        // Read everything that only needs a borrow before consuming the body.
-        let version = req.version();
-        let method = req.method().as_str().to_string();
-        let path = req.uri().path().to_string();
-        let raw_query = req.uri().query().map(|q| q.to_string());
-        let query = raw_query.as_deref().map(parse_query).unwrap_or_default();
         let upgrade = if is_websocket_upgrade_request(&req) {
             Some(hyper::upgrade::on(&mut req))
         } else {
             None
         };
+        let (parts, body) = req.into_parts();
+        let version = parts.version;
+        let method = parts.method.as_str().to_string();
+        let path = parts.uri.path().to_string();
+        let raw_query = parts.uri.query().map(|q| q.to_string());
+        let query = raw_query.as_deref().map(parse_query).unwrap_or_default();
         // Build a convenience single-value map (last value wins) and a
         // full-fidelity list that preserves duplicate headers.
         let mut headers: HashMap<String, String> = HashMap::new();
         let mut header_pairs: Vec<(String, String)> = Vec::new();
-        for (name, value) in req.headers().iter() {
+        for (name, value) in &parts.headers {
             let name = name.as_str().to_string();
             let value = value.to_str().unwrap_or("").to_string();
             headers.insert(name.clone(), value.clone());
             header_pairs.push((name, value));
         }
-        let cookies = req
-            .headers()
+        let cookies = parts
+            .headers
             .get(COOKIE)
             .and_then(|value| value.to_str().ok())
             .map(parse_cookies)
             .unwrap_or_default();
-
-        // Buffer the body up to the configured limit. On overflow return 413;
-        // on any other read error return 400 (no longer a silent empty body).
-        let body = match Limited::new(req.into_body(), self.config.max_body_size)
-            .collect()
-            .await
-        {
-            Ok(collected) => collected.to_bytes(),
-            Err(err) => {
-                let error = if err.downcast_ref::<LengthLimitError>().is_some() {
-                    HttpError::payload_too_large("Payload Too Large").with_source(err)
-                } else {
-                    HttpError::bad_request("Could not read request body").with_source(err)
-                };
-                return self.error_response(error).into_hyper();
-            }
-        };
 
         let request = Request {
             version,
@@ -542,7 +522,8 @@ impl App {
             query,
             headers,
             cookies,
-            body,
+            body: RequestBody::incoming(body, self.config.max_body_size),
+            body_limit: self.config.max_body_size,
             params: HashMap::new(),
             route_pattern: None,
             websocket_runtime: self.websocket_runtime.clone(),

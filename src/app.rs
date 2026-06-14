@@ -4,6 +4,7 @@
 //! file wires them together and re-exports the public API (also surfaced at the
 //! crate root via `lib.rs`).
 
+mod body;
 mod cookie;
 mod error;
 mod extract;
@@ -24,6 +25,7 @@ pub mod tls;
 mod trie;
 mod websocket;
 
+pub use body::{BodyStream, RequestBody};
 pub use cookie::{Cookie, SameSite, sign_value, verify_value};
 pub use error::{BoxError, HttpError, IntoHttpError};
 pub use extract::{Cookies, Form, FromRequest, Headers, Json, Path, Query, State};

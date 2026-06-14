@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
@@ -7,8 +6,9 @@ use hyper::header::{SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION};
 use hyper::upgrade::OnUpgrade;
 use serde::de::DeserializeOwned;
 
+use super::body::DEFAULT_BODY_LIMIT;
 use super::websocket::ResolvedWebSocketConfig;
-use super::{FromRequest, HttpError, StateStore, WebSocketRuntimeHandle};
+use super::{BodyStream, FromRequest, HttpError, RequestBody, StateStore, WebSocketRuntimeHandle};
 
 /// Request data handed to each route handler. Fields are part of the
 /// handler-facing API; some demo handlers ignore them.
@@ -23,8 +23,8 @@ pub struct Request {
     pub query: HashMap<String, Vec<String>>,
     pub headers: HashMap<String, String>,
     pub cookies: HashMap<String, String>,
-    /// Raw request body bytes (binary-safe), capped by the server's body limit.
-    pub(crate) body: Bytes,
+    pub(crate) body: RequestBody,
+    pub(crate) body_limit: usize,
     /// Captured path parameters, e.g. `/users/:id` matching `/users/42`
     /// yields `{"id": "42"}`.
     pub params: HashMap<String, String>,
@@ -157,19 +157,45 @@ impl Request {
             && version.trim() == "13"
     }
 
-    /// Returns the raw request body bytes (binary-safe).
-    pub fn bytes(&self) -> &[u8] {
+    /// Returns the request body abstraction.
+    pub fn body(&self) -> &RequestBody {
         &self.body
     }
 
-    /// Returns the request body as a lossy UTF-8 string view.
-    pub fn text(&self) -> Cow<'_, str> {
-        String::from_utf8_lossy(&self.body)
+    /// Returns the mutable request body abstraction.
+    pub fn body_mut(&mut self) -> &mut RequestBody {
+        &mut self.body
     }
 
-    /// Deserializes the request body as JSON into `T`.
-    pub fn json<T: DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
-        serde_json::from_slice(&self.body)
+    /// Takes the one-shot request body stream.
+    pub fn take_body_stream(&mut self) -> Result<BodyStream, HttpError> {
+        self.body.take_stream()
+    }
+
+    /// Collects the request body as binary-safe bytes.
+    pub async fn bytes(&mut self) -> Result<Bytes, HttpError> {
+        self.body.collect(self.body_limit).await
+    }
+
+    /// Collects the request body as strict UTF-8 text.
+    pub async fn text(&mut self) -> Result<String, HttpError> {
+        String::from_utf8(self.bytes().await?.to_vec())
+            .map_err(|error| HttpError::invalid_utf8().with_source(error))
+    }
+
+    /// Collects the request body as lossy UTF-8 text.
+    pub async fn text_lossy(&mut self) -> Result<String, HttpError> {
+        Ok(String::from_utf8_lossy(&self.bytes().await?).into_owned())
+    }
+
+    /// Collects and deserializes the request body as JSON into `T`.
+    pub async fn json<T: DeserializeOwned>(&mut self) -> Result<T, HttpError> {
+        serde_json::from_slice(&self.bytes().await?)
+            .map_err(|error| HttpError::invalid_json().with_source(error))
+    }
+
+    pub(crate) fn buffered_bytes(&self) -> Result<&Bytes, HttpError> {
+        self.body.buffered_bytes()
     }
 }
 
@@ -186,6 +212,7 @@ pub struct RequestBuilder {
     params: HashMap<String, String>,
     state: StateStore,
     body: Bytes,
+    body_limit: usize,
     remote_addr: Option<SocketAddr>,
     secure_transport: bool,
 }
@@ -202,6 +229,7 @@ impl RequestBuilder {
             params: HashMap::new(),
             state: StateStore::default(),
             body: Bytes::new(),
+            body_limit: DEFAULT_BODY_LIMIT,
             remote_addr: None,
             secure_transport: false,
         }
@@ -262,6 +290,12 @@ impl RequestBuilder {
         self
     }
 
+    /// Sets the collection limit used by body-reading request methods.
+    pub fn body_limit(mut self, limit: usize) -> Self {
+        self.body_limit = limit;
+        self
+    }
+
     /// Serializes `value` as the JSON body and sets the content type.
     pub fn json<T: serde::Serialize>(self, value: &T) -> Self {
         let body = serde_json::to_vec(value).unwrap_or_default();
@@ -303,7 +337,8 @@ impl RequestBuilder {
             query,
             headers,
             cookies,
-            body: self.body,
+            body: RequestBody::buffered(self.body, self.body_limit),
+            body_limit: self.body_limit,
             params: self.params,
             route_pattern: None,
             websocket_runtime: WebSocketRuntimeHandle::local(),
