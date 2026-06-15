@@ -28,9 +28,9 @@ fn users_router() -> Router {
     router.guard(|req: &Request| req.header("x-api-key") == Some("secret"));
 
     router
-        .get("/", |req: Request| -> Result<Response, HttpError> {
-            let Query(query) = req.extract::<Query<ListQuery>>()?;
-            let State(config) = req.extract::<State<Config>>()?;
+        .get("/", |mut req: Request| async move {
+            let Query(query) = req.extract_parts::<Query<ListQuery>>().await?;
+            let State(config) = req.extract_parts::<State<Config>>().await?;
             let users = vec![User {
                 id: 1,
                 name: format!(
@@ -39,14 +39,14 @@ fn users_router() -> Router {
                     query.active.unwrap_or(true)
                 ),
             }];
-            Ok(Response::json(&users))
+            Ok::<_, HttpError>(Response::json(&users))
         })
         .unwrap();
 
     router
-        .get("/:id", |req: Request| -> Result<Response, HttpError> {
-            let Path(path) = req.extract::<Path<UserPath>>()?;
-            Ok(Response::json(&User {
+        .get("/:id", |mut req: Request| async move {
+            let Path(path) = req.extract_parts::<Path<UserPath>>().await?;
+            Ok::<_, HttpError>(Response::json(&User {
                 id: path.id,
                 name: "Ada".to_string(),
             }))

@@ -8,7 +8,10 @@ use serde::de::DeserializeOwned;
 
 use super::body::DEFAULT_BODY_LIMIT;
 use super::websocket::ResolvedWebSocketConfig;
-use super::{BodyStream, FromRequest, HttpError, RequestBody, StateStore, WebSocketRuntimeHandle};
+use super::{
+    BodyStream, FromRequest, FromRequestParts, HttpError, RequestBody, StateStore,
+    WebSocketRuntimeHandle,
+};
 
 /// Request data handed to each route handler. Fields are part of the
 /// handler-facing API; some demo handlers ignore them.
@@ -32,6 +35,7 @@ pub struct Request {
     pub(crate) websocket_runtime: WebSocketRuntimeHandle,
     pub(crate) resolved_websocket_config: Option<ResolvedWebSocketConfig>,
     pub(crate) state: StateStore,
+    pub(crate) extensions: StateStore,
     pub(crate) upgrade: Option<OnUpgrade>,
     pub(crate) remote_addr: Option<SocketAddr>,
     pub(crate) secure_transport: bool,
@@ -166,11 +170,39 @@ impl Request {
         self.state.get::<T>()
     }
 
-    pub fn extract<E>(&self) -> Result<E, HttpError>
+    /// Returns request-local extension data by type.
+    pub fn extension<T>(&self) -> Option<std::sync::Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.extensions.get::<T>()
+    }
+
+    /// Stores request-local extension data by type.
+    pub fn insert_extension<T>(&mut self, value: T)
+    where
+        T: Send + Sync + 'static,
+    {
+        self.extensions.insert(value);
+    }
+
+    pub fn parts_mut(&mut self) -> RequestParts<'_> {
+        RequestParts { request: self }
+    }
+
+    pub async fn extract<E>(&mut self) -> Result<E, E::Rejection>
     where
         E: FromRequest,
     {
-        E::from_request(self)
+        E::from_request(self).await
+    }
+
+    pub async fn extract_parts<E>(&mut self) -> Result<E, E::Rejection>
+    where
+        E: FromRequestParts,
+    {
+        let mut parts = self.parts_mut();
+        E::from_request_parts(&mut parts).await
     }
 
     pub fn is_websocket_upgrade(&self) -> bool {
@@ -237,6 +269,83 @@ impl Request {
     }
 }
 
+pub struct RequestParts<'a> {
+    pub(crate) request: &'a mut Request,
+}
+
+impl RequestParts<'_> {
+    pub fn method(&self) -> &str {
+        &self.request.method
+    }
+
+    pub fn path(&self) -> &str {
+        &self.request.path
+    }
+
+    pub fn raw_query(&self) -> Option<&str> {
+        self.request.raw_query.as_deref()
+    }
+
+    pub fn version(&self) -> hyper::Version {
+        self.request.version
+    }
+
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.request.header(name)
+    }
+
+    pub fn headers_all(&self, name: &str) -> Vec<&str> {
+        self.request.headers_all(name)
+    }
+
+    pub fn cookies(&self) -> &HashMap<String, String> {
+        &self.request.cookies
+    }
+
+    pub fn headers(&self) -> &HashMap<String, String> {
+        &self.request.headers
+    }
+
+    pub fn params(&self) -> &HashMap<String, String> {
+        &self.request.params
+    }
+
+    pub fn state<T>(&self) -> Option<std::sync::Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.request.state::<T>()
+    }
+
+    pub fn extension<T>(&self) -> Option<std::sync::Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.request.extensions.get::<T>()
+    }
+
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        self.request.remote_addr
+    }
+
+    pub fn is_secure(&self) -> bool {
+        self.request.secure_transport
+    }
+
+    pub fn matched_path(&self) -> Option<&str> {
+        self.request.route_pattern.as_deref()
+    }
+
+    pub fn original_uri(&self) -> hyper::Uri {
+        let mut uri = self.request.path.clone();
+        if let Some(query) = &self.request.raw_query {
+            uri.push('?');
+            uri.push_str(query);
+        }
+        uri.parse().unwrap_or_else(|_| hyper::Uri::from_static("/"))
+    }
+}
+
 /// Builds a [`Request`] piece by piece. Header names are lowercased to mirror
 /// how the real server normalizes them; a path given as `/x?a=1` is split into
 /// path + query automatically.
@@ -248,7 +357,9 @@ pub struct RequestBuilder {
     headers: Vec<(String, String)>,
     cookies: HashMap<String, String>,
     params: HashMap<String, String>,
+    route_pattern: Option<String>,
     state: StateStore,
+    extensions: StateStore,
     body: Bytes,
     body_limit: usize,
     remote_addr: Option<SocketAddr>,
@@ -265,7 +376,9 @@ impl RequestBuilder {
             headers: Vec::new(),
             cookies: HashMap::new(),
             params: HashMap::new(),
+            route_pattern: None,
             state: StateStore::default(),
+            extensions: StateStore::default(),
             body: Bytes::new(),
             body_limit: DEFAULT_BODY_LIMIT,
             remote_addr: None,
@@ -320,6 +433,23 @@ impl RequestBuilder {
         T: Send + Sync + 'static,
     {
         self.state.insert(value);
+        self
+    }
+
+    pub fn extension<T>(mut self, value: T) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        self.extensions.insert(value);
+        self
+    }
+
+    pub fn matched_path(self, pattern: &str) -> Self {
+        self.route_pattern(pattern)
+    }
+
+    pub fn route_pattern(mut self, pattern: &str) -> Self {
+        self.route_pattern = Some(pattern.to_string());
         self
     }
 
@@ -378,10 +508,11 @@ impl RequestBuilder {
             body: RequestBody::buffered(self.body, self.body_limit),
             body_limit: self.body_limit,
             params: self.params,
-            route_pattern: None,
+            route_pattern: self.route_pattern,
             websocket_runtime: WebSocketRuntimeHandle::local(),
             resolved_websocket_config: None,
             state: self.state,
+            extensions: self.extensions,
             upgrade: None,
             remote_addr: self.remote_addr,
             secure_transport: self.secure_transport,

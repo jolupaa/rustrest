@@ -329,8 +329,8 @@ fn existing_websocket_error_remains_exhaustive() {
     let _ = classify as fn(WebSocketError) -> &'static str;
 }
 
-#[test]
-fn typed_extractors_read_json_path_query_and_state() {
+#[tokio::test]
+async fn typed_extractors_read_json_path_query_and_state() {
     #[derive(Deserialize)]
     struct CreateUser {
         name: String,
@@ -353,15 +353,17 @@ fn typed_extractors_read_json_path_query_and_state() {
         app_name: "rustrest",
     });
     let mut req = dummy_request(r#"{"name":"Ada"}"#);
+    req.headers
+        .insert("content-type".to_string(), "application/json".to_string());
     req.raw_query = Some("active=true&tag=rust&tag=http".to_string());
     req.query = parse_query(req.raw_query.as_deref().unwrap());
     req.params.insert("id".to_string(), "42".to_string());
     req.state = state;
 
-    let Json(user) = req.extract::<Json<CreateUser>>().unwrap();
-    let Path(path) = req.extract::<Path<UserPath>>().unwrap();
-    let Query(query) = req.extract::<Query<UserQuery>>().unwrap();
-    let State(config) = req.extract::<State<Config>>().unwrap();
+    let Json(user) = req.extract::<Json<CreateUser>>().await.unwrap();
+    let Path(path) = req.extract_parts::<Path<UserPath>>().await.unwrap();
+    let Query(query) = req.extract_parts::<Query<UserQuery>>().await.unwrap();
+    let State(config) = req.extract_parts::<State<Config>>().await.unwrap();
 
     assert_eq!(user.name, "Ada");
     assert_eq!(path.id, 42);
@@ -370,8 +372,8 @@ fn typed_extractors_read_json_path_query_and_state() {
     assert_eq!(config.app_name, "rustrest");
 }
 
-#[test]
-fn extra_extractors_cover_scalars_bodies_wrappers_and_maps() {
+#[tokio::test]
+async fn extra_extractors_cover_scalars_bodies_wrappers_and_maps() {
     #[derive(Deserialize)]
     struct MyCookies {
         sid: String,
@@ -382,35 +384,223 @@ fn extra_extractors_cover_scalars_bodies_wrappers_and_maps() {
         key: String,
     }
 
-    let mut req = dummy_request("cuerpo");
-    req.params.insert("id".to_string(), "42".to_string());
-    req.cookies.insert("sid".to_string(), "abc".to_string());
-    req.headers
+    let mut parts_req = dummy_request("cuerpo");
+    parts_req.params.insert("id".to_string(), "42".to_string());
+    parts_req
+        .cookies
+        .insert("sid".to_string(), "abc".to_string());
+    parts_req
+        .headers
         .insert("x-api-key".to_string(), "k1".to_string());
 
     // Scalar Path for single-param routes (numbers and strings).
-    let Path(id) = req.extract::<Path<u32>>().unwrap();
+    let Path(id) = parts_req.extract_parts::<Path<u32>>().await.unwrap();
     assert_eq!(id, 42);
-    let Path(raw) = req.extract::<Path<String>>().unwrap();
+    let Path(raw) = parts_req.extract_parts::<Path<String>>().await.unwrap();
     assert_eq!(raw, "42");
 
     // Raw body extractors.
-    let bytes = req.extract::<Bytes>().unwrap();
+    let mut req = dummy_request("cuerpo");
+    let bytes = req.extract::<Bytes>().await.unwrap();
     assert_eq!(&bytes[..], b"cuerpo");
-    let text = req.extract::<String>().unwrap();
+    let mut req = dummy_request("cuerpo");
+    let text = req.extract::<String>().await.unwrap();
     assert_eq!(text, "cuerpo");
 
     // Option/Result wrappers never fail the extraction itself.
-    let missing: Option<Json<serde_json::Value>> = req.extract().unwrap();
+    let mut req = dummy_request("not json");
+    let missing: Option<Json<serde_json::Value>> = req.extract().await.unwrap();
     assert!(missing.is_none());
-    let failed: Result<Json<serde_json::Value>, HttpError> = req.extract().unwrap();
+    let mut req = dummy_request("not json");
+    let failed: Result<Json<serde_json::Value>, HttpError> = req.extract().await.unwrap();
     assert!(failed.is_err());
 
     // Typed cookie/header maps.
-    let Cookies(cookies) = req.extract::<Cookies<MyCookies>>().unwrap();
+    let Cookies(cookies) = parts_req
+        .extract_parts::<Cookies<MyCookies>>()
+        .await
+        .unwrap();
     assert_eq!(cookies.sid, "abc");
-    let Headers(headers) = req.extract::<Headers<MyHeaders>>().unwrap();
+    let Headers(headers) = parts_req
+        .extract_parts::<Headers<MyHeaders>>()
+        .await
+        .unwrap();
     assert_eq!(headers.key, "k1");
+}
+
+#[tokio::test]
+async fn json_extractor_requires_json_content_type() {
+    #[derive(Deserialize)]
+    struct CreateUser {
+        name: String,
+    }
+
+    let mut req = Request::builder()
+        .method("POST")
+        .body(br#"{"name":"Ada"}"#.to_vec())
+        .build();
+
+    let error = match Json::<CreateUser>::from_request(&mut req).await {
+        Ok(_) => panic!("expected JSON extractor to reject missing content-type"),
+        Err(error) => error,
+    };
+    assert_eq!(error.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(error.code(), "unsupported_media_type");
+}
+
+#[tokio::test]
+async fn body_extractor_reports_consumed_body() {
+    #[derive(Deserialize)]
+    struct CreateUser {
+        name: String,
+    }
+
+    let mut req = Request::builder()
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(br#"{"name":"Ada"}"#.to_vec())
+        .build();
+
+    let _stream = req.take_body_stream().unwrap();
+
+    let error = match Json::<CreateUser>::from_request(&mut req).await {
+        Ok(_) => panic!("expected consumed body rejection"),
+        Err(error) => error,
+    };
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(error.code(), "body_already_consumed");
+}
+
+#[tokio::test]
+async fn matched_path_extracts_without_consuming_the_body() {
+    let mut req = Request::builder()
+        .path("/users/42")
+        .matched_path("/users/:id")
+        .body("payload")
+        .build();
+
+    let MatchedPath(path) = {
+        let mut parts = req.parts_mut();
+        MatchedPath::from_request_parts(&mut parts).await.unwrap()
+    };
+    assert_eq!(path, "/users/:id");
+    assert_eq!(req.text().await.unwrap(), "payload");
+}
+
+#[tokio::test]
+async fn typed_handler_arguments_extract_parts_before_body() {
+    #[derive(Clone)]
+    struct Config {
+        prefix: &'static str,
+    }
+    #[derive(Deserialize)]
+    struct CreateUser {
+        name: String,
+    }
+
+    async fn create_user(
+        State(config): State<Config>,
+        Path(team_id): Path<u64>,
+        Json(input): Json<CreateUser>,
+    ) -> Result<Response, HttpError> {
+        Ok(Response::send(&format!("{}:{}:{}", config.prefix, team_id, input.name)).status(201))
+    }
+
+    let mut app = App::new();
+    app.state(Config { prefix: "team" });
+    app.post("/teams/:team_id/users", create_user).unwrap();
+
+    let response = app
+        .dispatch(
+            Request::builder()
+                .method("POST")
+                .path("/teams/7/users")
+                .header("content-type", "application/json")
+                .body(br#"{"name":"Ada"}"#.to_vec())
+                .build(),
+        )
+        .await;
+
+    assert_eq!(response.status, 201);
+    assert_eq!(response.body_text(), "team:7:Ada");
+}
+
+#[tokio::test]
+async fn request_extensions_flow_from_middleware_to_typed_handlers() {
+    #[derive(Clone)]
+    struct TraceId(&'static str);
+
+    let mut app = App::new();
+    app.layer(|mut req: Request, next: Next| async move {
+        req.insert_extension(TraceId("req-1"));
+        next(req).await
+    });
+    app.get("/trace", |Extension(trace): Extension<TraceId>| {
+        Response::send(trace.0)
+    })
+    .unwrap();
+
+    let response = app
+        .dispatch(Request::builder().path("/trace").body("payload").build())
+        .await;
+
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body_text(), "req-1");
+}
+
+#[test]
+fn typed_handler_argument_arities_compile() {
+    #[derive(Clone)]
+    struct Config;
+    #[derive(Deserialize)]
+    struct Input {
+        name: String,
+    }
+    #[derive(Deserialize)]
+    struct ListQuery {
+        active: Option<bool>,
+    }
+
+    fn one(Path(id): Path<u64>) -> Response {
+        Response::send(&id.to_string())
+    }
+
+    async fn two(Path(id): Path<u64>, Query(query): Query<ListQuery>) -> Response {
+        Response::send(&format!("{}:{:?}", id, query.active))
+    }
+
+    async fn four(
+        method: hyper::Method,
+        version: hyper::Version,
+        MatchedPath(path): MatchedPath,
+        ConnectInfo(addr): ConnectInfo,
+    ) -> Response {
+        Response::send(&format!("{method:?}:{version:?}:{path}:{addr:?}"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn eight(
+        State(_config): State<Config>,
+        Path(id): Path<u64>,
+        Query(query): Query<ListQuery>,
+        MatchedPath(path): MatchedPath,
+        OriginalUri(uri): OriginalUri,
+        ConnectInfo(addr): ConnectInfo,
+        method: hyper::Method,
+        Json(input): Json<Input>,
+    ) -> Response {
+        Response::send(&format!(
+            "{id}:{:?}:{path}:{uri}:{addr:?}:{method}:{}",
+            query.active, input.name
+        ))
+    }
+
+    let mut app = App::new();
+    app.state(Config);
+    app.get("/one/:id", one).unwrap();
+    app.get("/two/:id", two).unwrap();
+    app.get("/four", four).unwrap();
+    app.post("/eight/:id", eight).unwrap();
 }
 
 #[tokio::test]
@@ -1243,6 +1433,7 @@ fn query_params_are_parsed_and_url_decoded() {
         websocket_runtime: WebSocketRuntimeHandle::local(),
         resolved_websocket_config: None,
         state: StateStore::default(),
+        extensions: StateStore::default(),
         upgrade: None,
         remote_addr: None,
         secure_transport: false,
@@ -1309,7 +1500,12 @@ async fn request_form_parses_urlencoded_body() {
     assert_eq!(form.user, "ada lovelace");
     assert_eq!(form.tags, vec!["a", "b"]);
 
-    let Form(extracted) = req.extract::<Form<Login>>().unwrap();
+    let mut req = Request::builder()
+        .method("POST")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("user=ada+lovelace&tags=a&tags=b")
+        .build();
+    let Form(extracted) = req.extract::<Form<Login>>().await.unwrap();
     assert_eq!(extracted.user, "ada lovelace");
 
     let mut bad = dummy_request("%%%not-a-form=%zz");

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use futures_util::FutureExt;
 use hyper::header::{ALLOW, HeaderValue};
 
-use super::{HttpError, IntoResponse, Request, Response};
+use super::{FromRequest, FromRequestParts, HttpError, IntoResponse, Request, Response};
 
 /// A route handler, normalized from a sync or async user handler. `Arc` so it
 /// can be cloned into the middleware chain (see [`Next`]).
@@ -32,6 +32,26 @@ pub type ErrorHandler = Arc<dyn Fn(HttpError) -> Response + Send + Sync>;
 /// `Fn(Request) -> Response`, one for `Fn(Request) -> Future`) can coexist
 /// without overlapping. Callers never name it; it is inferred from the
 /// closure's return type.
+///
+/// Body-consuming extractors must be the final typed argument; a parts extractor
+/// after a body extractor is rejected at compile time:
+///
+/// ```rust,compile_fail
+/// use rustrest::{App, Json, Path, Response};
+/// use serde::Deserialize;
+///
+/// #[derive(Deserialize)]
+/// struct Input {
+///     name: String,
+/// }
+///
+/// async fn bad(Json(_input): Json<Input>, Path(_id): Path<u64>) -> Response {
+///     Response::send("bad")
+/// }
+///
+/// let mut app = App::new();
+/// app.post("/users/:id", bad).unwrap();
+/// ```
 pub trait IntoHandler<Marker> {
     fn into_handler(self) -> Handler;
 }
@@ -40,6 +60,14 @@ pub trait IntoHandler<Marker> {
 pub struct SyncMarker;
 #[doc(hidden)]
 pub struct AsyncMarker;
+#[doc(hidden)]
+pub struct ExtractPartsSyncMarker<T>(std::marker::PhantomData<T>);
+#[doc(hidden)]
+pub struct ExtractPartsAsyncMarker<T>(std::marker::PhantomData<T>);
+#[doc(hidden)]
+pub struct ExtractBodySyncMarker<T>(std::marker::PhantomData<T>);
+#[doc(hidden)]
+pub struct ExtractBodyAsyncMarker<T>(std::marker::PhantomData<T>);
 
 // Synchronous handlers: `|req| Response`.
 impl<F, R> IntoHandler<SyncMarker> for F
@@ -82,6 +110,252 @@ where
         )
     }
 }
+
+macro_rules! impl_parts_handler {
+    ($(($ty:ident, $var:ident)),+) => {
+        impl<F, R, $($ty,)+> IntoHandler<ExtractPartsSyncMarker<($($ty,)+)>> for F
+        where
+            F: Fn($($ty),+) -> R + Send + Sync + 'static,
+            R: IntoResponse + Send + 'static,
+            $($ty: FromRequestParts + Send + 'static,)+
+        {
+            fn into_handler(self) -> Handler {
+                let handler = Arc::new(self);
+                Arc::new(move |mut req| -> Pin<Box<dyn Future<Output = Response> + Send>> {
+                    let handler = Arc::clone(&handler);
+                    Box::pin(async move {
+                        let mut parts = req.parts_mut();
+                        $(
+                            let $var = match <$ty as FromRequestParts>::from_request_parts(&mut parts).await {
+                                Ok(value) => value,
+                                Err(rejection) => return rejection.into_response(),
+                            };
+                        )+
+
+                        match catch_unwind(AssertUnwindSafe(|| (handler)($($var),+))) {
+                            Ok(res) => res.into_response(),
+                            Err(_) => panic_response(),
+                        }
+                    })
+                })
+            }
+        }
+
+        impl<F, Fut, R, $($ty,)+> IntoHandler<ExtractPartsAsyncMarker<($($ty,)+)>> for F
+        where
+            F: Fn($($ty),+) -> Fut + Send + Sync + 'static,
+            Fut: Future<Output = R> + Send + 'static,
+            R: IntoResponse + Send + 'static,
+            $($ty: FromRequestParts + Send + 'static,)+
+        {
+            fn into_handler(self) -> Handler {
+                let handler = Arc::new(self);
+                Arc::new(move |mut req| -> Pin<Box<dyn Future<Output = Response> + Send>> {
+                    let handler = Arc::clone(&handler);
+                    Box::pin(async move {
+                        let mut parts = req.parts_mut();
+                        $(
+                            let $var = match <$ty as FromRequestParts>::from_request_parts(&mut parts).await {
+                                Ok(value) => value,
+                                Err(rejection) => return rejection.into_response(),
+                            };
+                        )+
+
+                        match catch_unwind(AssertUnwindSafe(|| (handler)($($var),+))) {
+                            Ok(future) => match AssertUnwindSafe(future).catch_unwind().await {
+                                Ok(res) => res.into_response(),
+                                Err(_) => panic_response(),
+                            },
+                            Err(_) => panic_response(),
+                        }
+                    })
+                })
+            }
+        }
+    };
+}
+
+macro_rules! impl_body_only_handler {
+    ($body:ident, $body_var:ident) => {
+        impl<F, R, $body> IntoHandler<ExtractBodySyncMarker<($body,)>> for F
+        where
+            F: Fn($body) -> R + Send + Sync + 'static,
+            R: IntoResponse + Send + 'static,
+            $body: FromRequest + Send + 'static,
+        {
+            fn into_handler(self) -> Handler {
+                let handler = Arc::new(self);
+                Arc::new(
+                    move |mut req| -> Pin<Box<dyn Future<Output = Response> + Send>> {
+                        let handler = Arc::clone(&handler);
+                        Box::pin(async move {
+                            let $body_var =
+                                match <$body as FromRequest>::from_request(&mut req).await {
+                                    Ok(value) => value,
+                                    Err(rejection) => return rejection.into_response(),
+                                };
+                            match catch_unwind(AssertUnwindSafe(|| (handler)($body_var))) {
+                                Ok(res) => res.into_response(),
+                                Err(_) => panic_response(),
+                            }
+                        })
+                    },
+                )
+            }
+        }
+
+        impl<F, Fut, R, $body> IntoHandler<ExtractBodyAsyncMarker<($body,)>> for F
+        where
+            F: Fn($body) -> Fut + Send + Sync + 'static,
+            Fut: Future<Output = R> + Send + 'static,
+            R: IntoResponse + Send + 'static,
+            $body: FromRequest + Send + 'static,
+        {
+            fn into_handler(self) -> Handler {
+                let handler = Arc::new(self);
+                Arc::new(
+                    move |mut req| -> Pin<Box<dyn Future<Output = Response> + Send>> {
+                        let handler = Arc::clone(&handler);
+                        Box::pin(async move {
+                            let $body_var =
+                                match <$body as FromRequest>::from_request(&mut req).await {
+                                    Ok(value) => value,
+                                    Err(rejection) => return rejection.into_response(),
+                                };
+                            match catch_unwind(AssertUnwindSafe(|| (handler)($body_var))) {
+                                Ok(future) => match AssertUnwindSafe(future).catch_unwind().await {
+                                    Ok(res) => res.into_response(),
+                                    Err(_) => panic_response(),
+                                },
+                                Err(_) => panic_response(),
+                            }
+                        })
+                    },
+                )
+            }
+        }
+    };
+}
+
+macro_rules! impl_parts_body_handler {
+    ($(($ty:ident, $var:ident)),+ ; ($body:ident, $body_var:ident)) => {
+        impl<F, R, $($ty,)+ $body> IntoHandler<ExtractBodySyncMarker<($($ty,)+ $body)>> for F
+        where
+            F: Fn($($ty,)+ $body) -> R + Send + Sync + 'static,
+            R: IntoResponse + Send + 'static,
+            $($ty: FromRequestParts + Send + 'static,)+
+            $body: FromRequest + Send + 'static,
+        {
+            fn into_handler(self) -> Handler {
+                let handler = Arc::new(self);
+                Arc::new(move |mut req| -> Pin<Box<dyn Future<Output = Response> + Send>> {
+                    let handler = Arc::clone(&handler);
+                    Box::pin(async move {
+                        $(
+                            let $var;
+                        )+
+                        {
+                            let mut parts = req.parts_mut();
+                            $(
+                                $var = match <$ty as FromRequestParts>::from_request_parts(&mut parts).await {
+                                    Ok(value) => value,
+                                    Err(rejection) => return rejection.into_response(),
+                                };
+                            )+
+                        }
+                        let $body_var = match <$body as FromRequest>::from_request(&mut req).await {
+                            Ok(value) => value,
+                            Err(rejection) => return rejection.into_response(),
+                        };
+
+                        match catch_unwind(AssertUnwindSafe(|| (handler)($($var,)+ $body_var))) {
+                            Ok(res) => res.into_response(),
+                            Err(_) => panic_response(),
+                        }
+                    })
+                })
+            }
+        }
+
+        impl<F, Fut, R, $($ty,)+ $body> IntoHandler<ExtractBodyAsyncMarker<($($ty,)+ $body)>> for F
+        where
+            F: Fn($($ty,)+ $body) -> Fut + Send + Sync + 'static,
+            Fut: Future<Output = R> + Send + 'static,
+            R: IntoResponse + Send + 'static,
+            $($ty: FromRequestParts + Send + 'static,)+
+            $body: FromRequest + Send + 'static,
+        {
+            fn into_handler(self) -> Handler {
+                let handler = Arc::new(self);
+                Arc::new(move |mut req| -> Pin<Box<dyn Future<Output = Response> + Send>> {
+                    let handler = Arc::clone(&handler);
+                    Box::pin(async move {
+                        $(
+                            let $var;
+                        )+
+                        {
+                            let mut parts = req.parts_mut();
+                            $(
+                                $var = match <$ty as FromRequestParts>::from_request_parts(&mut parts).await {
+                                    Ok(value) => value,
+                                    Err(rejection) => return rejection.into_response(),
+                                };
+                            )+
+                        }
+                        let $body_var = match <$body as FromRequest>::from_request(&mut req).await {
+                            Ok(value) => value,
+                            Err(rejection) => return rejection.into_response(),
+                        };
+
+                        match catch_unwind(AssertUnwindSafe(|| (handler)($($var,)+ $body_var))) {
+                            Ok(future) => match AssertUnwindSafe(future).catch_unwind().await {
+                                Ok(res) => res.into_response(),
+                                Err(_) => panic_response(),
+                            },
+                            Err(_) => panic_response(),
+                        }
+                    })
+                })
+            }
+        }
+    };
+}
+
+impl_body_only_handler!(B, body);
+impl_parts_handler!((A, a));
+impl_parts_handler!((A, a), (B, b));
+impl_parts_handler!((A, a), (B, b), (C, c));
+impl_parts_handler!((A, a), (B, b), (C, c), (D, d));
+impl_parts_handler!((A, a), (B, b), (C, c), (D, d), (E, e));
+impl_parts_handler!((A, a), (B, b), (C, c), (D, d), (E, e), (G, g));
+impl_parts_handler!((A, a), (B, b), (C, c), (D, d), (E, e), (G, g), (H, h));
+impl_parts_handler!(
+    (A, a),
+    (B, b),
+    (C, c),
+    (D, d),
+    (E, e),
+    (G, g),
+    (H, h),
+    (I, i)
+);
+
+impl_parts_body_handler!((A, a); (B, body));
+impl_parts_body_handler!((A, a), (B, b); (C, body));
+impl_parts_body_handler!((A, a), (B, b), (C, c); (D, body));
+impl_parts_body_handler!((A, a), (B, b), (C, c), (D, d); (E, body));
+impl_parts_body_handler!((A, a), (B, b), (C, c), (D, d), (E, e); (G, body));
+impl_parts_body_handler!((A, a), (B, b), (C, c), (D, d), (E, e), (G, g); (H, body));
+impl_parts_body_handler!(
+    (A, a),
+    (B, b),
+    (C, c),
+    (D, d),
+    (E, e),
+    (G, g),
+    (H, h);
+    (I, body)
+);
 
 pub(crate) fn panic_response() -> Response {
     eprintln!("A handler or middleware panicked; returning 500.");

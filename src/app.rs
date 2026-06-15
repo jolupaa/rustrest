@@ -28,10 +28,13 @@ mod websocket;
 pub use body::{BodyStream, RequestBody};
 pub use cookie::{Cookie, SameSite, sign_value, verify_value};
 pub use error::{BoxError, HttpError, IntoHttpError};
-pub use extract::{Cookies, Form, FromRequest, Headers, Json, Path, Query, State};
+pub use extract::{
+    ConnectInfo, Cookies, Extension, Form, FromRequest, FromRequestParts, Headers, Json,
+    MatchedPath, OriginalUri, Path, Query, State, TypedHeader,
+};
 pub use form::MultipartPart;
 pub use handler::{ErrorHandler, Handler, IntoHandler, IntoMiddleware, Middleware, Next};
-pub use request::{Request, RequestBuilder};
+pub use request::{Request, RequestBuilder, RequestParts};
 pub use response::{IntoResponse, Response};
 pub use router::{
     HostPattern, RouteError, RouteErrorKind, RouteHandle, RouteInfo, RouteMatchError,

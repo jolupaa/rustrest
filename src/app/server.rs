@@ -564,6 +564,7 @@ impl App {
             websocket_runtime: self.websocket_runtime.clone(),
             resolved_websocket_config: None,
             state: self.state.clone(),
+            extensions: StateStore::default(),
             upgrade,
             remote_addr,
             secure_transport: transport_security.is_secure(),

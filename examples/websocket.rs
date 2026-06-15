@@ -155,7 +155,7 @@ async fn main() -> std::io::Result<()> {
         },
     );
 
-    let _ = app.get("/", |_req| {
+    let _ = app.get("/", |_req: Request| {
         Response::send(
             r##"<!doctype html>
 <html lang="es">

@@ -28,7 +28,7 @@ The goal is to provide a small, direct, easy-to-understand API for building HTTP
 - Signed values (HMAC-SHA256) and a minimal in-memory `Sessions` middleware.
 - `Result<Response, HttpError>` handlers and a global error handler that also formats 404/405.
 - Typed shared state.
-- Extractors: `Json<T>`, `Form<T>`, `Path<T>` (structs or scalars), `Query<T>`, `State<T>`, `Cookies<T>`, `Headers<T>`, `Bytes`, `String`, plus `Option`/`Result` wrappers.
+- Async extractors: `Json<T>`, `Form<T>`, `Path<T>` (structs or scalars), `Query<T>`, `State<T>`, `Cookies<T>`, `Headers<T>`, `MatchedPath`, `TypedHeader<T>`, `Bytes`, `String`, plus `Option`/`Result` wrappers.
 - Static files with streaming bodies, `ETag`/`Last-Modified` (304), and `Range` (206) support.
 - Response streaming and Server-Sent Events, with a heartbeat helper (`Response::sse_with_heartbeat`) and `req.last_event_id()` for resumption.
 - WebSocket routes with frame send/receive helpers and `{ "event": ..., "data": ... }` JSON envelopes.
@@ -328,11 +328,11 @@ req.is_websocket_upgrade();
 req.websocket(|socket| async move { ... });
 ```
 
-The incoming request body is streamed into the handler and is only buffered when a body helper is awaited. Collection is capped by `app.max_body_size(...)` (64 KB by default; oversized bodies get `413`). Body-based synchronous extractors remain available for requests built with `Request::builder()`; network handlers should use the async methods above.
+The incoming request body is streamed into the handler and is only buffered when a body helper or body extractor is awaited. Collection is capped by `app.max_body_size(...)` (64 KB by default; oversized bodies get `413`).
 
 ## Typed Extractors
 
-RustRest includes extractors used through `Request::extract`.
+RustRest includes async extractors. Parts-only extractors use `extract_parts`; body-consuming extractors use `extract`. Route handlers can also receive typed extractor arguments directly.
 
 ```rust
 use rustrest::{Json, Path, Query, Request, Response, State};
@@ -358,12 +358,12 @@ struct Config {
     app_name: &'static str,
 }
 
-app.get("/users/:id", |req: Request| -> Result<Response, rustrest::HttpError> {
-    let Path(path) = req.extract::<Path<UserPath>>()?;
-    let Query(query) = req.extract::<Query<UserQuery>>()?;
-    let State(config) = req.extract::<State<Config>>()?;
+app.get("/users/:id", |mut req: Request| async move {
+    let Path(path) = req.extract_parts::<Path<UserPath>>().await?;
+    let Query(query) = req.extract_parts::<Query<UserQuery>>().await?;
+    let State(config) = req.extract_parts::<State<Config>>().await?;
 
-    Ok(Response::send(&format!(
+    Ok::<_, rustrest::HttpError>(Response::send(&format!(
         "{} id={} active={:?} tags={:?}",
         config.app_name,
         path.id,
@@ -373,9 +373,19 @@ app.get("/users/:id", |req: Request| -> Result<Response, rustrest::HttpError> {
 }).unwrap();
 
 app.post("/users", |mut req: Request| async move {
-    let user: CreateUser = req.json().await?;
+    let Json(user) = req.extract::<Json<CreateUser>>().await?;
     Ok::<_, rustrest::HttpError>(Response::send(&format!("Creating {}", user.name)).status(201))
 }).unwrap();
+
+async fn create_user(
+    State(config): State<Config>,
+    Path(path): Path<UserPath>,
+    Json(user): Json<CreateUser>,
+) -> Result<Response, rustrest::HttpError> {
+    Ok(Response::send(&format!("{}:{}:{}", config.app_name, path.id, user.name)).status(201))
+}
+
+app.post("/typed/users/:id", create_user).unwrap();
 ```
 
 ## Shared State
@@ -1051,7 +1061,6 @@ tests/
 - Sessions are in-memory only (single process); use your own store for multi-instance deployments.
 - Rate limiting is in-memory and per process.
 - OpenAPI output covers paths, methods, and path parameters; request/response schemas are not introspected.
-- Handler argument macros are not implemented; extractors are used through `req.extract::<T>()`.
 
 ## License
 
