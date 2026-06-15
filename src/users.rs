@@ -15,51 +15,61 @@ pub fn router() -> Router {
     let mut router = Router::new();
 
     // GET / -> list (async handler)
-    router.get("/", |_req: Request| async move {
-        let users = vec![
-            User {
-                id: 1,
-                name: "Ada".to_string(),
-            },
-            User {
-                id: 2,
-                name: "Linus".to_string(),
-            },
-        ];
-        Response::json(&users)
-    });
+    router
+        .get("/", |_req: Request| async move {
+            let users = vec![
+                User {
+                    id: 1,
+                    name: "Ada".to_string(),
+                },
+                User {
+                    id: 2,
+                    name: "Linus".to_string(),
+                },
+            ];
+            Response::json(&users)
+        })
+        .unwrap();
 
     // GET /:id -> one (path param)
-    router.get("/:id", |req: Request| {
-        let id = req.param("id").unwrap_or("?");
-        Response::send(&format!("Requested user: {}", id))
-    });
+    router
+        .get("/:id", |req: Request| {
+            let id = req.param("id").unwrap_or("?");
+            Response::send(&format!("Requested user: {}", id))
+        })
+        .unwrap();
 
     // POST / -> create (JSON body)
-    router.post("/", |mut req: Request| async move {
-        match req.json::<User>().await {
-            Ok(user) => Response::json(&user),
-            Err(_) => Response::bad_request(),
-        }
-    });
+    router
+        .post("/", |mut req: Request| async move {
+            match req.json::<User>().await {
+                Ok(user) => Response::json(&user),
+                Err(_) => Response::bad_request(),
+            }
+        })
+        .unwrap();
 
     // PUT /:id -> update (path param + body)
-    router.put("/:id", |mut req: Request| async move {
-        let id = req.param("id").unwrap_or("0").to_string();
-        match req.json::<User>().await {
-            Ok(mut user) => {
-                user.id = id.parse().unwrap_or(user.id);
-                Response::json(&user)
+    router
+        .put("/:id", |mut req: Request| async move {
+            let id = req.param("id").unwrap_or("0").to_string();
+            match req.json::<User>().await {
+                Ok(mut user) => {
+                    user.id = id.parse().unwrap_or(user.id);
+                    Response::json(&user)
+                }
+                Err(_) => Response::bad_request(),
             }
-            Err(_) => Response::bad_request(),
-        }
-    });
+        })
+        .unwrap();
 
     // DELETE /:id -> delete (path param)
-    router.delete("/:id", |req: Request| {
-        let id = req.param("id").unwrap_or("?");
-        Response::send(&format!("User {} deleted", id))
-    });
+    router
+        .delete("/:id", |req: Request| {
+            let id = req.param("id").unwrap_or("?");
+            Response::send(&format!("User {} deleted", id))
+        })
+        .unwrap();
 
     router
 }

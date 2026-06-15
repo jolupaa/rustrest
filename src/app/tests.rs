@@ -1,4 +1,4 @@
-use super::router::{match_pattern, parse_pattern, path_segments};
+use super::router::{MatchedRoute, match_pattern, parse_pattern, path_segments};
 use super::*;
 use futures_util::stream;
 use http_body_util::BodyExt;
@@ -147,7 +147,7 @@ fn websocket_config_rejects_unbounded_or_inconsistent_values() {
 fn websocket_routes_validate_against_app_defaults_before_serving() {
     let mut app = App::new();
     app.websocket_defaults(WebSocketConfig::new().outbound_capacity(0));
-    app.websocket("/ws", |_socket| async move {});
+    let _ = app.websocket("/ws", |_socket| async move {});
 
     let error = app
         .validate_websockets()
@@ -159,7 +159,7 @@ fn websocket_routes_validate_against_app_defaults_before_serving() {
 #[tokio::test]
 async fn websocket_dispatch_uses_app_runtime_and_releases_failed_spawn() {
     let mut app = App::new();
-    app.websocket("/ws", |_socket| async move {});
+    let _ = app.websocket("/ws", |_socket| async move {});
     let runtime = app.websocket_runtime();
 
     let request = Request::builder()
@@ -188,7 +188,7 @@ async fn websocket_handshake_rejections_use_global_error_handler() {
         let status = err.status();
         Response::json(&serde_json::json!({ "code": err.code() })).status(status.as_u16())
     });
-    app.websocket("/ws", |_socket| async move {});
+    let _ = app.websocket("/ws", |_socket| async move {});
 
     let request = Request::builder()
         .method("GET")
@@ -217,7 +217,7 @@ async fn websocket_admission_rejections_use_global_error_handler() {
         let status = err.status();
         Response::json(&serde_json::json!({ "code": err.code() })).status(status.as_u16())
     });
-    app.websocket("/ws", |_socket| async move {});
+    let _ = app.websocket("/ws", |_socket| async move {});
 
     let runtime = app.websocket_runtime();
     let config =
@@ -300,13 +300,13 @@ fn request_builder_defaults_to_http_11_and_can_mark_secure_transport() {
 #[tokio::test]
 async fn mounted_websocket_request_records_normalized_route_pattern() {
     let mut chat = Router::new();
-    chat.websocket("/:channel", |_socket| async move {});
+    let _ = chat.websocket("/:channel", |_socket| async move {});
 
     let mut api = Router::new();
-    api.mount("/chat", chat);
+    let _ = api.mount("/chat", chat);
 
     let mut app = App::new();
-    app.mount("/api", api);
+    let _ = app.mount("/api", api);
     app.layer(|req: Request, _next: Next| async move {
         Response::send(req.route_pattern().unwrap_or("missing"))
     });
@@ -429,7 +429,7 @@ async fn http_errors_keep_status_and_can_use_global_error_handler() {
         })
         .status(err.status().as_u16())
     });
-    app.get("/", |_req: Request| -> Result<Response, HttpError> {
+    let _ = app.get("/", |_req: Request| -> Result<Response, HttpError> {
         Err(HttpError::bad_request("Invalid name"))
     });
 
@@ -451,12 +451,12 @@ async fn global_error_handler_yields_to_mandatory_error_headers() {
             .header(WWW_AUTHENTICATE.as_str(), "Custom first")
             .append_header(WWW_AUTHENTICATE.as_str(), "Custom second")
     });
-    app.get("/method", |_req: Request| Response::send("ok"));
-    app.get("/rate", |_req: Request| -> Result<Response, HttpError> {
+    let _ = app.get("/method", |_req: Request| Response::send("ok"));
+    let _ = app.get("/rate", |_req: Request| -> Result<Response, HttpError> {
         Err(HttpError::too_many_requests("Demasiadas solicitudes")
             .header(RETRY_AFTER, HeaderValue::from_static("30")))
     });
-    app.get("/auth", |_req: Request| -> Result<Response, HttpError> {
+    let _ = app.get("/auth", |_req: Request| -> Result<Response, HttpError> {
         Err(HttpError::unauthorized("Autenticacion requerida")
             .header(
                 WWW_AUTHENTICATE,
@@ -496,7 +496,7 @@ async fn builtin_middlewares_add_cors_request_id_gzip_and_tracing() {
     app.layer(middleware::request_id());
     app.layer(middleware::cors());
     app.layer(middleware::gzip());
-    app.get("/", |req: Request| {
+    let _ = app.get("/", |req: Request| {
         Response::send(req.header("x-request-id").unwrap_or("no-id"))
     });
 
@@ -552,7 +552,7 @@ async fn trace_middleware_emits_events_and_passes_response_through() {
 
     let mut app = App::new();
     app.layer(middleware::trace());
-    app.get("/ping", |_r: Request| Response::send("pong"));
+    let _ = app.get("/ping", |_r: Request| Response::send("pong"));
     let client = TestClient::new(app);
 
     let res = client.get("/ping").send().with_subscriber(subscriber).await;
@@ -566,7 +566,7 @@ async fn trace_middleware_emits_events_and_passes_response_through() {
 async fn etag_middleware_sets_validator_and_answers_304() {
     let mut app = App::new();
     app.layer(middleware::etag());
-    app.get("/doc", |_r: Request| Response::send("contenido estable"));
+    let _ = app.get("/doc", |_r: Request| Response::send("contenido estable"));
 
     let client = TestClient::new(app);
 
@@ -610,12 +610,16 @@ async fn etag_middleware_sets_validator_and_answers_304() {
 #[tokio::test]
 async fn timeout_middleware_cuts_off_slow_handlers() {
     let mut app = App::new();
-    app.get("/slow", |_r: Request| async {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        Response::send("late")
-    })
-    .layer(middleware::timeout(std::time::Duration::from_millis(40)));
-    app.get("/fast", |_r: Request| Response::send("quick"))
+    let _ = app
+        .get("/slow", |_r: Request| async {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            Response::send("late")
+        })
+        .unwrap()
+        .layer(middleware::timeout(std::time::Duration::from_millis(40)));
+    let _ = app
+        .get("/fast", |_r: Request| Response::send("quick"))
+        .unwrap()
         .layer(middleware::timeout(std::time::Duration::from_millis(40)));
 
     let slow = app.dispatch(request_with_method("GET", "/slow")).await;
@@ -644,7 +648,7 @@ async fn rate_limit_middleware_throttles_per_ip_and_recovers() {
         2,
         std::time::Duration::from_millis(80),
     ));
-    app.get("/", |_r: Request| Response::send("ok"));
+    let _ = app.get("/", |_r: Request| Response::send("ok"));
 
     // Two requests from the same IP pass; the third is throttled. The port
     // must not matter — limiting is per IP.
@@ -668,8 +672,8 @@ async fn compression_negotiates_encoding_and_skips_small_bodies() {
     let mut app = App::new();
     app.layer(middleware::compression());
     let big = "x".repeat(2048);
-    app.get("/big", move |_r: Request| Response::send(&big));
-    app.get("/small", |_r: Request| Response::send("tiny"));
+    let _ = app.get("/big", move |_r: Request| Response::send(&big));
+    let _ = app.get("/small", |_r: Request| Response::send("tiny"));
 
     let client = TestClient::new(app);
 
@@ -724,8 +728,8 @@ async fn cors_builder_handles_preflight_and_origin_allowlist() {
             .allow_credentials(true)
             .max_age_secs(600),
     );
-    app.get("/data", |_r: Request| Response::send("data"));
-    app.post("/data", |_r: Request| Response::send("created"));
+    let _ = app.get("/data", |_r: Request| Response::send("data"));
+    let _ = app.post("/data", |_r: Request| Response::send("created"));
 
     let client = TestClient::new(app);
 
@@ -783,11 +787,11 @@ async fn cors_builder_handles_preflight_and_origin_allowlist() {
 async fn router_guards_block_requests_and_scoped_fallbacks_handle_misses() {
     let mut api = Router::new();
     api.guard(|req: &Request| req.header("x-api-key") == Some("secret"));
-    api.get("/private", |_req: Request| Response::send("private"));
-    api.fallback(|_req: Request| Response::send("fallback api").status(404));
+    let _ = api.get("/private", |_req: Request| Response::send("private"));
+    let _ = api.fallback(|_req: Request| Response::send("fallback api").status(404));
 
     let mut app = App::new();
-    app.mount("/api", api);
+    let _ = app.mount("/api", api);
 
     let blocked = app
         .dispatch(request_with_method("GET", "/api/private"))
@@ -826,7 +830,7 @@ async fn error_handler_formats_404_and_405() {
         })
         .status(err.status().as_u16())
     });
-    app.get("/exists", |_r: Request| Response::send("ok"));
+    let _ = app.get("/exists", |_r: Request| Response::send("ok"));
 
     // Unmatched route (404) flows through the error handler.
     let res = app.dispatch(request_with_method("GET", "/missing")).await;
@@ -917,7 +921,7 @@ async fn sse_with_heartbeat_fills_idle_gaps_and_ends_with_source() {
 async fn gzip_middleware_skips_websocket_upgrade_responses() {
     let mut app = App::new();
     app.layer(middleware::gzip());
-    app.get("/ws", |req: Request| Response::websocket(&req).unwrap());
+    let _ = app.get("/ws", |req: Request| Response::websocket(&req).unwrap());
 
     let req = Request::builder()
         .method("GET")
@@ -994,12 +998,12 @@ async fn test_client_drives_app_without_tcp() {
         let res = next(req).await;
         res.header("x-mw", "ran")
     });
-    app.get("/hello/:name", |req: Request| {
+    let _ = app.get("/hello/:name", |req: Request| {
         let name = req.param("name").unwrap_or("?");
         let lang = req.query("lang").unwrap_or("en");
         Response::send(&format!("hola {} ({})", name, lang))
     });
-    app.post("/echo", |mut req: Request| async move {
+    let _ = app.post("/echo", |mut req: Request| async move {
         req.text().await.map(|text| Response::send(&text))
     });
 
@@ -1022,11 +1026,11 @@ async fn test_client_honors_body_limit_and_timeout() {
     let mut app = App::new();
     app.max_body_size(4);
     app.request_timeout(std::time::Duration::from_millis(30));
-    app.post("/up", |mut req: Request| async move {
+    let _ = app.post("/up", |mut req: Request| async move {
         req.bytes().await?;
         Ok::<_, HttpError>(Response::send("ok"))
     });
-    app.get("/slow", |_r: Request| async {
+    let _ = app.get("/slow", |_r: Request| async {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         Response::send("late")
     });
@@ -1179,7 +1183,7 @@ async fn sessions_middleware_assigns_and_persists_session() {
     let mut app = App::new();
     app.layer(sessions.middleware());
     let store = sessions.clone();
-    app.get("/visit", move |req: Request| {
+    let _ = app.get("/visit", move |req: Request| {
         let id = req.session_id().expect("session id set").to_string();
         let visits = store
             .get(&id, "visits")
@@ -1371,67 +1375,88 @@ fn match_pattern_captures_params_and_rejects_mismatches() {
     assert!(match_pattern(&pattern, &path_segments("/users/42/comments")).is_none());
 }
 
+fn route_match(router: &Router, method: &str, path: &str) -> Option<MatchedRoute> {
+    router.resolve_method(method, path, None).unwrap()
+}
+
 #[test]
 fn router_matches_method_and_path_param() {
     let mut router = Router::new();
-    router.get("/users", |_r: Request| Response::send("list"));
-    router.get("/users/:id", |req: Request| {
-        Response::send(req.param("id").unwrap_or("?"))
-    });
+    let _ = router
+        .get("/users", |_r: Request| Response::send("list"))
+        .unwrap();
+    let _ = router
+        .get("/users/:id", |req: Request| {
+            Response::send(req.param("id").unwrap_or("?"))
+        })
+        .unwrap();
 
-    assert!(router.route("GET", "/users").is_some());
-    assert!(router.route("POST", "/users").is_none());
-    assert!(router.route("GET", "/nope/extra").is_none());
+    assert!(route_match(&router, "GET", "/users").is_some());
+    assert!(route_match(&router, "POST", "/users").is_none());
+    assert!(route_match(&router, "GET", "/nope/extra").is_none());
 
-    let matched = router.route("GET", "/users/42").expect("should match");
+    let matched = route_match(&router, "GET", "/users/42").expect("should match");
     assert_eq!(matched.params.get("id").map(String::as_str), Some("42"));
 }
 
 #[test]
 fn router_supports_extra_methods_and_all() {
     let mut router = Router::new();
-    router.patch("/items/:id", |_r: Request| Response::send("patch"));
-    router.options("/items", |_r: Request| Response::send("options"));
-    router.head("/items", |_r: Request| Response::send("head"));
-    router.all("/health", |_r: Request| Response::send("ok"));
+    let _ = router
+        .patch("/items/:id", |_r: Request| Response::send("patch"))
+        .unwrap();
+    let _ = router
+        .options("/items", |_r: Request| Response::send("options"))
+        .unwrap();
+    let _ = router
+        .head("/items", |_r: Request| Response::send("head"))
+        .unwrap();
+    let _ = router
+        .all("/health", |_r: Request| Response::send("ok"))
+        .unwrap();
 
-    assert!(router.route("PATCH", "/items/1").is_some());
-    assert!(router.route("OPTIONS", "/items").is_some());
-    assert!(router.route("HEAD", "/items").is_some());
-    assert!(router.route("GET", "/health").is_some());
-    assert!(router.route("POST", "/health").is_some());
+    assert!(route_match(&router, "PATCH", "/items/1").is_some());
+    assert!(route_match(&router, "OPTIONS", "/items").is_some());
+    assert!(route_match(&router, "HEAD", "/items").is_some());
+    assert!(route_match(&router, "GET", "/health").is_some());
+    assert!(route_match(&router, "POST", "/health").is_some());
 }
 
 #[test]
 fn mount_concatenates_prefixes_across_nesting() {
     let mut users = Router::new();
-    users.get("/:id", |req: Request| {
-        Response::send(req.param("id").unwrap_or("?"))
-    });
+    users
+        .get("/:id", |req: Request| {
+            Response::send(req.param("id").unwrap_or("?"))
+        })
+        .unwrap();
 
     let mut api = Router::new();
-    api.mount("/users", users);
+    api.mount("/users", users).unwrap();
 
     let mut root = Router::new();
-    root.mount("/api", api);
+    root.mount("/api", api).unwrap();
 
-    let matched = root.route("GET", "/api/users/42").expect("should match");
+    let matched = route_match(&root, "GET", "/api/users/42").expect("should match");
     assert_eq!(matched.params.get("id").map(String::as_str), Some("42"));
     // Only `/:id` was registered, so the bare collection path does not match.
-    assert!(root.route("GET", "/api/users").is_none());
+    assert!(route_match(&root, "GET", "/api/users").is_none());
 }
 
 #[test]
 fn router_prefers_static_over_param_regardless_of_registration_order() {
     let mut router = Router::new();
     // The param route is registered FIRST; specificity must still win.
-    router.get("/users/:id", |req: Request| {
-        Response::send(req.param("id").unwrap_or("?"))
-    });
-    router.get("/users/me", |_r: Request| Response::send("me"));
+    let _ = router
+        .get("/users/:id", |req: Request| {
+            Response::send(req.param("id").unwrap_or("?"))
+        })
+        .unwrap();
+    let _ = router
+        .get("/users/me", |_r: Request| Response::send("me"))
+        .unwrap();
 
-    let params = router
-        .route("GET", "/users/me")
+    let params = route_match(&router, "GET", "/users/me")
         .expect("should match")
         .params;
     assert!(
@@ -1439,8 +1464,7 @@ fn router_prefers_static_over_param_regardless_of_registration_order() {
         "static /users/me should win over /users/:id, captured {params:?}"
     );
 
-    let params = router
-        .route("GET", "/users/42")
+    let params = route_match(&router, "GET", "/users/42")
         .expect("should match")
         .params;
     assert_eq!(params.get("id").map(String::as_str), Some("42"));
@@ -1450,43 +1474,48 @@ fn router_prefers_static_over_param_regardless_of_registration_order() {
 fn router_prefers_param_over_wildcard_and_backtracks_across_branches() {
     let mut router = Router::new();
     // Wildcard registered first; the more specific param route must win.
-    router.get("/files/*rest", |_r: Request| Response::send("wild"));
-    router.get("/files/:name", |_r: Request| Response::send("param"));
+    let _ = router
+        .get("/files/*rest", |_r: Request| Response::send("wild"))
+        .unwrap();
+    let _ = router
+        .get("/files/:name", |_r: Request| Response::send("param"))
+        .unwrap();
 
-    let params = router
-        .route("GET", "/files/readme")
+    let params = route_match(&router, "GET", "/files/readme")
         .expect("should match")
         .params;
     assert_eq!(params.get("name").map(String::as_str), Some("readme"));
 
     // Deeper paths only the wildcard can absorb.
-    let params = router
-        .route("GET", "/files/a/b")
+    let params = route_match(&router, "GET", "/files/a/b")
         .expect("should match")
         .params;
     assert_eq!(params.get("rest").map(String::as_str), Some("a/b"));
 
     // A static branch that dead-ends must backtrack to the param route
     // (also exercises index invalidation after further registration).
-    router.get("/users/me/profile", |_r: Request| Response::send("prof"));
-    router.get("/users/:id", |req: Request| {
-        Response::send(req.param("id").unwrap_or("?"))
-    });
-    let params = router
-        .route("GET", "/users/me")
+    let _ = router
+        .get("/users/me/profile", |_r: Request| Response::send("prof"))
+        .unwrap();
+    let _ = router
+        .get("/users/:id", |req: Request| {
+            Response::send(req.param("id").unwrap_or("?"))
+        })
+        .unwrap();
+    let params = route_match(&router, "GET", "/users/me")
         .expect("should match")
         .params;
     assert_eq!(params.get("id").map(String::as_str), Some("me"));
 
     // Method-aware backtracking: POST /users/me must not shadow GET.
-    router.post("/users/me", |_r: Request| Response::send("post me"));
-    let params = router
-        .route("GET", "/users/me")
+    let _ = router
+        .post("/users/me", |_r: Request| Response::send("post me"))
+        .unwrap();
+    let params = route_match(&router, "GET", "/users/me")
         .expect("should match")
         .params;
     assert_eq!(params.get("id").map(String::as_str), Some("me"));
-    let params = router
-        .route("POST", "/users/me")
+    let params = route_match(&router, "POST", "/users/me")
         .expect("should match")
         .params;
     assert!(params.is_empty());
@@ -1496,16 +1525,20 @@ fn router_prefers_param_over_wildcard_and_backtracks_across_branches() {
 async fn router_prefers_exact_method_over_all_on_same_path() {
     let mut router = Router::new();
     // `.all()` registered first; an exact-method route must still win for GET.
-    router.all("/health", |_r: Request| Response::send("all"));
-    router.get("/health", |_r: Request| Response::send("get"));
+    let _ = router
+        .all("/health", |_r: Request| Response::send("all"))
+        .unwrap();
+    let _ = router
+        .get("/health", |_r: Request| Response::send("get"))
+        .unwrap();
 
-    let matched = router.route("GET", "/health").expect("should match");
+    let matched = route_match(&router, "GET", "/health").expect("should match");
     assert_eq!(
         (matched.handler)(dummy_request("")).await.body_text(),
         "get"
     );
 
-    let matched = router.route("DELETE", "/health").expect("should match");
+    let matched = route_match(&router, "DELETE", "/health").expect("should match");
     assert_eq!(
         (matched.handler)(dummy_request("")).await.body_text(),
         "all"
@@ -1515,12 +1548,18 @@ async fn router_prefers_exact_method_over_all_on_same_path() {
 #[test]
 fn app_lists_registered_routes_for_introspection() {
     let mut app = App::new();
-    app.get("/", |_r: Request| Response::send("root"));
-    app.post("/users", |_r: Request| Response::send("create"));
-    app.get("/users/:id", |_r: Request| Response::send("show"));
+    let _ = app.get("/", |_r: Request| Response::send("root")).unwrap();
+    let _ = app
+        .post("/users", |_r: Request| Response::send("create"))
+        .unwrap();
+    let _ = app
+        .get("/users/:id", |_r: Request| Response::send("show"))
+        .unwrap();
     let mut files = Router::new();
-    files.get("/*path", |_r: Request| Response::send("file"));
-    app.mount("/files", files);
+    let _ = files
+        .get("/*path", |_r: Request| Response::send("file"))
+        .unwrap();
+    app.mount("/files", files).unwrap();
 
     let listed: Vec<(String, String)> = app
         .routes()
@@ -1538,15 +1577,19 @@ fn app_lists_registered_routes_for_introspection() {
 async fn trailing_slash_policy_controls_non_canonical_paths() {
     // Default (Ignore): a trailing slash still matches.
     let mut app = App::new();
-    app.get("/users", |_r: Request| Response::send("list"));
+    let _ = app
+        .get("/users", |_r: Request| Response::send("list"))
+        .unwrap();
     let res = app.dispatch(request_with_method("GET", "/users/")).await;
     assert_eq!(res.status, 200);
 
     // Strict: non-canonical paths 404; canonical ones and "/" are untouched.
     let mut app = App::new();
     app.trailing_slash(TrailingSlash::Strict);
-    app.get("/users", |_r: Request| Response::send("list"));
-    app.get("/", |_r: Request| Response::send("root"));
+    let _ = app
+        .get("/users", |_r: Request| Response::send("list"))
+        .unwrap();
+    let _ = app.get("/", |_r: Request| Response::send("root")).unwrap();
     assert_eq!(
         app.dispatch(request_with_method("GET", "/users/"))
             .await
@@ -1567,7 +1610,9 @@ async fn trailing_slash_policy_controls_non_canonical_paths() {
     // Redirect: 308 to the canonical path, preserving the query string.
     let mut app = App::new();
     app.trailing_slash(TrailingSlash::Redirect);
-    app.get("/users", |_r: Request| Response::send("list"));
+    let _ = app
+        .get("/users", |_r: Request| Response::send("list"))
+        .unwrap();
     let mut req = request_with_method("GET", "/users/");
     req.raw_query = Some("page=2".to_string());
     let res = app.dispatch(req).await;
@@ -1578,13 +1623,21 @@ async fn trailing_slash_policy_controls_non_canonical_paths() {
 #[tokio::test]
 async fn openapi_document_and_docs_routes_are_served() {
     let mut app = App::new();
-    app.get("/users", |_r: Request| Response::send("list"))
+    let _ = app
+        .get("/users", |_r: Request| Response::send("list"))
+        .unwrap()
         .summary("Lista usuarios")
         .tag("users");
-    app.post("/users", |_r: Request| Response::send("create"));
-    app.get("/users/:id", |_r: Request| Response::send("show"));
-    app.all("/health", |_r: Request| Response::send("ok"));
-    app.serve_docs("/docs", "Mi API", "0.2.0");
+    let _ = app
+        .post("/users", |_r: Request| Response::send("create"))
+        .unwrap();
+    let _ = app
+        .get("/users/:id", |_r: Request| Response::send("show"))
+        .unwrap();
+    let _ = app
+        .all("/health", |_r: Request| Response::send("ok"))
+        .unwrap();
+    app.serve_docs("/docs", "Mi API", "0.2.0").unwrap();
 
     let doc = app.openapi("Mi API", "0.2.0");
     assert_eq!(doc["openapi"], "3.0.3");
@@ -1619,19 +1672,21 @@ async fn openapi_document_and_docs_routes_are_served() {
 fn router_index_refreshes_after_mount() {
     let mut root = Router::new();
     // Force a lookup (and any lazy index build) before mounting.
-    assert!(root.route("GET", "/api/ping").is_none());
+    assert!(route_match(&root, "GET", "/api/ping").is_none());
 
     let mut api = Router::new();
-    api.get("/ping", |_r: Request| Response::send("pong"));
-    root.mount("/api", api);
+    let _ = api
+        .get("/ping", |_r: Request| Response::send("pong"))
+        .unwrap();
+    root.mount("/api", api).unwrap();
 
-    assert!(root.route("GET", "/api/ping").is_some());
+    assert!(route_match(&root, "GET", "/api/ping").is_some());
 }
 
 #[tokio::test]
 async fn dispatch_runs_sync_handler() {
     let mut app = App::new();
-    app.get("/", |_r: Request| Response::send("sync"));
+    let _ = app.get("/", |_r: Request| Response::send("sync"));
     let res = app.dispatch(dummy_request("")).await;
     assert_eq!(res.body_text(), "sync");
 }
@@ -1639,7 +1694,7 @@ async fn dispatch_runs_sync_handler() {
 #[tokio::test]
 async fn dispatch_runs_async_handler() {
     let mut app = App::new();
-    app.get("/", |_r: Request| async move { Response::send("async") });
+    let _ = app.get("/", |_r: Request| async move { Response::send("async") });
     let res = app.dispatch(dummy_request("")).await;
     assert_eq!(res.body_text(), "async");
 }
@@ -1647,7 +1702,7 @@ async fn dispatch_runs_async_handler() {
 #[tokio::test]
 async fn dispatch_accepts_result_handlers() {
     let mut app = App::new();
-    app.get("/", |_r: Request| -> Result<Response, &'static str> {
+    let _ = app.get("/", |_r: Request| -> Result<Response, &'static str> {
         Ok(Response::send("ok"))
     });
 
@@ -1660,7 +1715,7 @@ async fn dispatch_accepts_result_handlers() {
 #[tokio::test]
 async fn dispatch_converts_handler_errors_to_500() {
     let mut app = App::new();
-    app.get("/", |_r: Request| -> Result<Response, &'static str> {
+    let _ = app.get("/", |_r: Request| -> Result<Response, &'static str> {
         Err("fallo")
     });
 
@@ -1672,7 +1727,7 @@ async fn dispatch_converts_handler_errors_to_500() {
 #[tokio::test]
 async fn dispatch_catches_panics_as_500_responses() {
     let mut app = App::new();
-    app.get("/", |_r: Request| -> Response { panic!("boom") });
+    let _ = app.get("/", |_r: Request| -> Response { panic!("boom") });
 
     let res = app.dispatch(dummy_request("")).await;
 
@@ -1689,7 +1744,7 @@ async fn request_can_access_shared_state() {
     app.state(Config {
         app_name: "rustrest",
     });
-    app.get("/", |req: Request| {
+    let _ = app.get("/", |req: Request| {
         let config = req.state::<Config>().expect("state exists");
         Response::send(config.app_name)
     });
@@ -1709,7 +1764,7 @@ async fn dispatch_unmatched_returns_404() {
 #[tokio::test]
 async fn unmatched_method_returns_405_with_allow() {
     let mut app = App::new();
-    app.get("/only", |_r: Request| Response::send("get"));
+    let _ = app.get("/only", |_r: Request| Response::send("get"));
 
     let res = app.dispatch(request_with_method("POST", "/only")).await;
 
@@ -1720,7 +1775,7 @@ async fn unmatched_method_returns_405_with_allow() {
 #[tokio::test]
 async fn head_is_auto_served_from_get() {
     let mut app = App::new();
-    app.get("/page", |_r: Request| Response::send("hello"));
+    let _ = app.get("/page", |_r: Request| Response::send("hello"));
 
     let res = app.dispatch(request_with_method("HEAD", "/page")).await;
 
@@ -1732,8 +1787,8 @@ async fn head_is_auto_served_from_get() {
 #[tokio::test]
 async fn options_is_auto_answered_with_allow() {
     let mut app = App::new();
-    app.get("/thing", |_r: Request| Response::send("g"));
-    app.post("/thing", |_r: Request| Response::send("p"));
+    let _ = app.get("/thing", |_r: Request| Response::send("g"));
+    let _ = app.post("/thing", |_r: Request| Response::send("p"));
 
     let res = app.dispatch(request_with_method("OPTIONS", "/thing")).await;
 
@@ -1747,7 +1802,7 @@ async fn options_is_auto_answered_with_allow() {
 #[tokio::test]
 async fn middleware_wraps_handler_and_runs() {
     let mut app = App::new();
-    app.get("/", |_r: Request| Response::send("handler"));
+    let _ = app.get("/", |_r: Request| Response::send("handler"));
 
     let hits = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&hits);
@@ -1767,7 +1822,7 @@ async fn middleware_wraps_handler_and_runs() {
 #[tokio::test]
 async fn middleware_can_short_circuit() {
     let mut app = App::new();
-    app.get("/", |_r: Request| Response::send("handler"));
+    let _ = app.get("/", |_r: Request| Response::send("handler"));
     app.layer(|_req: Request, _next: Next| async move { Response::send("blocked") });
 
     let res = app.dispatch(dummy_request("")).await;
@@ -1777,7 +1832,7 @@ async fn middleware_can_short_circuit() {
 #[tokio::test]
 async fn middlewares_nest_in_registration_order() {
     let mut app = App::new();
-    app.get("/", |_r: Request| Response::send("h"));
+    let _ = app.get("/", |_r: Request| Response::send("h"));
 
     let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
     let o1 = Arc::clone(&order);
@@ -1814,7 +1869,9 @@ async fn per_route_middleware_applies_only_to_that_route() {
 
     let mut app = App::new();
     let counter = Arc::clone(&hits);
-    app.get("/guarded", |_r: Request| Response::send("guarded"))
+    let _ = app
+        .get("/guarded", |_r: Request| Response::send("guarded"))
+        .unwrap()
         .layer(move |req: Request, next: Next| {
             let counter = Arc::clone(&counter);
             async move {
@@ -1822,7 +1879,9 @@ async fn per_route_middleware_applies_only_to_that_route() {
                 next(req).await
             }
         });
-    app.get("/open", |_r: Request| Response::send("open"));
+    let _ = app
+        .get("/open", |_r: Request| Response::send("open"))
+        .unwrap();
 
     let res = app.dispatch(request_with_method("GET", "/guarded")).await;
     assert_eq!(res.body_text(), "guarded");
@@ -1847,11 +1906,11 @@ async fn router_layer_scopes_middleware_to_its_routes() {
             next(req).await
         }
     });
-    scoped.get("/thing", |_r: Request| Response::send("scoped"));
+    let _ = scoped.get("/thing", |_r: Request| Response::send("scoped"));
 
     let mut app = App::new();
-    app.get("/", |_r: Request| Response::send("root"));
-    app.mount("/api", scoped);
+    let _ = app.get("/", |_r: Request| Response::send("root"));
+    let _ = app.mount("/api", scoped);
 
     // A request under the mount runs the scoped middleware.
     let mut req = dummy_request("");
@@ -1879,7 +1938,7 @@ async fn app_static_files_serves_files_with_content_type() {
     fs::write(root.join("app.css"), "body { color: red; }").unwrap();
 
     let mut app = App::new();
-    app.static_files("/assets", &root);
+    let _ = app.static_files("/assets", &root);
 
     let res = app
         .dispatch(request_with_method("GET", "/assets/app.css"))
@@ -1913,7 +1972,7 @@ async fn static_files_support_conditional_and_range_requests() {
     fs::write(root.join("static.txt"), "0123456789").unwrap();
 
     let mut app = App::new();
-    app.static_files("/assets", &root);
+    let _ = app.static_files("/assets", &root);
     let client = TestClient::new(app);
 
     // Full GET: 200 with validators and a streamed, exact-length body.
@@ -2005,7 +2064,7 @@ async fn static_files_rejects_path_traversal() {
     fs::create_dir_all(&root).unwrap();
 
     let mut app = App::new();
-    app.static_files("/assets", &root);
+    let _ = app.static_files("/assets", &root);
 
     let res = app
         .dispatch(request_with_method("GET", "/assets/../secret.txt"))
@@ -2033,7 +2092,7 @@ async fn response_streams_body_chunks() {
 #[tokio::test]
 async fn handle_strips_body_for_head_requests() {
     let mut app = App::new();
-    app.head("/", |_r: Request| Response::send("no body"));
+    let _ = app.head("/", |_r: Request| Response::send("no body"));
 
     let res = app.dispatch(request_with_method("HEAD", "/")).await;
 

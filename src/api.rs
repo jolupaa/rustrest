@@ -16,6 +16,6 @@ pub fn router() -> Router {
         next(req).await
     });
 
-    router.mount("/users", users::router()); // -> <mount>/users, <mount>/users/:id, ...
+    router.mount("/users", users::router()).unwrap(); // -> <mount>/users, <mount>/users/:id, ...
     router
 }

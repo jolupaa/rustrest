@@ -20,7 +20,7 @@ use super::router::{MatchedRoute, RouteKind};
 use super::websocket::{header_value_contains_token, is_valid_websocket_key};
 use super::{
     ErrorHandler, HttpError, IntoHandler, IntoMiddleware, Middleware, Next, Request, RequestBody,
-    Response, RouteHandle, Router, StateStore, WebSocketConfig, WebSocketObserver,
+    Response, RouteError, RouteHandle, Router, StateStore, WebSocketConfig, WebSocketObserver,
     WebSocketRuntimeHandle, WsHub,
 };
 use super::{
@@ -236,19 +236,38 @@ impl App {
     /// Registers `GET {prefix}/openapi.json` (the OpenAPI document) and
     /// `GET {prefix}` (Swagger UI reading it). The document is a snapshot of
     /// the routes registered so far — call this after registering them.
-    pub fn serve_docs(&mut self, prefix: &str, title: &str, version: &str) {
+    pub fn serve_docs(
+        &mut self,
+        prefix: &str,
+        title: &str,
+        version: &str,
+    ) -> Result<(), RouteError> {
         let prefix = format!("/{}", prefix.trim_matches('/'));
         let spec_url = format!("{}/openapi.json", prefix.trim_end_matches('/'));
         let document = self.openapi(title, version);
         let html = super::openapi::swagger_ui_html(title, &spec_url);
 
-        self.get(&spec_url, move |_req: Request| Response::json(&document));
-        self.get(&prefix, move |_req: Request| {
+        let mut docs = Router::new();
+        let _ = docs.get(&spec_url, move |_req: Request| Response::json(&document))?;
+        let _ = docs.get(&prefix, move |_req: Request| {
             Response::send(html.as_str()).content_type("text/html; charset=utf-8")
-        });
+        })?;
+        self.router.mount("/", docs)
     }
 
-    pub fn get<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
+    pub fn route<H, M>(
+        &mut self,
+        method: hyper::Method,
+        path: &str,
+        handler: H,
+    ) -> Result<RouteHandle<'_>, RouteError>
+    where
+        H: IntoHandler<M>,
+    {
+        self.router.route(method, path, handler)
+    }
+
+    pub fn get<H, M>(&mut self, path: &str, handler: H) -> Result<RouteHandle<'_>, RouteError>
     where
         H: IntoHandler<M>,
     {
@@ -257,71 +276,75 @@ impl App {
 
     // These delegate to the root router and are part of the public API even
     // when a given binary registers its routes through a Router instead.
-    pub fn post<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
+    pub fn post<H, M>(&mut self, path: &str, handler: H) -> Result<RouteHandle<'_>, RouteError>
     where
         H: IntoHandler<M>,
     {
         self.router.post(path, handler)
     }
 
-    pub fn put<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
+    pub fn put<H, M>(&mut self, path: &str, handler: H) -> Result<RouteHandle<'_>, RouteError>
     where
         H: IntoHandler<M>,
     {
         self.router.put(path, handler)
     }
 
-    pub fn delete<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
+    pub fn delete<H, M>(&mut self, path: &str, handler: H) -> Result<RouteHandle<'_>, RouteError>
     where
         H: IntoHandler<M>,
     {
         self.router.delete(path, handler)
     }
 
-    pub fn patch<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
+    pub fn patch<H, M>(&mut self, path: &str, handler: H) -> Result<RouteHandle<'_>, RouteError>
     where
         H: IntoHandler<M>,
     {
         self.router.patch(path, handler)
     }
 
-    pub fn options<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
+    pub fn options<H, M>(&mut self, path: &str, handler: H) -> Result<RouteHandle<'_>, RouteError>
     where
         H: IntoHandler<M>,
     {
         self.router.options(path, handler)
     }
 
-    pub fn head<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
+    pub fn head<H, M>(&mut self, path: &str, handler: H) -> Result<RouteHandle<'_>, RouteError>
     where
         H: IntoHandler<M>,
     {
         self.router.head(path, handler)
     }
 
-    pub fn all<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
+    pub fn all<H, M>(&mut self, path: &str, handler: H) -> Result<RouteHandle<'_>, RouteError>
     where
         H: IntoHandler<M>,
     {
         self.router.all(path, handler)
     }
 
-    pub fn websocket<F, Fut, O>(&mut self, path: &str, handler: F)
+    pub fn websocket<F, Fut, O>(
+        &mut self,
+        path: &str,
+        handler: F,
+    ) -> Result<RouteHandle<'_>, RouteError>
     where
         F: Fn(super::WebSocket) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = O> + Send + 'static,
         O: super::IntoWebSocketOutput + Send + 'static,
     {
-        self.router.websocket(path, handler);
+        self.router.websocket(path, handler)
     }
 
-    pub fn ws<F, Fut, O>(&mut self, path: &str, handler: F)
+    pub fn ws<F, Fut, O>(&mut self, path: &str, handler: F) -> Result<RouteHandle<'_>, RouteError>
     where
         F: Fn(super::WebSocket) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = O> + Send + 'static,
         O: super::IntoWebSocketOutput + Send + 'static,
     {
-        self.router.ws(path, handler);
+        self.router.ws(path, handler)
     }
 
     /// Like [`App::websocket`], with subprotocols, message size limits, and
@@ -331,31 +354,41 @@ impl App {
         path: &str,
         config: super::WebSocketConfig,
         handler: F,
-    ) where
+    ) -> Result<RouteHandle<'_>, RouteError>
+    where
         F: Fn(super::WebSocket) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = O> + Send + 'static,
         O: super::IntoWebSocketOutput + Send + 'static,
     {
-        self.router.websocket_with(path, config, handler);
+        self.router.websocket_with(path, config, handler)
     }
 
     /// Mounts a router under `prefix` (Express-style sub-routes).
-    pub fn mount(&mut self, prefix: &str, router: Router) {
-        self.router.mount(prefix, router);
+    pub fn mount(&mut self, prefix: &str, router: Router) -> Result<(), RouteError> {
+        self.router.mount(prefix, router)
     }
 
-    pub fn fallback<H, M>(&mut self, handler: H)
+    pub fn fallback<H, M>(&mut self, handler: H) -> Result<RouteHandle<'_>, RouteError>
     where
         H: IntoHandler<M>,
     {
-        self.router.fallback(handler);
+        self.router.fallback(handler)
     }
 
-    pub fn static_files<P>(&mut self, prefix: &str, root: P)
+    pub fn static_files<P>(&mut self, prefix: &str, root: P) -> Result<(), RouteError>
     where
         P: Into<std::path::PathBuf>,
     {
-        self.router.static_files(prefix, root);
+        self.router.static_files(prefix, root)
+    }
+
+    pub fn url_for<K, V, I>(&self, name: &str, params: I) -> Result<String, RouteError>
+    where
+        K: AsRef<str>,
+        V: AsRef<str>,
+        I: IntoIterator<Item = (K, V)>,
+    {
+        self.router.url_for(name, params)
     }
 
     pub fn state<T>(&mut self, value: T)
@@ -574,39 +607,45 @@ impl App {
     /// Resolves a request that did not directly match a route: auto-serves
     /// HEAD from a matching GET, auto-answers OPTIONS with `Allow`, returns 405
     /// when the path exists for other methods, or falls through to 404.
-    fn resolve_miss(&self, method: &str, path: &str) -> MatchedRoute {
-        let allowed = self.router.allowed_methods(path);
+    fn resolve_miss(
+        &self,
+        method: &str,
+        path: &str,
+        host: Option<&str>,
+    ) -> Result<MatchedRoute, super::RouteMatchError> {
+        let allowed = self.router.allowed_methods(path, host)?;
         if allowed.is_empty() {
-            MatchedRoute {
+            Ok(MatchedRoute {
                 handler: not_found_handler(),
                 middlewares: Vec::new(),
                 params: HashMap::new(),
                 pattern: path.to_string(),
                 kind: RouteKind::Http,
                 body_limit: None,
-            }
+            })
         } else if method == "HEAD" && allowed.iter().any(|m| m == "GET") {
-            self.router
-                .route("GET", path)
-                .expect("GET route present per allowed_methods")
+            Ok(self
+                .router
+                .resolve_method("GET", path, host)?
+                .expect("GET route present per allowed_methods"))
         } else if method == "OPTIONS" {
-            MatchedRoute {
+            Ok(MatchedRoute {
                 handler: options_handler(allow_header_value(&allowed)),
                 middlewares: Vec::new(),
                 params: HashMap::new(),
                 pattern: path.to_string(),
                 kind: RouteKind::Http,
                 body_limit: None,
-            }
+            })
         } else {
-            MatchedRoute {
+            Ok(MatchedRoute {
                 handler: method_not_allowed_handler(allow_header_value(&allowed)),
                 middlewares: Vec::new(),
                 params: HashMap::new(),
                 pattern: path.to_string(),
                 kind: RouteKind::Http,
                 body_limit: None,
-            }
+            })
         }
     }
 
@@ -643,6 +682,7 @@ impl App {
         request.state = self.state.clone();
         request.websocket_runtime = self.websocket_runtime.clone();
         let is_head = request.method == "HEAD";
+        let host = request.header("host").map(str::to_string);
         let matched = match self.trailing_slash_miss(&request) {
             Some(handler) => MatchedRoute {
                 handler,
@@ -652,10 +692,21 @@ impl App {
                 kind: RouteKind::Http,
                 body_limit: None,
             },
-            None => match self.router.route(&request.method, &request.path) {
-                Some(found) => found,
-                None => self.resolve_miss(&request.method, &request.path),
-            },
+            None => {
+                match self
+                    .router
+                    .resolve_method(&request.method, &request.path, host.as_deref())
+                {
+                    Ok(Some(found)) => found,
+                    Ok(None) => {
+                        match self.resolve_miss(&request.method, &request.path, host.as_deref()) {
+                            Ok(miss) => miss,
+                            Err(error) => return self.error_response(error.into()),
+                        }
+                    }
+                    Err(error) => return self.error_response(error.into()),
+                }
+            }
         };
         let MatchedRoute {
             handler,

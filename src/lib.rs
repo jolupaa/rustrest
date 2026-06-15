@@ -11,7 +11,7 @@
 //!
 //!     app.get("/", |_req: Request| {
 //!         Response::send("Hello from RustRest")
-//!     });
+//!     }).unwrap();
 //!
 //!     app.listen("127.0.0.1:3000").await
 //! }
@@ -26,11 +26,12 @@ pub mod app;
 pub use app::tls;
 pub use app::{
     App, BackpressurePolicy, BodyStream, BoxError, Cookie, Cookies, ErrorHandler, Form,
-    FromRequest, Handler, Headers, HttpError, InMemoryWsBroker, IntoHandler, IntoHttpError,
-    IntoMiddleware, IntoResponse, IntoWebSocketHandler, IntoWebSocketOutput, Json, Middleware,
-    MultipartPart, Next, OriginPolicy, Path, Query, Request, RequestBody, RequestBuilder, Response,
-    RouteHandle, RouteInfo, Router, SameSite, Sessions, SseEvent, State, StateStore, TestClient,
-    TestRequest, TrailingSlash, WebSocket, WebSocketCapacityError, WebSocketCloseInfo,
+    FromRequest, Handler, Headers, HostPattern, HttpError, InMemoryWsBroker, IntoHandler,
+    IntoHttpError, IntoMiddleware, IntoResponse, IntoWebSocketHandler, IntoWebSocketOutput, Json,
+    Middleware, MultipartPart, Next, OriginPolicy, Path, Query, Request, RequestBody,
+    RequestBuilder, Response, RouteError, RouteErrorKind, RouteHandle, RouteInfo, RouteMatchError,
+    RouteMatchErrorKind, RoutePattern, Router, SameSite, Sessions, SseEvent, State, StateStore,
+    TestClient, TestRequest, TrailingSlash, WebSocket, WebSocketCapacityError, WebSocketCloseInfo,
     WebSocketCloseInitiator, WebSocketConfig, WebSocketConnectionSnapshot, WebSocketError,
     WebSocketErrorCategory, WebSocketEvent, WebSocketHandler, WebSocketId, WebSocketLifecycleState,
     WebSocketMessage, WebSocketObservation, WebSocketObserver, WebSocketReceiver,

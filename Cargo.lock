@@ -684,6 +684,7 @@ dependencies = [
  "httpdate",
  "hyper",
  "hyper-util",
+ "percent-encoding",
  "rcgen",
  "rustls-pemfile",
  "serde",

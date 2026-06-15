@@ -12,7 +12,7 @@ use super::{App, Request, RequestBuilder, Response};
 /// # use rustrest::{App, Request, Response, TestClient};
 /// # async fn demo() {
 /// let mut app = App::new();
-/// app.get("/ping", |_req: Request| Response::send("pong"));
+/// app.get("/ping", |_req: Request| Response::send("pong")).unwrap();
 ///
 /// let client = TestClient::new(app);
 /// let res = client.get("/ping").send().await;

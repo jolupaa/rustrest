@@ -6,7 +6,7 @@ use tokio::net::{TcpListener, TcpStream};
 #[tokio::test]
 async fn duplicate_request_headers_are_all_preserved() {
     let mut app = App::new();
-    app.get("/h", |req: Request| {
+    let _ = app.get("/h", |req: Request| {
         Response::send(&req.headers_all("x-tag").join(","))
     });
 
@@ -34,7 +34,7 @@ async fn duplicate_request_headers_are_all_preserved() {
 #[tokio::test]
 async fn request_exposes_client_peer_address() {
     let mut app = App::new();
-    app.get("/whoami", |req: Request| match req.remote_addr() {
+    let _ = app.get("/whoami", |req: Request| match req.remote_addr() {
         Some(addr) => Response::send(&addr.ip().to_string()),
         None => Response::send("none"),
     });
@@ -62,7 +62,7 @@ async fn request_exposes_client_peer_address() {
 async fn oversized_body_returns_413() {
     let mut app = App::new();
     app.max_body_size(16);
-    app.post("/upload", |mut req: Request| async move {
+    let _ = app.post("/upload", |mut req: Request| async move {
         req.bytes().await?;
         Ok::<_, HttpError>(Response::send("ok"))
     });
@@ -93,7 +93,7 @@ async fn oversized_body_returns_413() {
 async fn slow_handler_times_out_with_408() {
     let mut app = App::new();
     app.request_timeout(Duration::from_millis(50));
-    app.get("/slow", |_req: Request| async {
+    let _ = app.get("/slow", |_req: Request| async {
         tokio::time::sleep(Duration::from_secs(5)).await;
         Response::send("too late")
     });
@@ -120,7 +120,7 @@ async fn slow_handler_times_out_with_408() {
 #[tokio::test]
 async fn serve_with_shutdown_returns_after_signal() {
     let mut app = App::new();
-    app.get("/ping", |_req: Request| Response::send("pong"));
+    let _ = app.get("/ping", |_req: Request| Response::send("pong"));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -151,7 +151,7 @@ async fn serve_with_shutdown_returns_after_signal() {
 #[tokio::test]
 async fn app_serves_real_http_requests() {
     let mut app = App::new();
-    app.get("/hello", |_req: Request| Response::send("hello http"));
+    let _ = app.get("/hello", |_req: Request| Response::send("hello http"));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

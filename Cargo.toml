@@ -55,6 +55,7 @@ hmac = "0.12"
 sha2 = "0.10"
 httpdate = "1"
 tokio-tungstenite = "0.29"
+percent-encoding = "2"
 
 [dev-dependencies]
 rcgen = "0.13"

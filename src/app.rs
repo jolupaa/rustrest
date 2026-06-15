@@ -33,7 +33,10 @@ pub use form::MultipartPart;
 pub use handler::{ErrorHandler, Handler, IntoHandler, IntoMiddleware, Middleware, Next};
 pub use request::{Request, RequestBuilder};
 pub use response::{IntoResponse, Response};
-pub use router::{RouteHandle, RouteInfo, Router};
+pub use router::{
+    HostPattern, RouteError, RouteErrorKind, RouteHandle, RouteInfo, RouteMatchError,
+    RouteMatchErrorKind, RoutePattern, Router,
+};
 pub use server::{App, TrailingSlash};
 pub use session::Sessions;
 pub use sse::SseEvent;
@@ -55,7 +58,7 @@ pub use websocket::{
 pub(crate) use handler::{
     method_not_allowed_handler, not_found_handler, options_handler, panic_response,
 };
-pub(crate) use request::{decode_component, parse_cookies, parse_query};
+pub(crate) use request::{parse_cookies, parse_query};
 pub(crate) use response::ResponseBody;
 pub(crate) use router::allow_header_value;
 

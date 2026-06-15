@@ -29,11 +29,12 @@ async fn main() -> std::io::Result<()> {
             let body: HashMap<String, String> = req.json().await.unwrap_or_default();
             Response::send(body.get("Hola").unwrap_or(&"tonto".to_string()).as_str())
         }
-    });
+    })
+    .unwrap();
 
     // Routes and sub-routes organized in files: `api` mounts `users`.
     // Result: /api/users, /api/users/:id, ...
-    app.mount("/api", api::router());
+    app.mount("/api", api::router()).unwrap();
 
     app.listen("127.0.0.1:3000").await
 }

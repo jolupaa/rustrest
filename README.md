@@ -12,6 +12,7 @@ The goal is to provide a small, direct, easy-to-understand API for building HTTP
 - Synchronous and asynchronous handlers.
 - Route helpers for `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`, and `HEAD`.
 - Trie-indexed routing (O(path length)) where static segments beat `:params` and `:params` beat `*wildcards`, with backtracking.
+- Validated route registration with named routes (`url_for`), strict percent-decoded params, and optional host constraints.
 - Automatic `405 Method Not Allowed` (+`Allow`), auto-`HEAD` from `GET`, and auto-`OPTIONS`.
 - Mountable `Router` with nested prefixes.
 - Route parameters with `:id` and wildcards with `*path`.
@@ -95,12 +96,12 @@ async fn main() -> std::io::Result<()> {
 
     app.get("/", |_req: Request| {
         Response::send("Hello from RustRest")
-    });
+    }).unwrap();
 
     app.get("/users/:id", |req: Request| {
         let id = req.param("id").unwrap_or("?");
         Response::send(&format!("Requested user: {}", id))
-    });
+    }).unwrap();
 
     app.listen("127.0.0.1:3000").await
 }
@@ -154,24 +155,28 @@ Request flow:
 
 ## Routes
 
+Route registration returns `Result<RouteHandle, RouteError>` so invalid patterns,
+duplicate/conflicting routes, duplicate names, and invalid host constraints fail
+at startup instead of becoming runtime surprises.
+
 ```rust
 let mut app = App::new();
 
-app.get("/", |_req: Request| Response::send("home"));
-app.post("/users", |_req: Request| Response::send("create"));
-app.put("/users/:id", |_req: Request| Response::send("update"));
-app.patch("/users/:id", |_req: Request| Response::send("patch"));
-app.delete("/users/:id", |_req: Request| Response::send("delete"));
-app.options("/users", |_req: Request| Response::send("options"));
-app.head("/health", |_req: Request| Response::send("ok"));
-app.all("/any", |_req: Request| Response::send("any method"));
+app.get("/", |_req: Request| Response::send("home")).unwrap();
+app.post("/users", |_req: Request| Response::send("create")).unwrap();
+app.put("/users/:id", |_req: Request| Response::send("update")).unwrap();
+app.patch("/users/:id", |_req: Request| Response::send("patch")).unwrap();
+app.delete("/users/:id", |_req: Request| Response::send("delete")).unwrap();
+app.options("/users", |_req: Request| Response::send("options")).unwrap();
+app.head("/health", |_req: Request| Response::send("ok")).unwrap();
+app.all("/any", |_req: Request| Response::send("any method")).unwrap();
 ```
 
 Matching prefers the most specific pattern regardless of registration order: static segments beat `:params`, `:params` beat trailing `*wildcards` (with backtracking across branches), and an exact-method route beats `all()` on the same path. Remaining ties go to the first-registered route.
 
 ```rust
-app.get("/users/:id", |_req: Request| Response::send("by id"));
-app.get("/users/me", |_req: Request| Response::send("me")); // still wins for /users/me
+app.get("/users/:id", |_req: Request| Response::send("by id")).unwrap();
+app.get("/users/me", |_req: Request| Response::send("me")).unwrap(); // still wins for /users/me
 ```
 
 ### Trailing Slashes
@@ -199,7 +204,7 @@ app.get("/users/:id/posts/:post_id", |req: Request| {
     let user_id = req.param("id").unwrap_or("?");
     let post_id = req.param("post_id").unwrap_or("?");
     Response::send(&format!("user={} post={}", user_id, post_id))
-});
+}).unwrap();
 ```
 
 ### Wildcards
@@ -209,7 +214,7 @@ Patterns such as `*name` capture the rest of the path. They are used internally 
 ```rust
 app.get("/files/*path", |req: Request| {
     Response::send(req.param("path").unwrap_or(""))
-});
+}).unwrap();
 ```
 
 ## Routers
@@ -222,16 +227,16 @@ use rustrest::{Request, Response, Router};
 fn users_router() -> Router {
     let mut router = Router::new();
 
-    router.get("/", |_req: Request| Response::send("user list"));
+    router.get("/", |_req: Request| Response::send("user list")).unwrap();
     router.get("/:id", |req: Request| {
         Response::send(req.param("id").unwrap_or("?"))
-    });
+    }).unwrap();
 
     router
 }
 
 let mut app = App::new();
-app.mount("/users", users_router());
+app.mount("/users", users_router()).unwrap();
 ```
 
 This creates:
@@ -243,10 +248,10 @@ Routers can be mounted inside other routers:
 
 ```rust
 let mut api = Router::new();
-api.mount("/users", users_router());
+api.mount("/users", users_router()).unwrap();
 
 let mut app = App::new();
-app.mount("/api", api);
+app.mount("/api", api).unwrap();
 ```
 
 Result:
@@ -261,7 +266,7 @@ A handler can be synchronous:
 ```rust
 app.get("/", |_req: Request| {
     Response::send("sync")
-});
+}).unwrap();
 ```
 
 Or asynchronous:
@@ -269,7 +274,7 @@ Or asynchronous:
 ```rust
 app.get("/async", |_req: Request| async move {
     Response::send("async")
-});
+}).unwrap();
 ```
 
 A handler can also return `Result<Response, E>` when `E` implements `IntoHttpError`:
@@ -279,7 +284,7 @@ use rustrest::{HttpError, Request, Response};
 
 app.get("/fallible", |_req: Request| -> Result<Response, HttpError> {
     Err(HttpError::bad_request("Invalid parameters"))
-});
+}).unwrap();
 ```
 
 If a handler panics, RustRest catches it and returns `500`.
@@ -365,12 +370,12 @@ app.get("/users/:id", |req: Request| -> Result<Response, rustrest::HttpError> {
         query.active,
         query.tag
     )))
-});
+}).unwrap();
 
 app.post("/users", |mut req: Request| async move {
     let user: CreateUser = req.json().await?;
     Ok::<_, rustrest::HttpError>(Response::send(&format!("Creating {}", user.name)).status(201))
-});
+}).unwrap();
 ```
 
 ## Shared State
@@ -390,7 +395,7 @@ app.state(Config {
 app.get("/config", |req: Request| {
     let config = req.state::<Config>().expect("Config registered");
     Response::send(&config.database_url)
-});
+}).unwrap();
 ```
 
 Internally, state is stored in `Arc`, so `req.state::<T>()` returns `Option<Arc<T>>`.
@@ -520,8 +525,8 @@ router.layer(|req: Request, next: Next| async move {
     next(req).await
 });
 
-router.get("/health", |_req: Request| Response::send("ok"));
-app.mount("/api", router);
+router.get("/health", |_req: Request| Response::send("ok")).unwrap();
+app.mount("/api", router).unwrap();
 ```
 
 That middleware only runs for routes under `/api`.
@@ -539,6 +544,7 @@ app.layer(middleware::compression());
 app.layer(middleware::etag());
 app.layer(middleware::rate_limit(100, Duration::from_secs(60)));
 app.get("/slow", slow_handler)
+    .unwrap()
     .layer(middleware::timeout(Duration::from_secs(5)));
 ```
 
@@ -562,8 +568,8 @@ api.guard(|req: &Request| {
     req.header("x-api-key") == Some("secret")
 });
 
-api.get("/private", |_req: Request| Response::send("private"));
-app.mount("/api", api);
+api.get("/private", |_req: Request| Response::send("private")).unwrap();
+app.mount("/api", api).unwrap();
 ```
 
 If the guard fails, RustRest returns `403 Access denied`.
@@ -575,7 +581,7 @@ Global fallback:
 ```rust
 app.fallback(|_req: Request| {
     Response::send("Not found").status(404)
-});
+}).unwrap();
 ```
 
 Scoped fallback:
@@ -583,19 +589,19 @@ Scoped fallback:
 ```rust
 let mut api = Router::new();
 
-api.get("/health", |_req: Request| Response::send("ok"));
+api.get("/health", |_req: Request| Response::send("ok")).unwrap();
 api.fallback(|_req: Request| {
     Response::send("API route not found").status(404)
-});
+}).unwrap();
 
-app.mount("/api", api);
+app.mount("/api", api).unwrap();
 ```
 
 ## Static Files
 
 ```rust
 let mut app = App::new();
-app.static_files("/assets", "public");
+app.static_files("/assets", "public").unwrap();
 ```
 
 Examples:
@@ -626,7 +632,7 @@ app.get("/users/:id", |req: Request| -> Result<Response, HttpError> {
     })?;
 
     Ok(Response::send(id))
-});
+}).unwrap();
 ```
 
 Global error handler:
@@ -647,17 +653,18 @@ Routes can carry documentation, and the app can describe itself as OpenAPI 3.0:
 
 ```rust
 app.get("/users", list_users)
+    .unwrap()
     .summary("Lista usuarios")
     .description("Devuelve todos los usuarios registrados")
     .tag("users");
-app.get("/users/:id", show_user).tag("users");
+app.get("/users/:id", show_user).unwrap().tag("users");
 
 // A serde_json::Value with paths, methods, and path parameters:
 let doc = app.openapi("Mi API", "0.2.0");
 
 // Or serve it: GET /docs (Swagger UI) + GET /docs/openapi.json.
 // Snapshot semantics: call after registering the routes.
-app.serve_docs("/docs", "Mi API", "0.2.0");
+app.serve_docs("/docs", "Mi API", "0.2.0").unwrap();
 ```
 
 The generated document covers paths, methods, metadata, and `:param`/`*wildcard` path parameters (typed as strings). Request/response schemas are not introspected. `all()` routes are skipped.
@@ -675,7 +682,7 @@ app.get("/events", |_req: Request| {
     ]);
 
     Response::sse(events)
-});
+}).unwrap();
 ```
 
 The response uses `text/event-stream`, `Cache-Control: no-cache`, and `Connection: keep-alive`.
@@ -689,7 +696,7 @@ app.get("/events", |req: Request| {
     let resume_after = req.last_event_id().map(str::to_string);
     let events = my_event_stream(resume_after);
     Response::sse_with_heartbeat(events, Duration::from_secs(15))
-});
+}).unwrap();
 ```
 
 ## WebSocket
@@ -723,7 +730,7 @@ app.websocket("/ws", |mut socket| async move {
             break;
         }
     }
-});
+}).unwrap();
 ```
 
 `Router` has the same API:
@@ -732,8 +739,8 @@ app.websocket("/ws", |mut socket| async move {
 let mut router = Router::new();
 router.websocket("/ws", |mut socket| async move {
     socket.send_text("hello").await.ok();
-});
-app.mount("/api", router);
+}).unwrap();
+app.mount("/api", router).unwrap();
 ```
 
 There is also a short alias:
@@ -741,7 +748,7 @@ There is also a short alias:
 ```rust
 app.ws("/ws", |mut socket| async move {
     socket.close().await.ok();
-});
+}).unwrap();
 ```
 
 ### WebSocket Methods
@@ -850,7 +857,7 @@ app.websocket_with("/ws", config, |mut socket| async move {
     while let Ok(Some(message)) = socket.recv().await {
         // ...
     }
-});
+}).unwrap();
 ```
 
 The first client-offered subprotocol the server supports is selected and echoed in `Sec-WebSocket-Protocol`. With `ping_interval`, a Ping frame is sent whenever the connection has been idle inside `recv()` for the interval.
@@ -875,7 +882,7 @@ app.websocket("/chat/:channel", |mut socket| async move {
         }
     }
     Ok::<(), rustrest::WsError>(())
-});
+}).unwrap();
 ```
 
 Rooms are scoped by the normalized route pattern. `socket.to(...)` excludes
@@ -911,7 +918,7 @@ app.websocket("/chat", move |mut socket| {
             }
         }
     }
-});
+}).unwrap();
 ```
 
 Lagging subscribers receive `RecvError::Lagged` and must handle skipped
@@ -924,7 +931,7 @@ RustRest includes a handshake helper:
 ```rust
 app.get("/ws", |req: Request| -> Result<Response, HttpError> {
     Response::websocket(&req)
-});
+}).unwrap();
 ```
 
 This validates upgrade headers and returns `101 Switching Protocols` with `Sec-WebSocket-Accept`. Prefer `app.websocket` for normal server-side WebSocket handlers because it also owns the upgraded stream and frame loop.

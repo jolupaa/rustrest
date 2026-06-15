@@ -96,18 +96,22 @@ fn assert_problem_code(response: &Response, status: u16, code: &str) {
 async fn route_body_limit_can_reduce_the_server_default() {
     let mut app = App::new();
     app.max_body_size(1024 * 1024);
-    app.post("/json", |mut req: Request| async move {
-        req.bytes()
-            .await
-            .map(|body| Response::send(&body.len().to_string()))
-    })
-    .body_limit(1024);
-    app.post("/upload", |mut req: Request| async move {
-        req.bytes()
-            .await
-            .map(|body| Response::send(&body.len().to_string()))
-    })
-    .body_limit(1024 * 1024);
+    let _ = app
+        .post("/json", |mut req: Request| async move {
+            req.bytes()
+                .await
+                .map(|body| Response::send(&body.len().to_string()))
+        })
+        .unwrap()
+        .body_limit(1024);
+    let _ = app
+        .post("/upload", |mut req: Request| async move {
+            req.bytes()
+                .await
+                .map(|body| Response::send(&body.len().to_string()))
+        })
+        .unwrap()
+        .body_limit(1024 * 1024);
 
     let client = TestClient::new(app);
 
@@ -123,12 +127,14 @@ async fn route_body_limit_can_reduce_the_server_default() {
 async fn server_body_limit_is_a_hard_ceiling_for_routes() {
     let mut app = App::new();
     app.max_body_size(1024);
-    app.post("/upload", |mut req: Request| async move {
-        req.bytes()
-            .await
-            .map(|body| Response::send(&body.len().to_string()))
-    })
-    .body_limit(1024 * 1024);
+    let _ = app
+        .post("/upload", |mut req: Request| async move {
+            req.bytes()
+                .await
+                .map(|body| Response::send(&body.len().to_string()))
+        })
+        .unwrap()
+        .body_limit(1024 * 1024);
 
     let response = TestClient::new(app)
         .post("/upload")
@@ -142,12 +148,16 @@ async fn server_body_limit_is_a_hard_ceiling_for_routes() {
 #[tokio::test]
 async fn route_timeout_wraps_only_the_selected_route() {
     let mut app = App::new();
-    app.get("/slow", |_req: Request| async {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        Response::send("late")
-    })
-    .timeout(Duration::from_millis(20));
-    app.get("/fast", |_req: Request| Response::send("ok"));
+    let _ = app
+        .get("/slow", |_req: Request| async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Response::send("late")
+        })
+        .unwrap()
+        .timeout(Duration::from_millis(20));
+    let _ = app
+        .get("/fast", |_req: Request| Response::send("ok"))
+        .unwrap();
 
     let client = TestClient::new(app);
 
@@ -171,11 +181,13 @@ async fn known_oversized_content_length_is_rejected_before_middleware_or_body_po
         async move { next(req).await }
     });
     let handler_flag = Arc::clone(&handler_ran);
-    app.post("/upload", move |_req: Request| {
-        handler_flag.store(true, Ordering::SeqCst);
-        Response::send("ok")
-    })
-    .body_limit(4);
+    let _ = app
+        .post("/upload", move |_req: Request| {
+            handler_flag.store(true, Ordering::SeqCst);
+            Response::send("ok")
+        })
+        .unwrap()
+        .body_limit(4);
 
     let (addr, shutdown, server) = spawn_app(app).await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -211,7 +223,7 @@ async fn invalid_content_length_is_rejected_before_middleware_or_handler() {
         async move { next(req).await }
     });
     let handler_flag = Arc::clone(&handler_ran);
-    app.post("/upload", move |_req: Request| {
+    let _ = app.post("/upload", move |_req: Request| {
         handler_flag.store(true, Ordering::SeqCst);
         Response::send("ok")
     });
@@ -237,7 +249,7 @@ async fn content_length_errors_use_the_global_error_handler() {
             .status(error.status().as_u16())
             .header("x-error-code", error.code())
     });
-    app.post("/upload", |_req: Request| Response::send("ok"));
+    let _ = app.post("/upload", |_req: Request| Response::send("ok"));
     let client = TestClient::new(app);
 
     let response = client
@@ -269,7 +281,7 @@ async fn conflicting_content_length_is_rejected_before_middleware_or_handler() {
             async move { next(req).await }
         });
         let handler_counter = Arc::clone(&handler_runs);
-        app.post("/upload", move |_req: Request| {
+        let _ = app.post("/upload", move |_req: Request| {
             handler_counter.fetch_add(1, Ordering::SeqCst);
             Response::send("ok")
         });
@@ -290,12 +302,12 @@ async fn conflicting_content_length_is_rejected_before_middleware_or_handler() {
 #[tokio::test]
 async fn identical_content_length_values_are_accepted() {
     let mut app = App::new();
-    app.post("/duplicates", |mut req: Request| async move {
+    let _ = app.post("/duplicates", |mut req: Request| async move {
         req.bytes()
             .await
             .map(|body| Response::send(&body.len().to_string()))
     });
-    app.post("/list", |mut req: Request| async move {
+    let _ = app.post("/list", |mut req: Request| async move {
         req.bytes()
             .await
             .map(|body| Response::send(&body.len().to_string()))
@@ -337,7 +349,7 @@ async fn assert_http1_content_length_parse_error(content_length_headers: &str) {
         async move { next(req).await }
     });
     let handler_counter = Arc::clone(&handler_runs);
-    app.post("/upload", move |_req: Request| {
+    let _ = app.post("/upload", move |_req: Request| {
         handler_counter.fetch_add(1, Ordering::SeqCst);
         Response::send("ok")
     });
@@ -402,7 +414,7 @@ async fn http1_identical_duplicate_content_length_is_accepted_by_hyper() {
         async move { next(req).await }
     });
     let handler_counter = Arc::clone(&handler_runs);
-    app.post("/upload", move |mut req: Request| {
+    let _ = app.post("/upload", move |mut req: Request| {
         handler_counter.fetch_add(1, Ordering::SeqCst);
         async move {
             req.bytes()
@@ -439,7 +451,7 @@ async fn expect_continue_unauthorized_receives_only_the_final_response() {
         }
         next(req).await
     });
-    app.post("/upload", |mut req: Request| async move {
+    let _ = app.post("/upload", |mut req: Request| async move {
         req.bytes().await?;
         Ok::<_, HttpError>(Response::send("ok"))
     });
@@ -469,7 +481,7 @@ async fn expect_continue_authorized_receives_continue_before_sending_body() {
         }
         next(req).await
     });
-    app.post("/upload", |mut req: Request| async move {
+    let _ = app.post("/upload", |mut req: Request| async move {
         let body = req.bytes().await?;
         Ok::<_, HttpError>(Response::send(&body.len().to_string()))
     });
@@ -503,7 +515,7 @@ async fn middleware_can_reject_unknown_body_before_request_body_is_sent() {
         }
         next(req).await
     });
-    app.post("/upload", |_req: Request| Response::send("ok"));
+    let _ = app.post("/upload", |_req: Request| Response::send("ok"));
 
     let (addr, shutdown, server) = spawn_app(app).await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -528,7 +540,7 @@ async fn middleware_can_reject_unknown_body_before_request_body_is_sent() {
 #[tokio::test]
 async fn incoming_request_body_can_be_collected() {
     let mut app = App::new();
-    app.post("/echo", |mut req: Request| async move {
+    let _ = app.post("/echo", |mut req: Request| async move {
         let body = req.bytes().await?;
         Ok::<_, HttpError>(Response::send(&body.len().to_string()))
     });
@@ -667,7 +679,7 @@ async fn test_client_middleware_can_reject_oversized_body_without_collecting_it(
         }
         next(req).await
     });
-    app.post("/upload", move |_req: Request| {
+    let _ = app.post("/upload", move |_req: Request| {
         handler_dispatched.store(true, Ordering::SeqCst);
         Response::send("ok")
     });
@@ -683,7 +695,7 @@ async fn test_client_middleware_can_reject_oversized_body_without_collecting_it(
 async fn test_client_handler_can_ignore_oversized_body() {
     let mut app = App::new();
     app.max_body_size(4);
-    app.post("/upload", |_req: Request| Response::send("ok"));
+    let _ = app.post("/upload", |_req: Request| Response::send("ok"));
     let client = TestClient::new(app);
 
     let response = client.post("/upload").body("12345").send().await;
@@ -698,7 +710,7 @@ async fn test_client_enforces_body_limit_when_handler_collects_body() {
     let mut app = App::new();
     app.max_body_size(4);
     let bytes_reads = Arc::clone(&body_reads);
-    app.post("/bytes", move |mut req: Request| {
+    let _ = app.post("/bytes", move |mut req: Request| {
         let body_reads = Arc::clone(&bytes_reads);
         async move {
             body_reads.fetch_add(1, Ordering::SeqCst);
@@ -707,7 +719,7 @@ async fn test_client_enforces_body_limit_when_handler_collects_body() {
         }
     });
     let text_reads = Arc::clone(&body_reads);
-    app.post("/text", move |mut req: Request| {
+    let _ = app.post("/text", move |mut req: Request| {
         let body_reads = Arc::clone(&text_reads);
         async move {
             body_reads.fetch_add(1, Ordering::SeqCst);
@@ -716,7 +728,7 @@ async fn test_client_enforces_body_limit_when_handler_collects_body() {
         }
     });
     let json_reads = Arc::clone(&body_reads);
-    app.post("/json", move |mut req: Request| {
+    let _ = app.post("/json", move |mut req: Request| {
         let body_reads = Arc::clone(&json_reads);
         async move {
             body_reads.fetch_add(1, Ordering::SeqCst);
