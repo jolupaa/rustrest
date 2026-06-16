@@ -18,6 +18,7 @@
 //! ```
 //!
 //! The [`app`] module is also available with the framework's public core types.
+//! See `docs/migrations/0.2-to-0.3.md` in the repository for the 0.3 migration guide.
 #![forbid(unsafe_code)]
 
 pub mod app;

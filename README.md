@@ -4,7 +4,7 @@ RustRest is a minimal Express-style HTTP framework for Rust, built on top of `hy
 
 The goal is to provide a small, direct, easy-to-understand API for building HTTP servers and APIs without hiding the transport layer completely. RustRest includes routes, mountable routers, onion-style middleware, typed extractors, shared state, JSON responses, static files, SSE, cookies, redirects, and WebSocket routes.
 
-> Status: `0.2.0`. The API is still evolving. It is best suited for learning, prototyping, and controlled framework development.
+> Status: `0.3.0`. The API is still evolving. It is best suited for learning, prototyping, and controlled framework development.
 
 ## Features
 
@@ -64,7 +64,7 @@ After the crate is published:
 
 ```toml
 [dependencies]
-rustrest = "0.2"
+rustrest = "0.3"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
@@ -73,16 +73,26 @@ RustRest uses Rust edition 2024 and requires Rust `1.85` or newer.
 
 ### Cargo features
 
-All optional, disabled by default:
+All optional, disabled by default. The feature names introduced in `0.3.0` are mostly compatibility
+markers for the upcoming modularization work; current default source compatibility is preserved.
 
-| Feature   | Adds                                                                  |
-| --------- | --------------------------------------------------------------------- |
-| `tls`     | HTTPS via rustls: `app.listen_tls(...)` + `rustrest::tls::config_from_pem` |
-| `tracing` | `middleware::trace()` emitting structured spans/events per request    |
-| `brotli`  | Brotli as the preferred encoding in `middleware::compression()`       |
+| Feature        | Adds / marks                                                         |
+| -------------- | -------------------------------------------------------------------- |
+| `tls`          | HTTPS via rustls: `app.listen_tls(...)` + `rustrest::tls::config_from_pem` |
+| `tracing`      | `middleware::trace()` emitting structured spans/events per request   |
+| `brotli`       | Brotli support in `middleware::compression()`                        |
+| `compression`  | Compression middleware surface                                       |
+| `multipart`    | Multipart request parsing surface                                    |
+| `static-files` | Static file serving surface                                          |
+| `sse`          | Server-Sent Events surface                                           |
+| `websocket`    | WebSocket surface                                                    |
+| `openapi`      | OpenAPI and docs routes surface                                      |
+| `sessions`     | Signed values and in-memory sessions surface                         |
+| `metrics`      | Reserved for upcoming metrics/observability work                     |
+| `full`         | Enables all named feature flags plus optional integrations           |
 
 ```toml
-rustrest = { version = "0.2", features = ["tls", "tracing"] }
+rustrest = { version = "0.3", features = ["tls", "tracing"] }
 ```
 
 ## Quick Start
@@ -699,11 +709,11 @@ app.get("/users", list_users)
 app.get("/users/:id", show_user).unwrap().tag("users");
 
 // A serde_json::Value with paths, methods, and path parameters:
-let doc = app.openapi("Mi API", "0.2.0");
+let doc = app.openapi("Mi API", "0.3.0");
 
 // Or serve it: GET /docs (Swagger UI) + GET /docs/openapi.json.
 // Snapshot semantics: call after registering the routes.
-app.serve_docs("/docs", "Mi API", "0.2.0").unwrap();
+app.serve_docs("/docs", "Mi API", "0.3.0").unwrap();
 ```
 
 The generated document covers paths, methods, metadata, and `:param`/`*wildcard` path parameters (typed as strings). Request/response schemas are not introspected. `all()` routes are skipped.
@@ -1017,7 +1027,7 @@ The project includes:
 
 ## Compatibility and releases
 
-See the [changelog](CHANGELOG.md) for notable changes, the [release policy](docs/releases.md) for compatibility guarantees, and the [migration guides](docs/migrations/README.md) for breaking upgrades.
+See the [changelog](CHANGELOG.md) for notable changes, the [release policy](docs/releases.md) for compatibility guarantees, and the [migration guides](docs/migrations/README.md) for breaking upgrades. For this release, start with [Migrating from 0.2 to 0.3](docs/migrations/0.2-to-0.3.md).
 
 ## Publishing Preparation
 
@@ -1068,7 +1078,7 @@ src/
     form.rs              # Form bodies + multipart parser
     cookie.rs            # Cookie builder + sign/verify helpers
     session.rs           # Minimal in-memory Sessions middleware
-    middleware.rs        # Built-in middleware (Cors, compression, ...)
+    middleware/          # Built-in middleware (Cors, compression, conditionals, ...)
     error.rs             # HttpError and IntoHttpError
     state.rs             # Type-keyed StateStore
     testing.rs           # In-process TestClient
@@ -1079,9 +1089,11 @@ src/
 examples/
   basic.rs               # Minimal example
   api.rs                 # Full API example
+  streaming_upload.rs    # Streaming request body upload example
   websocket.rs           # WebSocket and browser client example
 tests/
   http_integration.rs    # Real HTTP integration tests
+  http_semantics.rs      # Compression/precondition protocol tests
   tls_integration.rs     # Real HTTPS integration test (feature `tls`)
 ```
 
