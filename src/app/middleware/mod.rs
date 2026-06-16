@@ -1,15 +1,19 @@
 use std::collections::HashMap;
-use std::io::Write;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use flate2::Compression;
-use flate2::write::{GzEncoder, ZlibEncoder};
-use hyper::header::{CONTENT_ENCODING, HeaderValue, RETRY_AFTER, VARY};
+use hyper::header::{HeaderValue, RETRY_AFTER};
 
 use super::{HttpError, IntoMiddleware, Middleware, Next, Request, Response};
+
+mod compression;
+pub(crate) mod conditional;
+
+pub use compression::{compression, compression_with_min_size, gzip};
+pub use conditional::etag;
+pub(crate) use conditional::{PreconditionResult, evaluate_preconditions};
 
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -42,45 +46,6 @@ pub fn request_id() -> Middleware {
             req.headers.insert("x-request-id".to_string(), id.clone());
             let mut res = next(req).await;
             res = res.header("x-request-id", &id);
-            res
-        })
-    })
-}
-
-pub fn gzip() -> Middleware {
-    Arc::new(|req: Request, next: Next| {
-        Box::pin(async move {
-            let accepts_gzip = req
-                .header("accept-encoding")
-                .is_some_and(|value| value.split(',').any(|part| part.trim() == "gzip"));
-            let mut res = next(req).await;
-
-            if !accepts_gzip
-                || res.status == 101
-                || res.body_bytes().is_none_or(<[u8]>::is_empty)
-                || res.headers.contains_key(CONTENT_ENCODING)
-            {
-                return res;
-            }
-
-            if res
-                .map_body_bytes(|body| {
-                    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-                    encoder.write_all(body).map_err(|err| {
-                        HttpError::internal_server_error("Could not compress response")
-                            .with_source(err)
-                    })?;
-                    encoder.finish().map_err(|err| {
-                        HttpError::internal_server_error("Could not finish gzip encoding")
-                            .with_source(err)
-                    })
-                })
-                .is_ok()
-            {
-                res = res
-                    .header(CONTENT_ENCODING.as_str(), "gzip")
-                    .append_header(VARY.as_str(), "Accept-Encoding");
-            }
             res
         })
     })
@@ -122,180 +87,6 @@ pub fn trace() -> Middleware {
             .instrument(span),
         )
     })
-}
-
-/// Bodies smaller than this are not worth compressing.
-const COMPRESSION_MIN_BYTES: usize = 1024;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Encoding {
-    #[cfg(feature = "brotli")]
-    Brotli,
-    Gzip,
-    Deflate,
-}
-
-impl Encoding {
-    fn name(self) -> &'static str {
-        match self {
-            #[cfg(feature = "brotli")]
-            Encoding::Brotli => "br",
-            Encoding::Gzip => "gzip",
-            Encoding::Deflate => "deflate",
-        }
-    }
-
-    fn encode(self, body: &[u8]) -> Result<Vec<u8>, HttpError> {
-        let failed = |err: std::io::Error| {
-            HttpError::internal_server_error("Could not compress response").with_source(err)
-        };
-        match self {
-            #[cfg(feature = "brotli")]
-            Encoding::Brotli => {
-                let mut writer = brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22);
-                writer.write_all(body).map_err(failed)?;
-                writer.flush().map_err(failed)?;
-                Ok(writer.into_inner())
-            }
-            Encoding::Gzip => {
-                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-                encoder.write_all(body).map_err(failed)?;
-                encoder.finish().map_err(failed)
-            }
-            Encoding::Deflate => {
-                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-                encoder.write_all(body).map_err(failed)?;
-                encoder.finish().map_err(failed)
-            }
-        }
-    }
-}
-
-/// Picks the best supported encoding from an `Accept-Encoding` header
-/// (brotli, when the feature is on, then gzip, then deflate). `q=0` refuses.
-fn choose_encoding(accept_encoding: &str) -> Option<Encoding> {
-    #[cfg(feature = "brotli")]
-    let mut brotli_ok = false;
-    let mut gzip_ok = false;
-    let mut deflate_ok = false;
-
-    for part in accept_encoding.split(',') {
-        let token = part.trim();
-        let (name, params) = token.split_once(';').unwrap_or((token, ""));
-        if params.replace(' ', "").eq_ignore_ascii_case("q=0") {
-            continue;
-        }
-        match name.trim().to_ascii_lowercase().as_str() {
-            #[cfg(feature = "brotli")]
-            "br" => brotli_ok = true,
-            "gzip" => gzip_ok = true,
-            "deflate" => deflate_ok = true,
-            _ => {}
-        }
-    }
-
-    #[cfg(feature = "brotli")]
-    if brotli_ok {
-        return Some(Encoding::Brotli);
-    }
-    if gzip_ok {
-        Some(Encoding::Gzip)
-    } else if deflate_ok {
-        Some(Encoding::Deflate)
-    } else {
-        None
-    }
-}
-
-/// Content negotiation for response compression with a 1 KB minimum size.
-/// Supports gzip and deflate (plus brotli with the `brotli` feature).
-pub fn compression() -> Middleware {
-    compression_with_min_size(COMPRESSION_MIN_BYTES)
-}
-
-/// Like [`compression`], with a custom minimum body size.
-pub fn compression_with_min_size(min_size: usize) -> Middleware {
-    Arc::new(move |req: Request, next: Next| {
-        let encoding = req.header("accept-encoding").and_then(choose_encoding);
-        Box::pin(async move {
-            let mut res = next(req).await;
-            let Some(encoding) = encoding else {
-                return res;
-            };
-            if res.status == 101
-                || res.headers.contains_key(CONTENT_ENCODING)
-                || res.body_bytes().is_none_or(|body| body.len() < min_size)
-            {
-                return res;
-            }
-            if res.map_body_bytes(|body| encoding.encode(body)).is_ok() {
-                res = res
-                    .header(CONTENT_ENCODING.as_str(), encoding.name())
-                    .append_header(VARY.as_str(), "Accept-Encoding");
-            }
-            res
-        })
-    })
-}
-
-/// Strong-ETag validation for buffered 200 responses: hashes the body
-/// (SHA-1), sets `ETag` when the handler did not set one, and answers a
-/// matching `If-None-Match` on GET/HEAD with `304 Not Modified` (headers
-/// kept, body dropped). Streaming bodies and non-200 responses pass through
-/// untouched.
-pub fn etag() -> Middleware {
-    Arc::new(|req: Request, next: Next| {
-        let if_none_match = matches!(req.method.as_str(), "GET" | "HEAD")
-            .then(|| req.header("if-none-match").map(str::to_string))
-            .flatten();
-        Box::pin(async move {
-            let mut res = next(req).await;
-            if res.status != 200 {
-                return res;
-            }
-            let tag = match res
-                .headers
-                .get("etag")
-                .and_then(|value| value.to_str().ok())
-            {
-                Some(existing) => existing.to_string(),
-                None => {
-                    let Some(body) = res.body_bytes() else {
-                        return res;
-                    };
-                    if body.is_empty() {
-                        return res;
-                    }
-                    let tag = format!("\"{}\"", sha1_hex(body));
-                    res = res.header("etag", &tag);
-                    tag
-                }
-            };
-            let revalidated = if_none_match.is_some_and(|raw| {
-                raw.split(',').any(|candidate| {
-                    let candidate = candidate.trim().trim_start_matches("W/");
-                    candidate == "*" || candidate == tag
-                })
-            });
-            if revalidated {
-                res.clear_body();
-                res = res.status(304);
-            }
-            res
-        })
-    })
-}
-
-fn sha1_hex(data: &[u8]) -> String {
-    use std::fmt::Write as _;
-
-    use sha1::{Digest, Sha1};
-    let digest = Sha1::digest(data);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        let _ = write!(out, "{:02x}", byte);
-    }
-    out
 }
 
 /// Cuts off everything it wraps (handler plus inner middleware) after

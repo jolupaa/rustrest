@@ -22,6 +22,19 @@ fn dummy_request(body: &str) -> Request {
     Request::builder().body(body.to_string()).build()
 }
 
+fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+    static COUNTER: AtomicUsize = AtomicUsize::new(1);
+    std::env::temp_dir().join(format!(
+        "rustrest-{prefix}-{}-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+}
+
 #[test]
 fn http_error_preserves_code_headers_and_private_source() {
     let error = HttpError::new(
@@ -880,13 +893,13 @@ async fn compression_negotiates_encoding_and_skips_small_bodies() {
     decoder.read_to_string(&mut decoded).unwrap();
     assert_eq!(decoded.len(), 2048);
 
-    // gzip preferred when both are accepted; Vary advertises the negotiation.
+    // Higher q-value wins; Vary advertises the negotiation.
     let res = client
         .get("/big")
         .header("accept-encoding", "deflate, gzip;q=0.8")
         .send()
         .await;
-    assert_eq!(res.headers.get(CONTENT_ENCODING).unwrap(), "gzip");
+    assert_eq!(res.headers.get(CONTENT_ENCODING).unwrap(), "deflate");
     assert_eq!(res.headers.get("vary").unwrap(), "Accept-Encoding");
 
     // Bodies under the threshold are left alone.
@@ -2184,13 +2197,7 @@ async fn router_layer_scopes_middleware_to_its_routes() {
 
 #[tokio::test]
 async fn app_static_files_serves_files_with_content_type() {
-    let root = std::env::temp_dir().join(format!(
-        "rustrest-static-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root = unique_temp_dir("static");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("app.css"), "body { color: red; }").unwrap();
 
@@ -2218,13 +2225,7 @@ async fn app_static_files_serves_files_with_content_type() {
 
 #[tokio::test]
 async fn static_files_support_conditional_and_range_requests() {
-    let root = std::env::temp_dir().join(format!(
-        "rustrest-static-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root = unique_temp_dir("static");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("static.txt"), "0123456789").unwrap();
 
@@ -2311,13 +2312,7 @@ async fn static_files_support_conditional_and_range_requests() {
 
 #[tokio::test]
 async fn static_files_rejects_path_traversal() {
-    let root = std::env::temp_dir().join(format!(
-        "rustrest-static-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root = unique_temp_dir("static");
     fs::create_dir_all(&root).unwrap();
 
     let mut app = App::new();

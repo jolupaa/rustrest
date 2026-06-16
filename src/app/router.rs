@@ -6,7 +6,7 @@ use std::io::SeekFrom;
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use futures_util::Stream;
 use hyper::body::Bytes;
@@ -1312,47 +1312,39 @@ async fn serve_static_file(root: Arc<PathBuf>, req: Request) -> Response {
         res
     };
 
-    // Conditional GET: If-None-Match wins over If-Modified-Since.
-    if let Some(if_none_match) = req.header("if-none-match") {
-        let matches = etag.as_deref().is_some_and(|etag| {
-            if_none_match
-                .split(',')
-                .any(|candidate| candidate.trim() == etag || candidate.trim() == "*")
-        });
-        if matches {
+    let range_requested = req.header("range").is_some();
+    let preconditions =
+        super::middleware::evaluate_preconditions(&req, etag.as_deref(), modified, range_requested);
+    match preconditions {
+        super::middleware::PreconditionResult::Failed => {
+            return validators(Response::send("").status(412));
+        }
+        super::middleware::PreconditionResult::NotModified => {
             return validators(Response::send("").status(304));
         }
-    } else if let (Some(since), Some(modified)) = (
-        req.header("if-modified-since")
-            .and_then(|value| httpdate::parse_http_date(value).ok()),
-        modified,
-    ) {
-        // HTTP dates have second resolution.
-        let to_secs = |time: SystemTime| {
-            time.duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_secs())
-                .unwrap_or_default()
-        };
-        if to_secs(modified) <= to_secs(since) {
-            return validators(Response::send("").status(304));
-        }
+        super::middleware::PreconditionResult::Proceed
+        | super::middleware::PreconditionResult::IgnoreRange => {}
     }
 
     // A structurally valid but unsatisfiable Range gets 416; a malformed one
     // is ignored and the full file is served (as the RFC allows).
-    let range = match req
-        .header("range")
-        .map(|raw| parse_byte_range(raw, total_len))
-    {
-        Some(RangeParse::Satisfiable(start, end)) => Some((start, end)),
-        Some(RangeParse::Unsatisfiable) => {
-            return validators(
-                Response::send("")
-                    .status(416)
-                    .header("content-range", &format!("bytes */{}", total_len)),
-            );
+    let range = if preconditions == super::middleware::PreconditionResult::IgnoreRange {
+        None
+    } else {
+        match req
+            .header("range")
+            .map(|raw| parse_byte_range(raw, total_len))
+        {
+            Some(RangeParse::Satisfiable(start, end)) => Some((start, end)),
+            Some(RangeParse::Unsatisfiable) => {
+                return validators(
+                    Response::send("")
+                        .status(416)
+                        .header("content-range", &format!("bytes */{}", total_len)),
+                );
+            }
+            Some(RangeParse::Ignored) | None => None,
         }
-        Some(RangeParse::Ignored) | None => None,
     };
 
     let Ok(mut file) = tokio::fs::File::open(&file_path).await else {
