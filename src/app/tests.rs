@@ -2,14 +2,15 @@ use super::router::{MatchedRoute, match_pattern, parse_pattern, path_segments};
 use super::*;
 use futures_util::stream;
 use http_body_util::BodyExt;
-use hyper::StatusCode;
 use hyper::body::Bytes;
 use hyper::header::{
     ALLOW, CONTENT_ENCODING, HeaderValue, LOCATION, RETRY_AFTER, SEC_WEBSOCKET_VERSION, SET_COOKIE,
     WWW_AUTHENTICATE,
 };
+use hyper::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fs;
 use std::io::Read;
 use std::sync::Arc;
@@ -1146,8 +1147,68 @@ fn response_body_accessors_and_no_desync_for_streams() {
     assert_eq!(bytes_res.body_text(), "hi");
 
     // A streamed response keeps no in-memory body to desync from its stream.
-    let stream_res = Response::stream(stream::iter(vec![Ok(Bytes::from_static(b"x"))]));
+    let stream_res = Response::stream(stream::iter(vec![Ok::<_, Infallible>(Bytes::from_static(
+        b"x",
+    ))]));
     assert_eq!(stream_res.body_bytes(), None);
+}
+
+#[tokio::test]
+async fn fallible_stream_closes_the_body_after_the_error() {
+    let stream = stream::iter(vec![
+        Ok::<_, std::io::Error>(Bytes::from_static(b"first")),
+        Err(std::io::Error::other("read failed")),
+    ]);
+    let response = Response::stream(stream);
+
+    let result = response.into_hyper().into_body().collect().await;
+
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn response_can_emit_http_trailers() {
+    let mut trailers = HeaderMap::new();
+    trailers.insert("x-checksum", HeaderValue::from_static("abc"));
+    let stream = stream::once(async { Ok::<_, std::io::Error>(Bytes::from_static(b"data")) });
+    let response = Response::stream(stream).with_trailers(trailers);
+
+    let collected = response.into_hyper().into_body().collect().await.unwrap();
+
+    assert_eq!(
+        collected.trailers().unwrap().get("x-checksum").unwrap(),
+        "abc"
+    );
+}
+
+#[test]
+fn checked_response_builders_reject_invalid_status_and_headers() {
+    assert!(Response::send("x").try_status(99).is_err());
+    assert!(Response::send("x").try_header("bad header", "x").is_err());
+    assert!(Response::send("x").try_header("x-ok", "bad\r\n").is_err());
+}
+
+#[tokio::test]
+async fn invalid_fluent_response_builder_renders_structured_500() {
+    let res = Response::send("ok").status(99).into_hyper();
+
+    assert_eq!(res.status(), 500);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], "internal_server_error");
+    assert_eq!(json["detail"], "No se pudo construir la respuesta");
+}
+
+#[tokio::test]
+async fn invalid_sse_event_terminates_the_response_body_with_error() {
+    let events = stream::iter(vec![SseEvent::new("hola").id("bad\nid")]);
+    let result = Response::sse(events)
+        .into_hyper()
+        .into_body()
+        .collect()
+        .await;
+
+    assert!(result.is_err());
 }
 
 #[tokio::test]
@@ -2274,8 +2335,8 @@ async fn static_files_rejects_path_traversal() {
 #[tokio::test]
 async fn response_streams_body_chunks() {
     let chunks = stream::iter(vec![
-        Ok(Bytes::from_static(b"hello ")),
-        Ok(Bytes::from_static(b"stream")),
+        Ok::<_, Infallible>(Bytes::from_static(b"hello ")),
+        Ok::<_, Infallible>(Bytes::from_static(b"stream")),
     ]);
     let res = Response::stream(chunks)
         .content_type("text/plain; charset=utf-8")

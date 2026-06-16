@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::convert::Infallible;
 use std::error::Error;
 use std::fmt::{Debug, Display};
 use std::future::Future;
@@ -1438,11 +1437,11 @@ fn parse_byte_range(raw: &str, total_len: u64) -> RangeParse {
 }
 
 /// Streams `len` bytes from `file` in 64 KB chunks. On a read error the
-/// stream ends early; the explicit Content-Length lets clients detect it.
+/// body terminates with that error instead of silently ending early.
 fn file_stream(
     file: tokio::fs::File,
     len: u64,
-) -> impl Stream<Item = Result<Bytes, Infallible>> + Send {
+) -> impl Stream<Item = std::io::Result<Bytes>> + Send {
     futures_util::stream::unfold((file, len), |(mut file, remaining)| async move {
         if remaining == 0 {
             return None;
@@ -1450,7 +1449,14 @@ fn file_stream(
         let chunk = remaining.min(64 * 1024) as usize;
         let mut buffer = vec![0u8; chunk];
         match file.read(&mut buffer).await {
-            Ok(0) | Err(_) => None,
+            Ok(0) => Some((
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "static file ended before content-length bytes were read",
+                )),
+                (file, 0),
+            )),
+            Err(error) => Some((Err(error), (file, 0))),
             Ok(read) => {
                 buffer.truncate(read);
                 Some((Ok(Bytes::from(buffer)), (file, remaining - read as u64)))

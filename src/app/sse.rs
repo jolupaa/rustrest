@@ -1,3 +1,6 @@
+use std::error::Error;
+use std::fmt::{Display, Formatter};
+
 pub struct SseEvent {
     data: String,
     event: Option<String>,
@@ -45,20 +48,28 @@ impl SseEvent {
     }
 
     pub(super) fn format(&self) -> String {
+        self.try_format()
+            .expect("SseEvent::format is only used with already valid test events")
+    }
+
+    pub(super) fn try_format(&self) -> Result<String, SseError> {
         let mut out = String::new();
         if let Some(comment) = &self.comment {
+            validate_single_line("comment", comment)?;
             out.push_str(": ");
             out.push_str(comment);
             out.push('\n');
             out.push('\n');
-            return out;
+            return Ok(out);
         }
         if let Some(id) = &self.id {
+            validate_single_line("id", id)?;
             out.push_str("id: ");
             out.push_str(id);
             out.push('\n');
         }
         if let Some(event) = &self.event {
+            validate_single_line("event", event)?;
             out.push_str("event: ");
             out.push_str(event);
             out.push('\n');
@@ -77,6 +88,35 @@ impl SseEvent {
             out.push_str("data: \n");
         }
         out.push('\n');
-        out
+        Ok(out)
     }
 }
+
+fn validate_single_line(field: &'static str, value: &str) -> Result<(), SseError> {
+    if value.contains('\r') || value.contains('\n') {
+        Err(SseError::invalid_field(field))
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseError {
+    message: String,
+}
+
+impl SseError {
+    fn invalid_field(field: &'static str) -> Self {
+        Self {
+            message: format!("El campo SSE {field} no puede contener saltos de linea"),
+        }
+    }
+}
+
+impl Display for SseError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for SseError {}

@@ -502,6 +502,35 @@ let chunks = stream::iter(vec![
 Response::stream(chunks).content_type("text/plain; charset=utf-8")
 ```
 
+`Response::stream` also accepts fallible streams. Stream errors are propagated to the HTTP body
+instead of being swallowed:
+
+```rust
+let chunks = stream::iter(vec![
+    Ok::<_, std::io::Error>(Bytes::from_static(b"hello")),
+    Err(std::io::Error::other("read failed")),
+]);
+
+Response::stream(chunks)
+```
+
+HTTP trailers can be appended as the final body frame:
+
+```rust
+use hyper::HeaderMap;
+use hyper::header::HeaderValue;
+
+let mut trailers = HeaderMap::new();
+trailers.insert("x-checksum", HeaderValue::from_static("abc"));
+
+Response::stream(stream::iter(vec![Ok::<_, Infallible>(Bytes::from_static(b"data"))]))
+    .with_trailers(trailers)
+```
+
+For checked response construction, use `try_status`, `try_header`, `try_append_header`, and
+`try_with_trailers`. The fluent wrappers still exist; invalid values are recorded and rendered as a
+structured `500` at the HTTP boundary instead of panicking or silently disappearing.
+
 ## Middleware
 
 Middleware receives `Request` and `Next`.
@@ -696,6 +725,8 @@ app.get("/events", |_req: Request| {
 ```
 
 The response uses `text/event-stream`, `Cache-Control: no-cache`, and `Connection: keep-alive`.
+Invalid SSE fields terminate the response body with a stream error rather than emitting malformed
+events.
 
 For long-lived streams, `sse_with_heartbeat` emits a `: keep-alive` comment whenever the source stream is idle for the given interval, and `req.last_event_id()` exposes the ID browsers resend when they reconnect:
 
@@ -1056,8 +1087,8 @@ tests/
 
 ## Current Limitations
 
-- Request bodies are fully buffered (configurable limit, 64 KB by default; oversized bodies get `413`).
-- Request streaming is not implemented yet (responses do stream).
+- Request body helpers and body extractors buffer on demand under configurable limits; multipart
+  parsing is still buffered rather than streaming each part.
 - Sessions are in-memory only (single process); use your own store for multi-instance deployments.
 - Rate limiting is in-memory and per process.
 - OpenAPI output covers paths, methods, and path parameters; request/response schemas are not introspected.

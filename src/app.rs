@@ -35,14 +35,14 @@ pub use extract::{
 pub use form::MultipartPart;
 pub use handler::{ErrorHandler, Handler, IntoHandler, IntoMiddleware, Middleware, Next};
 pub use request::{Request, RequestBuilder, RequestParts};
-pub use response::{IntoResponse, Response};
+pub use response::{IntoResponse, Response, ResponseBuildError};
 pub use router::{
     HostPattern, RouteError, RouteErrorKind, RouteHandle, RouteInfo, RouteMatchError,
     RouteMatchErrorKind, RoutePattern, Router,
 };
 pub use server::{App, TrailingSlash};
 pub use session::Sessions;
-pub use sse::SseEvent;
+pub use sse::{SseError, SseEvent};
 pub use state::StateStore;
 pub use testing::{TestClient, TestRequest};
 pub use websocket::{
