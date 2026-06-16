@@ -4,7 +4,7 @@
 use hyper::body::Bytes;
 use serde::Serialize;
 
-use super::{App, HttpError, Request, RequestBuilder, Response};
+use super::{App, Request, RequestBuilder, Response};
 
 /// Drives an [`App`] in-process for tests:
 ///
@@ -12,7 +12,7 @@ use super::{App, HttpError, Request, RequestBuilder, Response};
 /// # use rustrest::{App, Request, Response, TestClient};
 /// # async fn demo() {
 /// let mut app = App::new();
-/// app.get("/ping", |_req: Request| Response::send("pong"));
+/// app.get("/ping", |_req: Request| Response::send("pong")).unwrap();
 ///
 /// let client = TestClient::new(app);
 /// let res = client.get("/ping").send().await;
@@ -98,13 +98,8 @@ impl TestRequest<'_> {
     /// middleware, handler, error handler), honoring the configured body
     /// limit (413) and request timeout (408) like the real server.
     pub async fn send(self) -> Response {
-        let request = self.builder.build();
-        if request.bytes().len() > self.client.app.config.max_body_size {
-            return self
-                .client
-                .app
-                .error_response(HttpError::new(413, "Payload Too Large"));
-        }
+        let body_limit = self.client.app.config.max_body_size;
+        let request = self.builder.body_limit(body_limit).build();
         self.client.app.run_request(request).await
     }
 }

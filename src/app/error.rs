@@ -1,53 +1,217 @@
-use std::fmt::Display;
+use std::borrow::Cow;
+use std::error::Error;
+use std::fmt::{Debug, Display};
+
+use hyper::StatusCode;
+use hyper::header::{HeaderMap, HeaderName, HeaderValue};
 
 use super::Response;
 
-#[derive(Clone, Debug)]
+pub type BoxError = Box<dyn Error + Send + Sync>;
+
+#[derive(Debug, Default)]
+struct HttpErrorDetails {
+    source: Option<BoxError>,
+    headers: HeaderMap,
+}
+
+#[derive(Debug)]
 pub struct HttpError {
-    status: u16,
-    message: String,
+    status: StatusCode,
+    code: Cow<'static, str>,
+    public_message: Cow<'static, str>,
+    details: Box<HttpErrorDetails>,
 }
 
 impl HttpError {
-    pub fn new(status: u16, message: impl Into<String>) -> Self {
+    pub fn new(
+        status: StatusCode,
+        code: impl Into<Cow<'static, str>>,
+        public_message: impl Into<Cow<'static, str>>,
+    ) -> Self {
         Self {
             status,
-            message: message.into(),
+            code: code.into(),
+            public_message: public_message.into(),
+            details: Box::default(),
         }
     }
 
-    pub fn bad_request(message: impl Into<String>) -> Self {
-        Self::new(400, message)
+    pub fn bad_request(public_message: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "bad_request", public_message)
     }
 
-    pub fn unauthorized(message: impl Into<String>) -> Self {
-        Self::new(401, message)
+    pub fn unauthorized(public_message: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(StatusCode::UNAUTHORIZED, "unauthorized", public_message)
     }
 
-    pub fn forbidden(message: impl Into<String>) -> Self {
-        Self::new(403, message)
+    pub fn forbidden(public_message: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, "forbidden", public_message)
     }
 
-    pub fn not_found(message: impl Into<String>) -> Self {
-        Self::new(404, message)
+    pub fn not_found(public_message: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, "not_found", public_message)
     }
 
-    pub fn internal_server_error(message: impl Into<String>) -> Self {
-        Self::new(500, message)
+    pub fn method_not_allowed(public_message: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            public_message,
+        )
     }
 
-    pub fn status(&self) -> u16 {
+    pub fn payload_too_large(public_message: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            public_message,
+        )
+    }
+
+    pub fn payload_too_large_limit(limit: usize) -> Self {
+        Self::payload_too_large(format!(
+            "El cuerpo de la solicitud supera el limite de {limit} bytes"
+        ))
+    }
+
+    pub fn invalid_content_length() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_content_length",
+            "El encabezado Content-Length no es valido",
+        )
+    }
+
+    pub fn body_read(source: BoxError) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "body_read",
+            "No se pudo leer el cuerpo de la solicitud",
+        )
+        .with_source(source)
+    }
+
+    pub fn body_already_consumed() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "body_already_consumed",
+            "El cuerpo de la solicitud ya fue consumido",
+        )
+    }
+
+    pub fn body_not_buffered() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "body_not_buffered",
+            "El cuerpo de la solicitud requiere lectura asincrona",
+        )
+    }
+
+    pub fn invalid_utf8() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_utf8",
+            "El cuerpo de la solicitud no es UTF-8 valido",
+        )
+    }
+
+    pub fn invalid_json() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_json",
+            "El cuerpo de la solicitud no contiene JSON valido",
+        )
+    }
+
+    pub fn request_timeout(public_message: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "request_timeout",
+            public_message,
+        )
+    }
+
+    pub fn too_many_requests(public_message: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_requests",
+            public_message,
+        )
+    }
+
+    pub fn upgrade_required(public_message: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(
+            StatusCode::UPGRADE_REQUIRED,
+            "upgrade_required",
+            public_message,
+        )
+    }
+
+    pub fn internal_server_error(public_message: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_server_error",
+            public_message,
+        )
+    }
+
+    pub fn header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+        self.details.headers.insert(name, value);
+        self
+    }
+
+    pub fn append_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+        self.details.headers.append(name, value);
+        self
+    }
+
+    pub fn with_source<E>(mut self, source: E) -> Self
+    where
+        E: Into<BoxError>,
+    {
+        self.details.source = Some(source.into());
+        self
+    }
+
+    pub fn status(&self) -> StatusCode {
         self.status
     }
 
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    pub fn public_message(&self) -> &str {
+        &self.public_message
+    }
+
+    pub fn headers(&self) -> &HeaderMap {
+        &self.details.headers
+    }
+
+    pub fn source(&self) -> Option<&(dyn Error + Send + Sync + 'static)> {
+        self.details.source.as_deref()
+    }
+
+    #[deprecated(since = "0.3.0", note = "use public_message() instead")]
     pub fn message(&self) -> &str {
-        &self.message
+        self.public_message()
     }
 }
 
 impl Display for HttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} {}", self.status, self.message)
+        write!(f, "{} {}", self.status.as_u16(), self.public_message)
+    }
+}
+
+impl Error for HttpError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.details
+            .source
+            .as_deref()
+            .map(|source| source as &(dyn Error + 'static))
     }
 }
 

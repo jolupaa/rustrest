@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
@@ -7,8 +6,12 @@ use hyper::header::{SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION};
 use hyper::upgrade::OnUpgrade;
 use serde::de::DeserializeOwned;
 
+use super::body::DEFAULT_BODY_LIMIT;
 use super::websocket::ResolvedWebSocketConfig;
-use super::{FromRequest, HttpError, StateStore, WebSocketRuntimeHandle};
+use super::{
+    BodyStream, FromRequest, FromRequestParts, HttpError, RequestBody, StateStore,
+    WebSocketRuntimeHandle,
+};
 
 /// Request data handed to each route handler. Fields are part of the
 /// handler-facing API; some demo handlers ignore them.
@@ -23,8 +26,8 @@ pub struct Request {
     pub query: HashMap<String, Vec<String>>,
     pub headers: HashMap<String, String>,
     pub cookies: HashMap<String, String>,
-    /// Raw request body bytes (binary-safe), capped by the server's body limit.
-    pub(crate) body: Bytes,
+    pub(crate) body: RequestBody,
+    pub(crate) body_limit: usize,
     /// Captured path parameters, e.g. `/users/:id` matching `/users/42`
     /// yields `{"id": "42"}`.
     pub params: HashMap<String, String>,
@@ -32,6 +35,7 @@ pub struct Request {
     pub(crate) websocket_runtime: WebSocketRuntimeHandle,
     pub(crate) resolved_websocket_config: Option<ResolvedWebSocketConfig>,
     pub(crate) state: StateStore,
+    pub(crate) extensions: StateStore,
     pub(crate) upgrade: Option<OnUpgrade>,
     pub(crate) remote_addr: Option<SocketAddr>,
     pub(crate) secure_transport: bool,
@@ -120,6 +124,44 @@ impl Request {
         self.route_pattern.as_deref()
     }
 
+    pub(crate) fn set_body_limit(&mut self, limit: usize) {
+        self.body_limit = limit;
+        self.body.set_default_limit(limit);
+    }
+
+    pub(crate) fn validate_content_length(&self) -> Result<(), HttpError> {
+        let mut content_length: Option<u64> = None;
+
+        for raw_value in self.headers_all("content-length") {
+            for raw_part in raw_value.split(',') {
+                let value = raw_part.trim();
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(HttpError::invalid_content_length());
+                }
+
+                let value = value
+                    .parse::<u64>()
+                    .map_err(|_| HttpError::invalid_content_length())?;
+                match content_length {
+                    Some(previous) if previous != value => {
+                        return Err(HttpError::invalid_content_length());
+                    }
+                    Some(_) => {}
+                    None => content_length = Some(value),
+                }
+            }
+        }
+
+        // Hyper's HTTP/1 parser rejects malformed and conflicting values before
+        // service_fn. This validation covers TestClient and transports that
+        // preserve repeated fields or comma lists for framework-level handling.
+        if content_length.is_some_and(|length| length > self.body_limit as u64) {
+            return Err(HttpError::payload_too_large_limit(self.body_limit));
+        }
+
+        Ok(())
+    }
+
     /// Returns shared application state by type.
     pub fn state<T>(&self) -> Option<std::sync::Arc<T>>
     where
@@ -128,11 +170,39 @@ impl Request {
         self.state.get::<T>()
     }
 
-    pub fn extract<E>(&self) -> Result<E, HttpError>
+    /// Returns request-local extension data by type.
+    pub fn extension<T>(&self) -> Option<std::sync::Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.extensions.get::<T>()
+    }
+
+    /// Stores request-local extension data by type.
+    pub fn insert_extension<T>(&mut self, value: T)
+    where
+        T: Send + Sync + 'static,
+    {
+        self.extensions.insert(value);
+    }
+
+    pub fn parts_mut(&mut self) -> RequestParts<'_> {
+        RequestParts { request: self }
+    }
+
+    pub async fn extract<E>(&mut self) -> Result<E, E::Rejection>
     where
         E: FromRequest,
     {
-        E::from_request(self)
+        E::from_request(self).await
+    }
+
+    pub async fn extract_parts<E>(&mut self) -> Result<E, E::Rejection>
+    where
+        E: FromRequestParts,
+    {
+        let mut parts = self.parts_mut();
+        E::from_request_parts(&mut parts).await
     }
 
     pub fn is_websocket_upgrade(&self) -> bool {
@@ -157,19 +227,122 @@ impl Request {
             && version.trim() == "13"
     }
 
-    /// Returns the raw request body bytes (binary-safe).
-    pub fn bytes(&self) -> &[u8] {
+    /// Returns the request body abstraction.
+    pub fn body(&self) -> &RequestBody {
         &self.body
     }
 
-    /// Returns the request body as a lossy UTF-8 string view.
-    pub fn text(&self) -> Cow<'_, str> {
-        String::from_utf8_lossy(&self.body)
+    /// Returns the mutable request body abstraction.
+    pub fn body_mut(&mut self) -> &mut RequestBody {
+        &mut self.body
     }
 
-    /// Deserializes the request body as JSON into `T`.
-    pub fn json<T: DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
-        serde_json::from_slice(&self.body)
+    /// Takes the one-shot request body stream.
+    pub fn take_body_stream(&mut self) -> Result<BodyStream, HttpError> {
+        self.body.take_stream()
+    }
+
+    /// Collects the request body as binary-safe bytes.
+    pub async fn bytes(&mut self) -> Result<Bytes, HttpError> {
+        self.body.collect(self.body_limit).await
+    }
+
+    /// Collects the request body as strict UTF-8 text.
+    pub async fn text(&mut self) -> Result<String, HttpError> {
+        String::from_utf8(self.bytes().await?.to_vec())
+            .map_err(|error| HttpError::invalid_utf8().with_source(error))
+    }
+
+    /// Collects the request body as lossy UTF-8 text.
+    pub async fn text_lossy(&mut self) -> Result<String, HttpError> {
+        Ok(String::from_utf8_lossy(&self.bytes().await?).into_owned())
+    }
+
+    /// Collects and deserializes the request body as JSON into `T`.
+    pub async fn json<T: DeserializeOwned>(&mut self) -> Result<T, HttpError> {
+        serde_json::from_slice(&self.bytes().await?)
+            .map_err(|error| HttpError::invalid_json().with_source(error))
+    }
+
+    pub(crate) fn buffered_bytes(&self) -> Result<&Bytes, HttpError> {
+        self.body.buffered_bytes()
+    }
+}
+
+pub struct RequestParts<'a> {
+    pub(crate) request: &'a mut Request,
+}
+
+impl RequestParts<'_> {
+    pub fn method(&self) -> &str {
+        &self.request.method
+    }
+
+    pub fn path(&self) -> &str {
+        &self.request.path
+    }
+
+    pub fn raw_query(&self) -> Option<&str> {
+        self.request.raw_query.as_deref()
+    }
+
+    pub fn version(&self) -> hyper::Version {
+        self.request.version
+    }
+
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.request.header(name)
+    }
+
+    pub fn headers_all(&self, name: &str) -> Vec<&str> {
+        self.request.headers_all(name)
+    }
+
+    pub fn cookies(&self) -> &HashMap<String, String> {
+        &self.request.cookies
+    }
+
+    pub fn headers(&self) -> &HashMap<String, String> {
+        &self.request.headers
+    }
+
+    pub fn params(&self) -> &HashMap<String, String> {
+        &self.request.params
+    }
+
+    pub fn state<T>(&self) -> Option<std::sync::Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.request.state::<T>()
+    }
+
+    pub fn extension<T>(&self) -> Option<std::sync::Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.request.extensions.get::<T>()
+    }
+
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        self.request.remote_addr
+    }
+
+    pub fn is_secure(&self) -> bool {
+        self.request.secure_transport
+    }
+
+    pub fn matched_path(&self) -> Option<&str> {
+        self.request.route_pattern.as_deref()
+    }
+
+    pub fn original_uri(&self) -> hyper::Uri {
+        let mut uri = self.request.path.clone();
+        if let Some(query) = &self.request.raw_query {
+            uri.push('?');
+            uri.push_str(query);
+        }
+        uri.parse().unwrap_or_else(|_| hyper::Uri::from_static("/"))
     }
 }
 
@@ -184,8 +357,11 @@ pub struct RequestBuilder {
     headers: Vec<(String, String)>,
     cookies: HashMap<String, String>,
     params: HashMap<String, String>,
+    route_pattern: Option<String>,
     state: StateStore,
+    extensions: StateStore,
     body: Bytes,
+    body_limit: usize,
     remote_addr: Option<SocketAddr>,
     secure_transport: bool,
 }
@@ -200,8 +376,11 @@ impl RequestBuilder {
             headers: Vec::new(),
             cookies: HashMap::new(),
             params: HashMap::new(),
+            route_pattern: None,
             state: StateStore::default(),
+            extensions: StateStore::default(),
             body: Bytes::new(),
+            body_limit: DEFAULT_BODY_LIMIT,
             remote_addr: None,
             secure_transport: false,
         }
@@ -257,8 +436,31 @@ impl RequestBuilder {
         self
     }
 
+    pub fn extension<T>(mut self, value: T) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        self.extensions.insert(value);
+        self
+    }
+
+    pub fn matched_path(self, pattern: &str) -> Self {
+        self.route_pattern(pattern)
+    }
+
+    pub fn route_pattern(mut self, pattern: &str) -> Self {
+        self.route_pattern = Some(pattern.to_string());
+        self
+    }
+
     pub fn body(mut self, body: impl Into<Bytes>) -> Self {
         self.body = body.into();
+        self
+    }
+
+    /// Sets the collection limit used by body-reading request methods.
+    pub fn body_limit(mut self, limit: usize) -> Self {
+        self.body_limit = limit;
         self
     }
 
@@ -303,12 +505,14 @@ impl RequestBuilder {
             query,
             headers,
             cookies,
-            body: self.body,
+            body: RequestBody::buffered(self.body, self.body_limit),
+            body_limit: self.body_limit,
             params: self.params,
-            route_pattern: None,
+            route_pattern: self.route_pattern,
             websocket_runtime: WebSocketRuntimeHandle::local(),
             resolved_websocket_config: None,
             state: self.state,
+            extensions: self.extensions,
             upgrade: None,
             remote_addr: self.remote_addr,
             secure_transport: self.secure_transport,

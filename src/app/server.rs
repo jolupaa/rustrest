@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::FutureExt;
-use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::header::{CONNECTION, COOKIE, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE};
 use hyper::service::service_fn;
@@ -20,17 +19,15 @@ use tokio::net::{TcpListener, ToSocketAddrs};
 use super::router::{MatchedRoute, RouteKind};
 use super::websocket::{header_value_contains_token, is_valid_websocket_key};
 use super::{
-    ErrorHandler, HttpError, IntoHandler, IntoMiddleware, Middleware, Next, Request, Response,
-    RouteHandle, Router, StateStore, WebSocketConfig, WebSocketObserver, WebSocketRuntimeHandle,
-    WsHub,
+    ErrorHandler, HttpError, IntoHandler, IntoMiddleware, Middleware, Next, Request, RequestBody,
+    Response, RouteError, RouteHandle, Router, StateStore, WebSocketConfig, WebSocketObserver,
+    WebSocketRuntimeHandle, WsHub,
 };
 use super::{
     Handler, ResponseBody, allow_header_value, method_not_allowed_handler, not_found_handler,
     options_handler, panic_response, parse_cookies, parse_query,
 };
 
-/// Default maximum request body we will buffer into memory (64 KB).
-const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
 const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) async fn drain_server_connections(
@@ -83,7 +80,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            max_body_size: DEFAULT_MAX_BODY_BYTES,
+            max_body_size: super::body::DEFAULT_BODY_LIMIT,
             request_timeout: None,
             header_read_timeout: None,
             trailing_slash: TrailingSlash::default(),
@@ -188,8 +185,10 @@ impl App {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
     }
 
-    /// Sets the maximum request body size buffered into memory. Requests whose
-    /// body exceeds this return `413 Payload Too Large`. Defaults to 64 KB.
+    /// Sets the hard maximum request body size buffered into memory. Route-level
+    /// limits may lower, but never raise, this ceiling. Requests whose body
+    /// exceeds the effective limit return `413 Payload Too Large`. Defaults to
+    /// 64 KB.
     pub fn max_body_size(&mut self, bytes: usize) -> &mut Self {
         self.config.max_body_size = bytes;
         self
@@ -237,19 +236,38 @@ impl App {
     /// Registers `GET {prefix}/openapi.json` (the OpenAPI document) and
     /// `GET {prefix}` (Swagger UI reading it). The document is a snapshot of
     /// the routes registered so far — call this after registering them.
-    pub fn serve_docs(&mut self, prefix: &str, title: &str, version: &str) {
+    pub fn serve_docs(
+        &mut self,
+        prefix: &str,
+        title: &str,
+        version: &str,
+    ) -> Result<(), RouteError> {
         let prefix = format!("/{}", prefix.trim_matches('/'));
         let spec_url = format!("{}/openapi.json", prefix.trim_end_matches('/'));
         let document = self.openapi(title, version);
         let html = super::openapi::swagger_ui_html(title, &spec_url);
 
-        self.get(&spec_url, move |_req: Request| Response::json(&document));
-        self.get(&prefix, move |_req: Request| {
+        let mut docs = Router::new();
+        let _ = docs.get(&spec_url, move |_req: Request| Response::json(&document))?;
+        let _ = docs.get(&prefix, move |_req: Request| {
             Response::send(html.as_str()).content_type("text/html; charset=utf-8")
-        });
+        })?;
+        self.router.mount("/", docs)
     }
 
-    pub fn get<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
+    pub fn route<H, M>(
+        &mut self,
+        method: hyper::Method,
+        path: &str,
+        handler: H,
+    ) -> Result<RouteHandle<'_>, RouteError>
+    where
+        H: IntoHandler<M>,
+    {
+        self.router.route(method, path, handler)
+    }
+
+    pub fn get<H, M>(&mut self, path: &str, handler: H) -> Result<RouteHandle<'_>, RouteError>
     where
         H: IntoHandler<M>,
     {
@@ -258,71 +276,75 @@ impl App {
 
     // These delegate to the root router and are part of the public API even
     // when a given binary registers its routes through a Router instead.
-    pub fn post<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
+    pub fn post<H, M>(&mut self, path: &str, handler: H) -> Result<RouteHandle<'_>, RouteError>
     where
         H: IntoHandler<M>,
     {
         self.router.post(path, handler)
     }
 
-    pub fn put<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
+    pub fn put<H, M>(&mut self, path: &str, handler: H) -> Result<RouteHandle<'_>, RouteError>
     where
         H: IntoHandler<M>,
     {
         self.router.put(path, handler)
     }
 
-    pub fn delete<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
+    pub fn delete<H, M>(&mut self, path: &str, handler: H) -> Result<RouteHandle<'_>, RouteError>
     where
         H: IntoHandler<M>,
     {
         self.router.delete(path, handler)
     }
 
-    pub fn patch<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
+    pub fn patch<H, M>(&mut self, path: &str, handler: H) -> Result<RouteHandle<'_>, RouteError>
     where
         H: IntoHandler<M>,
     {
         self.router.patch(path, handler)
     }
 
-    pub fn options<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
+    pub fn options<H, M>(&mut self, path: &str, handler: H) -> Result<RouteHandle<'_>, RouteError>
     where
         H: IntoHandler<M>,
     {
         self.router.options(path, handler)
     }
 
-    pub fn head<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
+    pub fn head<H, M>(&mut self, path: &str, handler: H) -> Result<RouteHandle<'_>, RouteError>
     where
         H: IntoHandler<M>,
     {
         self.router.head(path, handler)
     }
 
-    pub fn all<H, M>(&mut self, path: &str, handler: H) -> RouteHandle<'_>
+    pub fn all<H, M>(&mut self, path: &str, handler: H) -> Result<RouteHandle<'_>, RouteError>
     where
         H: IntoHandler<M>,
     {
         self.router.all(path, handler)
     }
 
-    pub fn websocket<F, Fut, O>(&mut self, path: &str, handler: F)
+    pub fn websocket<F, Fut, O>(
+        &mut self,
+        path: &str,
+        handler: F,
+    ) -> Result<RouteHandle<'_>, RouteError>
     where
         F: Fn(super::WebSocket) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = O> + Send + 'static,
         O: super::IntoWebSocketOutput + Send + 'static,
     {
-        self.router.websocket(path, handler);
+        self.router.websocket(path, handler)
     }
 
-    pub fn ws<F, Fut, O>(&mut self, path: &str, handler: F)
+    pub fn ws<F, Fut, O>(&mut self, path: &str, handler: F) -> Result<RouteHandle<'_>, RouteError>
     where
         F: Fn(super::WebSocket) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = O> + Send + 'static,
         O: super::IntoWebSocketOutput + Send + 'static,
     {
-        self.router.ws(path, handler);
+        self.router.ws(path, handler)
     }
 
     /// Like [`App::websocket`], with subprotocols, message size limits, and
@@ -332,31 +354,41 @@ impl App {
         path: &str,
         config: super::WebSocketConfig,
         handler: F,
-    ) where
+    ) -> Result<RouteHandle<'_>, RouteError>
+    where
         F: Fn(super::WebSocket) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = O> + Send + 'static,
         O: super::IntoWebSocketOutput + Send + 'static,
     {
-        self.router.websocket_with(path, config, handler);
+        self.router.websocket_with(path, config, handler)
     }
 
     /// Mounts a router under `prefix` (Express-style sub-routes).
-    pub fn mount(&mut self, prefix: &str, router: Router) {
-        self.router.mount(prefix, router);
+    pub fn mount(&mut self, prefix: &str, router: Router) -> Result<(), RouteError> {
+        self.router.mount(prefix, router)
     }
 
-    pub fn fallback<H, M>(&mut self, handler: H)
+    pub fn fallback<H, M>(&mut self, handler: H) -> Result<RouteHandle<'_>, RouteError>
     where
         H: IntoHandler<M>,
     {
-        self.router.fallback(handler);
+        self.router.fallback(handler)
     }
 
-    pub fn static_files<P>(&mut self, prefix: &str, root: P)
+    pub fn static_files<P>(&mut self, prefix: &str, root: P) -> Result<(), RouteError>
     where
         P: Into<std::path::PathBuf>,
     {
-        self.router.static_files(prefix, root);
+        self.router.static_files(prefix, root)
+    }
+
+    pub fn url_for<K, V, I>(&self, name: &str, params: I) -> Result<String, RouteError>
+    where
+        K: AsRef<str>,
+        V: AsRef<str>,
+        I: IntoIterator<Item = (K, V)>,
+    {
+        self.router.url_for(name, params)
     }
 
     pub fn state<T>(&mut self, value: T)
@@ -481,58 +513,41 @@ impl App {
         Ok(())
     }
 
-    /// Translates a hyper request into a [`Request`] (method, path, query,
-    /// headers, size-bounded body), dispatches it, and converts the result.
+    /// Translates a hyper request into a [`Request`] without consuming its
+    /// body, dispatches it, and converts the result.
     pub(crate) async fn handle(
         &self,
         mut req: hyper::Request<Incoming>,
         remote_addr: Option<SocketAddr>,
         transport_security: TransportSecurity,
     ) -> hyper::Response<ResponseBody> {
-        // Read everything that only needs a borrow before consuming the body.
-        let version = req.version();
-        let method = req.method().as_str().to_string();
-        let path = req.uri().path().to_string();
-        let raw_query = req.uri().query().map(|q| q.to_string());
-        let query = raw_query.as_deref().map(parse_query).unwrap_or_default();
         let upgrade = if is_websocket_upgrade_request(&req) {
             Some(hyper::upgrade::on(&mut req))
         } else {
             None
         };
+        let (parts, body) = req.into_parts();
+        let version = parts.version;
+        let method = parts.method.as_str().to_string();
+        let path = parts.uri.path().to_string();
+        let raw_query = parts.uri.query().map(|q| q.to_string());
+        let query = raw_query.as_deref().map(parse_query).unwrap_or_default();
         // Build a convenience single-value map (last value wins) and a
         // full-fidelity list that preserves duplicate headers.
         let mut headers: HashMap<String, String> = HashMap::new();
         let mut header_pairs: Vec<(String, String)> = Vec::new();
-        for (name, value) in req.headers().iter() {
+        for (name, value) in &parts.headers {
             let name = name.as_str().to_string();
             let value = value.to_str().unwrap_or("").to_string();
             headers.insert(name.clone(), value.clone());
             header_pairs.push((name, value));
         }
-        let cookies = req
-            .headers()
+        let cookies = parts
+            .headers
             .get(COOKIE)
             .and_then(|value| value.to_str().ok())
             .map(parse_cookies)
             .unwrap_or_default();
-
-        // Buffer the body up to the configured limit. On overflow return 413;
-        // on any other read error return 400 (no longer a silent empty body).
-        let body = match Limited::new(req.into_body(), self.config.max_body_size)
-            .collect()
-            .await
-        {
-            Ok(collected) => collected.to_bytes(),
-            Err(err) => {
-                let error = if err.downcast_ref::<LengthLimitError>().is_some() {
-                    HttpError::new(413, "Payload Too Large")
-                } else {
-                    HttpError::bad_request("Could not read request body")
-                };
-                return self.error_response(error).into_hyper();
-            }
-        };
 
         let request = Request {
             version,
@@ -542,12 +557,14 @@ impl App {
             query,
             headers,
             cookies,
-            body,
+            body: RequestBody::incoming(body, self.config.max_body_size),
+            body_limit: self.config.max_body_size,
             params: HashMap::new(),
             route_pattern: None,
             websocket_runtime: self.websocket_runtime.clone(),
             resolved_websocket_config: None,
             state: self.state.clone(),
+            extensions: StateStore::default(),
             upgrade,
             remote_addr,
             secure_transport: transport_security.is_secure(),
@@ -563,17 +580,27 @@ impl App {
         match self.config.request_timeout {
             Some(timeout) => match tokio::time::timeout(timeout, self.dispatch(request)).await {
                 Ok(response) => response,
-                Err(_) => self.error_response(HttpError::new(408, "Request Timeout")),
+                Err(_) => self.error_response(HttpError::request_timeout("Request Timeout")),
             },
             None => self.dispatch(request).await,
         }
     }
 
     /// Builds a response for an error, routing it through the registered
-    /// `error_handler` if one is set, otherwise a default plain-text response.
+    /// `error_handler` if one is set, otherwise a default problem response.
     pub(crate) fn error_response(&self, error: HttpError) -> Response {
         match &self.error_handler {
-            Some(handler) => handler(error),
+            Some(handler) => {
+                let headers = error.headers().clone();
+                let mut response = handler(error);
+                for name in headers.keys() {
+                    response.headers.remove(name);
+                }
+                for (name, value) in &headers {
+                    response.headers.append(name, value.clone());
+                }
+                response
+            }
             None => Response::from_error(error),
         }
     }
@@ -581,36 +608,45 @@ impl App {
     /// Resolves a request that did not directly match a route: auto-serves
     /// HEAD from a matching GET, auto-answers OPTIONS with `Allow`, returns 405
     /// when the path exists for other methods, or falls through to 404.
-    fn resolve_miss(&self, method: &str, path: &str) -> MatchedRoute {
-        let allowed = self.router.allowed_methods(path);
+    fn resolve_miss(
+        &self,
+        method: &str,
+        path: &str,
+        host: Option<&str>,
+    ) -> Result<MatchedRoute, super::RouteMatchError> {
+        let allowed = self.router.allowed_methods(path, host)?;
         if allowed.is_empty() {
-            MatchedRoute {
+            Ok(MatchedRoute {
                 handler: not_found_handler(),
                 middlewares: Vec::new(),
                 params: HashMap::new(),
                 pattern: path.to_string(),
                 kind: RouteKind::Http,
-            }
+                body_limit: None,
+            })
         } else if method == "HEAD" && allowed.iter().any(|m| m == "GET") {
-            self.router
-                .route("GET", path)
-                .expect("GET route present per allowed_methods")
+            Ok(self
+                .router
+                .resolve_method("GET", path, host)?
+                .expect("GET route present per allowed_methods"))
         } else if method == "OPTIONS" {
-            MatchedRoute {
+            Ok(MatchedRoute {
                 handler: options_handler(allow_header_value(&allowed)),
                 middlewares: Vec::new(),
                 params: HashMap::new(),
                 pattern: path.to_string(),
                 kind: RouteKind::Http,
-            }
+                body_limit: None,
+            })
         } else {
-            MatchedRoute {
+            Ok(MatchedRoute {
                 handler: method_not_allowed_handler(allow_header_value(&allowed)),
                 middlewares: Vec::new(),
                 params: HashMap::new(),
                 pattern: path.to_string(),
                 kind: RouteKind::Http,
-            }
+                body_limit: None,
+            })
         }
     }
 
@@ -647,6 +683,7 @@ impl App {
         request.state = self.state.clone();
         request.websocket_runtime = self.websocket_runtime.clone();
         let is_head = request.method == "HEAD";
+        let host = request.header("host").map(str::to_string);
         let matched = match self.trailing_slash_miss(&request) {
             Some(handler) => MatchedRoute {
                 handler,
@@ -654,11 +691,23 @@ impl App {
                 params: HashMap::new(),
                 pattern: request.path.clone(),
                 kind: RouteKind::Http,
+                body_limit: None,
             },
-            None => match self.router.route(&request.method, &request.path) {
-                Some(found) => found,
-                None => self.resolve_miss(&request.method, &request.path),
-            },
+            None => {
+                match self
+                    .router
+                    .resolve_method(&request.method, &request.path, host.as_deref())
+                {
+                    Ok(Some(found)) => found,
+                    Ok(None) => {
+                        match self.resolve_miss(&request.method, &request.path, host.as_deref()) {
+                            Ok(miss) => miss,
+                            Err(error) => return self.error_response(error.into()),
+                        }
+                    }
+                    Err(error) => return self.error_response(error.into()),
+                }
+            }
         };
         let MatchedRoute {
             handler,
@@ -666,7 +715,12 @@ impl App {
             params,
             pattern,
             kind,
+            body_limit,
         } = matched;
+        let effective_body_limit = body_limit
+            .unwrap_or(self.config.max_body_size)
+            .min(self.config.max_body_size);
+        request.set_body_limit(effective_body_limit);
         request.params = params;
         request.route_pattern = Some(pattern);
         request.resolved_websocket_config = match kind {
@@ -678,6 +732,14 @@ impl App {
                 ))
             }
         };
+
+        if let Err(error) = request.validate_content_length() {
+            let mut response = self.error_response(error);
+            if is_head {
+                response.clear_body();
+            }
+            return response;
+        }
 
         // Innermost layer: the matched handler.
         let mut next: Next = Box::new(move |req| (*handler)(req));
@@ -704,8 +766,8 @@ impl App {
             Err(_) => panic_response(),
         };
         if let Some(err) = response.take_error() {
-            if let Some(handler) = &self.error_handler {
-                response = handler(err);
+            if self.error_handler.is_some() {
+                response = self.error_response(err);
             }
         }
         if is_head {

@@ -151,66 +151,82 @@ fn existing_websocket_surface_still_compiles() {
     .into_websocket_handler();
     let admin_hub = hub.clone();
     let admin_runtime = runtime.clone();
-    let _: () = app.websocket("/ws-admin-api", move |socket| {
-        let admin_hub = admin_hub.clone();
-        let admin_runtime = admin_runtime.clone();
-        async move {
-            let local = admin_hub.local_socket(socket.id());
-            if let Some(local) = local {
-                let _: rustrest::WebSocketId = local.id();
-                let _: &str = local.route();
-                let _: Option<std::net::SocketAddr> = local.remote_addr();
-                let _: Option<&str> = local.protocol();
-                let _: std::time::SystemTime = local.opened_at();
-                let _: &[String] = local.rooms();
-                let _: WebSocketLifecycleState = local.lifecycle();
-                let _: Result<(), WsError> = local.send_text("administrado").await;
-                let _: Result<(), WsError> = local.send_event("ready", &true).await;
-                let _: Result<(), WsError> = local.close_with(1000, "finalizado").await;
-                let _: WebSocketCloseInfo = local.closed().await;
+    let _ = app
+        .websocket("/ws-admin-api", move |socket| {
+            let admin_hub = admin_hub.clone();
+            let admin_runtime = admin_runtime.clone();
+            async move {
+                let local = admin_hub.local_socket(socket.id());
+                if let Some(local) = local {
+                    let _: rustrest::WebSocketId = local.id();
+                    let _: &str = local.route();
+                    let _: Option<std::net::SocketAddr> = local.remote_addr();
+                    let _: Option<&str> = local.protocol();
+                    let _: std::time::SystemTime = local.opened_at();
+                    let _: &[String] = local.rooms();
+                    let _: WebSocketLifecycleState = local.lifecycle();
+                    let _: Result<(), WsError> = local.send_text("administrado").await;
+                    let _: Result<(), WsError> = local.send_event("ready", &true).await;
+                    let _: Result<(), WsError> = local.close_with(1000, "finalizado").await;
+                    let _: WebSocketCloseInfo = local.closed().await;
+                }
+                let _: Result<(), WsError> = admin_hub
+                    .disconnect_local(socket.id(), 1008, "no autorizado")
+                    .await;
+                let _snapshot = admin_runtime.connection(socket.id());
+                let _: Result<(), WsError> = admin_runtime
+                    .close(socket.id(), 1008, "no autorizado")
+                    .await;
+                let _: Result<(), WsError> = admin_runtime.shutdown().await;
             }
-            let _: Result<(), WsError> = admin_hub
-                .disconnect_local(socket.id(), 1008, "no autorizado")
-                .await;
-            let _snapshot = admin_runtime.connection(socket.id());
-            let _: Result<(), WsError> = admin_runtime
-                .close(socket.id(), 1008, "no autorizado")
-                .await;
-            let _: Result<(), WsError> = admin_runtime.shutdown().await;
-        }
-    });
-    let _: () = app.websocket("/ws", |_socket| async move {});
-    let _: () = app.websocket("/ws-result", |_socket| async move {
-        Ok::<(), WebSocketError>(())
-    });
-    let _: () = app.websocket("/ws-result-precise", |_socket| async move {
-        Ok::<(), WsError>(())
-    });
+        })
+        .unwrap();
+    let _ = app.websocket("/ws", |_socket| async move {}).unwrap();
+    let _ = app
+        .websocket("/ws-result", |_socket| async move {
+            Ok::<(), WebSocketError>(())
+        })
+        .unwrap();
+    let _ = app
+        .websocket("/ws-result-precise", |_socket| async move {
+            Ok::<(), WsError>(())
+        })
+        .unwrap();
 
-    let _: () = app.ws("/short", |_socket| async move {});
-    let _: () = app.websocket_with(
-        "/configured",
-        WebSocketConfig::new()
-            .protocols(&["chat"])
-            .max_message_size(1024)
-            .ping_interval(Duration::from_secs(30)),
-        |_socket| async move {},
-    );
+    let _ = app.ws("/short", |_socket| async move {}).unwrap();
+    let _ = app
+        .websocket_with(
+            "/configured",
+            WebSocketConfig::new()
+                .protocols(&["chat"])
+                .max_message_size(1024)
+                .ping_interval(Duration::from_secs(30)),
+            |_socket| async move {},
+        )
+        .unwrap();
 
     let mut router = Router::new();
-    let _: () = router.websocket("/nested", |_socket| async move {});
-    let _: () = router.websocket("/nested-result", |_socket| async move {
-        Ok::<(), WebSocketError>(())
-    });
-    let _: () = router.websocket("/nested-result-precise", |_socket| async move {
-        Ok::<(), WsError>(())
-    });
-    let _: () = router.ws("/nested-short", |_socket| async move {});
-    let _: () = router.websocket_with(
-        "/nested-configured",
-        WebSocketConfig::new(),
-        |_socket| async move {},
-    );
+    let _ = router
+        .websocket("/nested", |_socket| async move {})
+        .unwrap();
+    let _ = router
+        .websocket("/nested-result", |_socket| async move {
+            Ok::<(), WebSocketError>(())
+        })
+        .unwrap();
+    let _ = router
+        .websocket("/nested-result-precise", |_socket| async move {
+            Ok::<(), WsError>(())
+        })
+        .unwrap();
+    let _ = router.ws("/nested-short", |_socket| async move {}).unwrap();
+    let _ = router
+        .websocket_with(
+            "/nested-configured",
+            WebSocketConfig::new(),
+            |_socket| async move {},
+        )
+        .unwrap();
 
     let request = Request::builder().path("/ws").build();
     let _response: Response = request.websocket(|_socket| async move {});

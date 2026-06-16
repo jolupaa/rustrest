@@ -114,7 +114,8 @@ async fn next_message(client: &mut TlsWebSocket) -> Message {
 async fn serves_https_with_rustls() {
     let fixture = TlsFixture::new("https");
     let mut app = App::new();
-    app.get("/secure", |_req: Request| Response::send("hola tls"));
+    app.get("/secure", |_req: Request| Response::send("hola tls"))
+        .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(app.serve_tls(listener, fixture.server_config()));
@@ -156,7 +157,8 @@ async fn websocket_tls_negotiates_protocol_and_echoes_text_binary() {
             }
             Ok::<(), WsError>(())
         },
-    );
+    )
+    .unwrap();
     let runtime = app.websocket_runtime();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -213,7 +215,8 @@ async fn websocket_tls_rooms_broadcast_over_wss() {
             }
         }
         Ok::<(), WsError>(())
-    });
+    })
+    .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(app.serve_tls(listener, fixture.server_config()));
@@ -250,7 +253,8 @@ async fn websocket_tls_heartbeat_keeps_connection_alive() {
         |_socket| async move {
             std::future::pending::<()>().await;
         },
-    );
+    )
+    .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(app.serve_tls(listener, fixture.server_config()));
@@ -273,7 +277,8 @@ async fn websocket_tls_shutdown_sends_1001_and_drains_runtime() {
     app.websocket_defaults(WebSocketConfig::new().close_timeout(Duration::from_millis(200)));
     app.websocket("/ws", |_socket| async move {
         std::future::pending::<()>().await;
-    });
+    })
+    .unwrap();
     let runtime = app.websocket_runtime();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

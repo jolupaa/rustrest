@@ -123,7 +123,7 @@ async fn spawn_broker_app(
     app.websocket_hub(hub);
     for path in ["/chat/:channel", "/admin/chat/:channel"] {
         let report_tx = report_tx.clone();
-        app.websocket(path, move |mut socket| {
+        let _ = app.websocket(path, move |mut socket| {
             let report_tx = report_tx.clone();
             async move {
                 while let Some(message) = socket.recv().await.unwrap() {
@@ -249,7 +249,7 @@ async fn websocket_room_broadcast_excludes_sender_and_respects_route_scope() {
     let hub = app.websocket_hub_handle();
     for path in ["/chat/:channel", "/admin/chat/:channel"] {
         let report_tx = report_tx.clone();
-        app.websocket(path, move |mut socket| {
+        let _ = app.websocket(path, move |mut socket| {
             let report_tx = report_tx.clone();
             async move {
                 while let Some(message) = socket.recv().await.unwrap() {
@@ -341,7 +341,7 @@ async fn websocket_room_broadcast_excludes_sender_and_respects_route_scope() {
 async fn websocket_multi_room_deduplicates_local_recipient() {
     let (report_tx, mut report_rx) = tokio::sync::mpsc::unbounded_channel();
     let (addr, _server) = spawn_app(move |app| {
-        app.websocket("/chat/:channel", move |mut socket| {
+        let _ = app.websocket("/chat/:channel", move |mut socket| {
             let report_tx = report_tx.clone();
             async move {
                 while let Some(message) = socket.recv().await.unwrap() {
@@ -518,7 +518,7 @@ async fn websocket_local_administration_sends_disconnects_and_snapshots_rooms() 
     let (id_tx, mut id_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new();
     let hub = app.websocket_hub_handle();
-    app.websocket("/admin/:tenant", move |socket| {
+    let _ = app.websocket("/admin/:tenant", move |socket| {
         let id_tx = id_tx.clone();
         async move {
             socket.join_many(["zeta", "general"]).await.unwrap();
@@ -592,7 +592,7 @@ async fn websocket_runtime_stats_and_observer_record_message_metadata() {
     let handler_release = release.clone();
     let (addr, runtime, _server) = spawn_app_with_runtime(move |app| {
         app.websocket_observer(Arc::new(RecordingObserver(observer_events)));
-        app.websocket_with(
+        let _ = app.websocket_with(
             "/ws",
             WebSocketConfig::new().protocols(&["superchat"]),
             move |mut socket| {
@@ -665,7 +665,7 @@ async fn websocket_runtime_stats_and_observer_record_message_metadata() {
 #[tokio::test]
 async fn websocket_runtime_stats_count_messages_flushed_before_local_close() {
     let (addr, runtime, _server) = spawn_app_with_runtime(|app| {
-        app.websocket("/ws", |socket| async move {
+        let _ = app.websocket("/ws", |socket| async move {
             let (_receiver, sender) = socket.split();
             sender.try_send(Message::Text("antes".into())).unwrap();
             sender.close().await.unwrap();
@@ -704,7 +704,7 @@ async fn websocket_observer_panic_does_not_break_echo() {
 
     let (addr, _server) = spawn_app(|app| {
         app.websocket_observer(Arc::new(PanickingObserver));
-        app.websocket("/ws", |mut socket| async move {
+        let _ = app.websocket("/ws", |mut socket| async move {
             if let Some(message) = socket.recv().await.unwrap() {
                 socket.send(message).await.unwrap();
             }
@@ -788,7 +788,7 @@ async fn websocket_observer_tracing_records_metadata_without_payload() {
     };
     tracing::subscriber::set_global_default(subscriber).unwrap();
     let mut app = App::new();
-    app.websocket("/ws", |mut socket| async move {
+    let _ = app.websocket("/ws", |mut socket| async move {
         if let Some(message) = socket.recv().await.unwrap() {
             socket.send(message).await.unwrap();
         }
@@ -828,7 +828,7 @@ async fn websocket_observer_tracing_records_metadata_without_payload() {
 #[tokio::test]
 async fn websocket_rejects_invalid_version_with_426() {
     let (addr, _server) = spawn_app(|app| {
-        app.websocket("/ws", |_socket| async move {});
+        let _ = app.websocket("/ws", |_socket| async move {});
     })
     .await;
 
@@ -848,7 +848,7 @@ async fn websocket_rejects_invalid_version_with_426() {
 #[tokio::test]
 async fn websocket_rejects_key_that_is_not_sixteen_decoded_bytes() {
     let (addr, _server) = spawn_app(|app| {
-        app.websocket("/ws", |_socket| async move {});
+        let _ = app.websocket("/ws", |_socket| async move {});
     })
     .await;
 
@@ -867,7 +867,7 @@ async fn websocket_rejects_key_that_is_not_sixteen_decoded_bytes() {
 #[tokio::test]
 async fn websocket_rejects_duplicate_key() {
     let (addr, _server) = spawn_app(|app| {
-        app.websocket("/ws", |_socket| async move {});
+        let _ = app.websocket("/ws", |_socket| async move {});
     })
     .await;
 
@@ -887,7 +887,7 @@ async fn websocket_rejects_duplicate_key() {
 #[tokio::test]
 async fn websocket_rejects_duplicate_version() {
     let (addr, _server) = spawn_app(|app| {
-        app.websocket("/ws", |_socket| async move {});
+        let _ = app.websocket("/ws", |_socket| async move {});
     })
     .await;
 
@@ -908,7 +908,7 @@ async fn websocket_rejects_duplicate_version() {
 async fn websocket_process_capacity_rejects_before_101() {
     let (addr, _server) = spawn_app(|app| {
         app.websocket_defaults(WebSocketConfig::new().max_connections(1));
-        app.websocket("/ws", |_socket| async move {
+        let _ = app.websocket("/ws", |_socket| async move {
             std::future::pending::<()>().await;
         });
     })
@@ -932,7 +932,7 @@ async fn websocket_process_capacity_rejects_before_101() {
 #[tokio::test]
 async fn websocket_route_capacity_rejects_before_101() {
     let (addr, _server) = spawn_app(|app| {
-        app.websocket_with(
+        let _ = app.websocket_with(
             "/ws",
             WebSocketConfig::new().max_connections(1),
             |_socket| async move {
@@ -960,7 +960,7 @@ async fn websocket_route_capacity_rejects_before_101() {
 #[tokio::test]
 async fn websocket_ip_capacity_rejects_with_retry_after_before_101() {
     let (addr, _server) = spawn_app(|app| {
-        app.websocket_with(
+        let _ = app.websocket_with(
             "/ws",
             WebSocketConfig::new().max_connections_per_ip(1),
             |_socket| async move {
@@ -989,7 +989,7 @@ async fn websocket_ip_capacity_rejects_with_retry_after_before_101() {
 #[tokio::test]
 async fn websocket_routes_exchange_messages_and_events() {
     let mut app = App::new();
-    app.websocket("/ws", |mut socket| async move {
+    let _ = app.websocket("/ws", |mut socket| async move {
         while let Some(message) = socket.recv().await.unwrap() {
             if message.is_text() {
                 let text = message.into_text().unwrap().to_string();
@@ -1038,7 +1038,7 @@ async fn websocket_config_negotiates_protocol_pings_and_limits_message_size() {
         .ping_interval(Duration::from_millis(100))
         .pong_timeout(Duration::from_millis(50))
         .max_message_size(1024);
-    app.websocket_with("/ws", config, |mut socket| async move {
+    let _ = app.websocket_with("/ws", config, |mut socket| async move {
         let protocol = socket.protocol().unwrap_or("none").to_string();
         while let Ok(Some(message)) = socket.recv().await {
             if message.is_text() {
@@ -1112,7 +1112,7 @@ async fn websocket_config_negotiates_protocol_pings_and_limits_message_size() {
 #[tokio::test]
 async fn websocket_sender_progresses_independently() {
     let (addr, _server) = spawn_app(|app| {
-        app.websocket("/ws", |socket| async move {
+        let _ = app.websocket("/ws", |socket| async move {
             let (_receiver, sender) = socket.split();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1142,7 +1142,7 @@ async fn websocket_sender_survives_a_dropped_receiver() {
     let handler_gate = send_gate.clone();
     let (addr, _server) = spawn_app(move |app| {
         let handler_gate = handler_gate.clone();
-        app.websocket("/ws", move |socket| {
+        let _ = app.websocket("/ws", move |socket| {
             let handler_gate = handler_gate.clone();
             let ready_tx = ready_tx.clone();
             async move {
@@ -1180,7 +1180,7 @@ async fn websocket_sender_survives_a_dropped_receiver() {
 async fn websocket_control_frames_remain_visible_to_recv() {
     let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
     let (addr, _server) = spawn_app(move |app| {
-        app.websocket("/ws", move |mut socket| {
+        let _ = app.websocket("/ws", move |mut socket| {
             let seen_tx = seen_tx.clone();
             async move {
                 while let Some(message) = socket.recv().await.unwrap() {
@@ -1240,7 +1240,7 @@ async fn websocket_runtime_releases_permit_after_handler_completion() {
     let handler_release = release.clone();
     let (addr, runtime, _server) = spawn_app_with_runtime(move |app| {
         let handler_release = handler_release.clone();
-        app.websocket("/ws", move |_socket| {
+        let _ = app.websocket("/ws", move |_socket| {
             let handler_release = handler_release.clone();
             async move {
                 handler_release.acquire().await.unwrap().forget();
@@ -1267,7 +1267,7 @@ async fn websocket_runtime_releases_permit_after_handler_completion() {
 #[tokio::test]
 async fn websocket_runtime_releases_permit_after_transport_close() {
     let (addr, runtime, _server) = spawn_app_with_runtime(|app| {
-        app.websocket("/ws", |_socket| async move {
+        let _ = app.websocket("/ws", |_socket| async move {
             std::future::pending::<()>().await;
         });
     })
@@ -1291,7 +1291,7 @@ async fn websocket_observer_records_queue_saturation_for_slow_consumer() {
     let observer_events = observations.clone();
     let (addr, runtime, _server) = spawn_app_with_runtime(move |app| {
         app.websocket_observer(Arc::new(RecordingObserver(observer_events)));
-        app.websocket_with(
+        let _ = app.websocket_with(
             "/ws",
             WebSocketConfig::new()
                 .outbound_capacity(1)
@@ -1375,7 +1375,7 @@ async fn receive_close_frame(
 #[tokio::test]
 async fn websocket_heartbeat_ping_does_not_require_handler_recv() {
     let (addr, _server) = spawn_app(|app| {
-        app.websocket_with(
+        let _ = app.websocket_with(
             "/ws",
             WebSocketConfig::new()
                 .ping_interval(Duration::from_millis(80))
@@ -1402,7 +1402,7 @@ async fn websocket_heartbeat_ping_does_not_require_handler_recv() {
 #[tokio::test]
 async fn websocket_heartbeat_matching_pong_keeps_connection_alive() {
     let (addr, _server) = spawn_app(|app| {
-        app.websocket_with(
+        let _ = app.websocket_with(
             "/ws",
             WebSocketConfig::new()
                 .ping_interval(Duration::from_millis(80))
@@ -1443,7 +1443,7 @@ async fn websocket_observer_records_heartbeat_timeout() {
     let observer_events = observations.clone();
     let (addr, runtime, _server) = spawn_app_with_runtime(move |app| {
         app.websocket_observer(Arc::new(RecordingObserver(observer_events)));
-        app.websocket_with(
+        let _ = app.websocket_with(
             "/ws",
             WebSocketConfig::new()
                 .ping_interval(Duration::from_millis(80))
@@ -1480,7 +1480,7 @@ async fn websocket_observer_records_heartbeat_timeout() {
 #[tokio::test]
 async fn websocket_close_idle_timeout_uses_1001() {
     let (addr, _server) = spawn_app(|app| {
-        app.websocket_with(
+        let _ = app.websocket_with(
             "/ws",
             WebSocketConfig::new()
                 .disable_ping()
@@ -1501,7 +1501,7 @@ async fn websocket_close_idle_timeout_uses_1001() {
 #[tokio::test]
 async fn websocket_close_lifetime_expires_while_messages_flow() {
     let (addr, _server) = spawn_app(|app| {
-        app.websocket_with(
+        let _ = app.websocket_with(
             "/ws",
             WebSocketConfig::new()
                 .disable_ping()
@@ -1529,7 +1529,7 @@ async fn websocket_close_handshake_reports_clean_local_close() {
     let (close_tx, mut close_rx) = tokio::sync::mpsc::unbounded_channel();
     let (addr, _server) = spawn_app(move |app| {
         let close_tx = close_tx.clone();
-        app.websocket("/ws", move |mut socket| {
+        let _ = app.websocket("/ws", move |mut socket| {
             let close_tx = close_tx.clone();
             async move {
                 socket.close_with(1000, "finalizado").await.unwrap();
@@ -1562,7 +1562,7 @@ async fn websocket_close_rejects_control_sends_after_closing_starts() {
     let (late_send_tx, mut late_send_rx) = tokio::sync::mpsc::unbounded_channel();
     let (addr, _server) = spawn_app(move |app| {
         let late_send_tx = late_send_tx.clone();
-        app.websocket("/ws", move |socket| {
+        let _ = app.websocket("/ws", move |socket| {
             let late_send_tx = late_send_tx.clone();
             async move {
                 let (_receiver, sender) = socket.split();
@@ -1589,7 +1589,7 @@ async fn websocket_close_rejects_control_sends_after_closing_starts() {
 #[tokio::test]
 async fn websocket_slow_consumer_closes_with_1013() {
     let (addr, _server) = spawn_app(|app| {
-        app.websocket_with(
+        let _ = app.websocket_with(
             "/ws",
             WebSocketConfig::new()
                 .disable_ping()
@@ -1619,7 +1619,7 @@ async fn websocket_close_waits_for_peer_after_handler_returns() {
     let (requested_tx, mut requested_rx) = tokio::sync::mpsc::unbounded_channel();
     let (addr, runtime, _server) = spawn_app_with_runtime(move |app| {
         let requested_tx = requested_tx.clone();
-        app.websocket_with(
+        let _ = app.websocket_with(
             "/ws",
             WebSocketConfig::new().close_timeout(Duration::from_millis(200)),
             move |socket| {
@@ -1658,7 +1658,7 @@ async fn websocket_observer_records_handler_panic_and_isolates_connection() {
     let (addr, _server) = spawn_app(move |app| {
         app.websocket_observer(Arc::new(RecordingObserver(observer_events)));
         let handler_attempts = handler_attempts.clone();
-        app.websocket("/ws", move |mut socket| {
+        let _ = app.websocket("/ws", move |mut socket| {
             let attempt = handler_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async move {
                 if attempt == 0 {
@@ -1704,7 +1704,7 @@ async fn websocket_observer_records_handler_panic_and_isolates_connection() {
 #[tokio::test]
 async fn websocket_handler_completion_closes_with_1000() {
     let (addr, _server) = spawn_app(|app| {
-        app.websocket("/ws", |_socket| async move {});
+        let _ = app.websocket("/ws", |_socket| async move {});
     })
     .await;
     let (mut client, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
@@ -1718,7 +1718,7 @@ async fn websocket_handler_completion_closes_with_1000() {
 #[tokio::test]
 async fn websocket_handler_background_sender_outlives_handler() {
     let (addr, _server) = spawn_app(|app| {
-        app.websocket("/ws", |socket| async move {
+        let _ = app.websocket("/ws", |socket| async move {
             let (_receiver, sender) = socket.split();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1746,7 +1746,7 @@ async fn websocket_message_rate_overflow_closes_with_1008() {
     let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
     let (addr, _server) = spawn_app(move |app| {
         let received_tx = received_tx.clone();
-        app.websocket_with(
+        let _ = app.websocket_with(
             "/ws",
             WebSocketConfig::new().message_rate_limit(2, Duration::from_secs(1)),
             move |mut socket| {
@@ -1784,7 +1784,7 @@ async fn websocket_message_rate_resets_after_window_rollover() {
     let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
     let (addr, _server) = spawn_app(move |app| {
         let received_tx = received_tx.clone();
-        app.websocket_with(
+        let _ = app.websocket_with(
             "/ws",
             WebSocketConfig::new().message_rate_limit(1, Duration::from_millis(40)),
             move |mut socket| {
@@ -1821,7 +1821,7 @@ async fn websocket_message_rate_resets_after_window_rollover() {
 async fn websocket_shutdown_sends_1001_and_drains_cooperative_client() {
     let mut app = App::new();
     app.websocket_defaults(WebSocketConfig::new().close_timeout(Duration::from_millis(200)));
-    app.websocket("/ws", |_socket| async move {
+    let _ = app.websocket("/ws", |_socket| async move {
         std::future::pending::<()>().await;
     });
     let runtime = app.websocket_runtime();
@@ -1864,7 +1864,7 @@ async fn websocket_shutdown_waits_for_uncooperative_client_close_timeout() {
     let close_timeout = Duration::from_millis(150);
     let mut app = App::new();
     app.websocket_defaults(WebSocketConfig::new().close_timeout(close_timeout));
-    app.websocket("/ws", |_socket| async move {
+    let _ = app.websocket("/ws", |_socket| async move {
         std::future::pending::<()>().await;
     });
     let runtime = app.websocket_runtime();
@@ -1896,7 +1896,7 @@ async fn websocket_shutdown_waits_for_uncooperative_client_close_timeout() {
 #[tokio::test]
 async fn websocket_runtime_close_targets_one_connection_and_reports_missing_id() {
     let (addr, runtime, _server) = spawn_app_with_runtime(|app| {
-        app.websocket("/ws", |_socket| async move {
+        let _ = app.websocket("/ws", |_socket| async move {
             std::future::pending::<()>().await;
         });
     })
@@ -1932,7 +1932,7 @@ async fn websocket_runtime_close_targets_one_connection_and_reports_missing_id()
 async fn websocket_runtime_shutdown_drains_and_rejects_future_upgrades() {
     let (addr, runtime, _server) = spawn_app_with_runtime(|app| {
         app.websocket_defaults(WebSocketConfig::new().close_timeout(Duration::from_millis(200)));
-        app.websocket("/ws", |_socket| async move {
+        let _ = app.websocket("/ws", |_socket| async move {
             std::future::pending::<()>().await;
         });
     })

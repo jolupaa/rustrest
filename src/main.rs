@@ -22,18 +22,19 @@ async fn main() -> std::io::Result<()> {
     });
 
     // Root route (synchronous handler).
-    app.get("/", |_req: Request| {
-        if let Some(user) = _req.params.get("user") {
+    app.get("/", |mut req: Request| async move {
+        if let Some(user) = req.params.get("user") {
             Response::send(format!("Hola {}", user).as_str())
         } else {
-            let body: HashMap<String, String> = _req.json().unwrap();
+            let body: HashMap<String, String> = req.json().await.unwrap_or_default();
             Response::send(body.get("Hola").unwrap_or(&"tonto".to_string()).as_str())
         }
-    });
+    })
+    .unwrap();
 
     // Routes and sub-routes organized in files: `api` mounts `users`.
     // Result: /api/users, /api/users/:id, ...
-    app.mount("/api", api::router());
+    app.mount("/api", api::router()).unwrap();
 
     app.listen("127.0.0.1:3000").await
 }

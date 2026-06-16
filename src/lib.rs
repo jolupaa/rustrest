@@ -11,13 +11,14 @@
 //!
 //!     app.get("/", |_req: Request| {
 //!         Response::send("Hello from RustRest")
-//!     });
+//!     }).unwrap();
 //!
 //!     app.listen("127.0.0.1:3000").await
 //! }
 //! ```
 //!
 //! The [`app`] module is also available with the framework's public core types.
+//! See `docs/migrations/0.2-to-0.3.md` in the repository for the 0.3 migration guide.
 #![forbid(unsafe_code)]
 
 pub mod app;
@@ -25,11 +26,14 @@ pub mod app;
 #[cfg(feature = "tls")]
 pub use app::tls;
 pub use app::{
-    App, BackpressurePolicy, Cookie, Cookies, ErrorHandler, Form, FromRequest, Handler, Headers,
-    HttpError, InMemoryWsBroker, IntoHandler, IntoHttpError, IntoMiddleware, IntoResponse,
-    IntoWebSocketHandler, IntoWebSocketOutput, Json, Middleware, MultipartPart, Next, OriginPolicy,
-    Path, Query, Request, RequestBuilder, Response, RouteHandle, RouteInfo, Router, SameSite,
-    Sessions, SseEvent, State, StateStore, TestClient, TestRequest, TrailingSlash, WebSocket,
+    App, BackpressurePolicy, BodyStream, BoxError, ConnectInfo, Cookie, Cookies, ErrorHandler,
+    Extension, Form, FromRequest, FromRequestParts, Handler, Headers, HostPattern, HttpError,
+    InMemoryWsBroker, IntoHandler, IntoHttpError, IntoMiddleware, IntoResponse,
+    IntoWebSocketHandler, IntoWebSocketOutput, Json, MatchedPath, Middleware, MultipartPart, Next,
+    OriginPolicy, OriginalUri, Path, Query, Request, RequestBody, RequestBuilder, RequestParts,
+    Response, ResponseBuildError, RouteError, RouteErrorKind, RouteHandle, RouteInfo,
+    RouteMatchError, RouteMatchErrorKind, RoutePattern, Router, SameSite, Sessions, SseError,
+    SseEvent, State, StateStore, TestClient, TestRequest, TrailingSlash, TypedHeader, WebSocket,
     WebSocketCapacityError, WebSocketCloseInfo, WebSocketCloseInitiator, WebSocketConfig,
     WebSocketConnectionSnapshot, WebSocketError, WebSocketErrorCategory, WebSocketEvent,
     WebSocketHandler, WebSocketId, WebSocketLifecycleState, WebSocketMessage, WebSocketObservation,

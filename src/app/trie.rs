@@ -52,7 +52,17 @@ impl RouteIndex {
     /// Returns the registration index of the best route for `method` + path
     /// segments, or `None` when nothing matches.
     pub(crate) fn find(&self, method: &str, segments: &[&str]) -> Option<usize> {
-        find_in(&self.root, method, segments)
+        self.find_candidates(method, segments).into_iter().next()
+    }
+
+    /// Returns every structurally matching route for `method` + path segments
+    /// in route-precedence order: static branches before params before
+    /// wildcards; exact method entries before `all()`; registration order for
+    /// ties within the same branch.
+    pub(crate) fn find_candidates(&self, method: &str, segments: &[&str]) -> Vec<usize> {
+        let mut found = Vec::new();
+        collect_candidates(&self.root, method, segments, &mut found);
+        found
     }
 
     /// Returns `(registration index, method)` for every route whose pattern
@@ -66,29 +76,35 @@ impl RouteIndex {
     }
 }
 
-fn find_in(node: &Node, method: &str, segments: &[&str]) -> Option<usize> {
+fn collect_candidates(node: &Node, method: &str, segments: &[&str], found: &mut Vec<usize>) {
     match segments.split_first() {
-        None => pick(&node.terminals, method).or_else(|| pick(&node.wildcards, method)),
-        Some((head, rest)) => node
-            .statics
-            .get(*head)
-            .and_then(|child| find_in(child, method, rest))
-            .or_else(|| {
-                node.param
-                    .as_deref()
-                    .and_then(|child| find_in(child, method, rest))
-            })
-            .or_else(|| pick(&node.wildcards, method)),
+        None => {
+            push_matching(&node.terminals, method, found);
+            push_matching(&node.wildcards, method, found);
+        }
+        Some((head, rest)) => {
+            if let Some(child) = node.statics.get(*head) {
+                collect_candidates(child, method, rest, found);
+            }
+            if let Some(child) = node.param.as_deref() {
+                collect_candidates(child, method, rest, found);
+            }
+            push_matching(&node.wildcards, method, found);
+        }
     }
 }
 
-/// First entry registered for exactly `method`, falling back to `all()`.
-fn pick(entries: &[(String, usize)], method: &str) -> Option<usize> {
-    entries
-        .iter()
-        .find(|(m, _)| m == method)
-        .or_else(|| entries.iter().find(|(m, _)| m == METHOD_ALL))
-        .map(|(_, index)| *index)
+fn push_matching(entries: &[(String, usize)], method: &str, found: &mut Vec<usize>) {
+    for (entry_method, index) in entries {
+        if entry_method == method {
+            found.push(*index);
+        }
+    }
+    for (entry_method, index) in entries {
+        if entry_method == METHOD_ALL {
+            found.push(*index);
+        }
+    }
 }
 
 fn collect_methods(node: &Node, segments: &[&str], found: &mut Vec<(usize, String)>) {

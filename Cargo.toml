@@ -1,12 +1,14 @@
 [package]
 name = "rustrest"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A minimal Express-style HTTP framework for Rust, built on hyper and tokio."
 license = "MIT"
 readme = "README.md"
 documentation = "https://docs.rs/rustrest"
+repository = "https://github.com/jolupaa/rustrest"
+homepage = "https://github.com/jolupaa/rustrest"
 keywords = ["http", "web", "framework", "hyper", "tokio"]
 categories = ["web-programming::http-server", "network-programming"]
 exclude = ["AGENTS.md", "CLAUDE.md"]
@@ -14,8 +16,29 @@ exclude = ["AGENTS.md", "CLAUDE.md"]
 [features]
 default = []
 brotli = ["dep:brotli"]
+compression = []
+full = [
+    "brotli",
+    "compression",
+    "metrics",
+    "multipart",
+    "openapi",
+    "sessions",
+    "sse",
+    "static-files",
+    "tls",
+    "tracing",
+    "websocket",
+]
+metrics = []
+multipart = []
+openapi = []
+sessions = []
+sse = []
+static-files = []
 tracing = ["dep:tracing"]
 tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
+websocket = []
 
 [dependencies]
 brotli = { version = "7", optional = true }
@@ -53,6 +76,8 @@ hmac = "0.12"
 sha2 = "0.10"
 httpdate = "1"
 tokio-tungstenite = "0.29"
+percent-encoding = "2"
+headers = "0.4"
 
 [dev-dependencies]
 rcgen = "0.13"

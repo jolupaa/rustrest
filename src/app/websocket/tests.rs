@@ -1,4 +1,5 @@
 use futures_util::StreamExt;
+use hyper::StatusCode;
 use hyper::header::SEC_WEBSOCKET_ACCEPT;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -333,7 +334,7 @@ fn handshake_request() -> RequestBuilder {
     handshake_request_without_host().header("host", "localhost")
 }
 
-fn assert_websocket_error_status(req: &Request, expected: u16) {
+fn assert_websocket_error_status(req: &Request, expected: StatusCode) {
     let error = Response::websocket(req)
         .err()
         .expect("the handshake should be rejected");
@@ -397,13 +398,13 @@ fn websocket_handshake_parses_upgrade_headers_as_tokens() {
 #[test]
 fn websocket_handshake_requires_one_non_empty_host() {
     let missing = handshake_request_without_host().build();
-    assert_websocket_error_status(&missing, 400);
+    assert_websocket_error_status(&missing, StatusCode::BAD_REQUEST);
 
     let empty = handshake_request_without_host().header("host", "").build();
-    assert_websocket_error_status(&empty, 400);
+    assert_websocket_error_status(&empty, StatusCode::BAD_REQUEST);
 
     let duplicate = handshake_request().header("host", "example.com").build();
-    assert_websocket_error_status(&duplicate, 400);
+    assert_websocket_error_status(&duplicate, StatusCode::BAD_REQUEST);
 }
 
 #[test]
@@ -412,7 +413,7 @@ fn websocket_handshake_rejects_duplicate_key() {
         .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
         .build();
 
-    assert_websocket_error_status(&req, 400);
+    assert_websocket_error_status(&req, StatusCode::BAD_REQUEST);
 }
 
 #[test]
@@ -421,7 +422,7 @@ fn websocket_handshake_rejects_duplicate_version() {
         .header("sec-websocket-version", "13")
         .build();
 
-    assert_websocket_error_status(&req, 400);
+    assert_websocket_error_status(&req, StatusCode::BAD_REQUEST);
 }
 
 #[test]
@@ -431,7 +432,7 @@ fn websocket_handshake_rejects_duplicate_origin() {
         .header("origin", "https://app.example.com")
         .build();
 
-    assert_websocket_error_status(&req, 400);
+    assert_websocket_error_status(&req, StatusCode::BAD_REQUEST);
 }
 
 #[test]
@@ -867,15 +868,21 @@ async fn websocket_broadcast_report_represents_every_partial_outcome() {
 
 #[test]
 fn websocket_admission_errors_map_before_upgrade() {
-    for error in [
-        AdmissionError::Shutdown,
-        AdmissionError::ProcessCapacity,
-        AdmissionError::RouteCapacity,
+    for (error, code) in [
+        (AdmissionError::Shutdown, "websocket_shutdown"),
+        (
+            AdmissionError::ProcessCapacity,
+            "websocket_process_capacity",
+        ),
+        (AdmissionError::RouteCapacity, "websocket_route_capacity"),
     ] {
-        assert_eq!(error.into_response().status, 503);
+        let error = error.into_http_error();
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code(), code);
     }
 
-    let response = AdmissionError::IpCapacity.into_response();
-    assert_eq!(response.status, 429);
-    assert_eq!(response.headers.get("retry-after").unwrap(), "1");
+    let error = AdmissionError::IpCapacity.into_http_error();
+    assert_eq!(error.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(error.code(), "websocket_ip_capacity");
+    assert_eq!(error.headers().get("retry-after").unwrap(), "1");
 }

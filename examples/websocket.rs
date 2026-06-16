@@ -54,7 +54,7 @@ async fn main() -> std::io::Result<()> {
         .max_rooms_per_connection(32)
         .max_room_name_bytes(128);
 
-    app.websocket_with("/chat/:channel", chat_config, |mut socket| async move {
+    let _ = app.websocket_with("/chat/:channel", chat_config, |mut socket| async move {
         let Some(join) = socket.recv_event::<String>().await? else {
             return Ok::<(), WsError>(());
         };
@@ -110,7 +110,7 @@ async fn main() -> std::io::Result<()> {
         Ok::<(), WsError>(())
     });
 
-    app.websocket_with(
+    let _ = app.websocket_with(
         "/autobahn",
         WebSocketConfig::new()
             .max_message_size(64 * 1024 * 1024)
@@ -133,7 +133,7 @@ async fn main() -> std::io::Result<()> {
         },
     );
 
-    app.websocket_with(
+    let _ = app.websocket_with(
         "/load",
         WebSocketConfig::new()
             .max_connections(12_000)
@@ -155,7 +155,7 @@ async fn main() -> std::io::Result<()> {
         },
     );
 
-    app.get("/", |_req| {
+    let _ = app.get("/", |_req: Request| {
         Response::send(
             r##"<!doctype html>
 <html lang="es">

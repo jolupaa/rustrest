@@ -4,7 +4,7 @@ RustRest is a minimal Express-style HTTP framework for Rust, built on top of `hy
 
 The goal is to provide a small, direct, easy-to-understand API for building HTTP servers and APIs without hiding the transport layer completely. RustRest includes routes, mountable routers, onion-style middleware, typed extractors, shared state, JSON responses, static files, SSE, cookies, redirects, and WebSocket routes.
 
-> Status: `0.2.0`. The API is still evolving. It is best suited for learning, prototyping, and controlled framework development.
+> Status: `0.3.0`. The API is still evolving. It is best suited for learning, prototyping, and controlled framework development.
 
 ## Features
 
@@ -12,6 +12,7 @@ The goal is to provide a small, direct, easy-to-understand API for building HTTP
 - Synchronous and asynchronous handlers.
 - Route helpers for `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`, and `HEAD`.
 - Trie-indexed routing (O(path length)) where static segments beat `:params` and `:params` beat `*wildcards`, with backtracking.
+- Validated route registration with named routes (`url_for`), strict percent-decoded params, and optional host constraints.
 - Automatic `405 Method Not Allowed` (+`Allow`), auto-`HEAD` from `GET`, and auto-`OPTIONS`.
 - Mountable `Router` with nested prefixes.
 - Route parameters with `:id` and wildcards with `*path`.
@@ -21,13 +22,13 @@ The goal is to provide a small, direct, easy-to-understand API for building HTTP
 - Router guards; app and router fallbacks.
 - Graceful shutdown (`listen_with_shutdown` / `serve_with_shutdown`) and a panic-proof accept loop.
 - Configurable body limit (413), request timeout (408), and header-read timeout.
-- Binary-safe request bodies: `req.bytes()`, `req.text()`, `req.json::<T>()`, `req.form::<T>()`, and `req.multipart()`.
+- Streaming, binary-safe request bodies with async `bytes`, strict `text`, JSON, form, and multipart helpers.
 - Client address via `req.remote_addr()`; duplicate headers via `req.headers_all()`.
 - Parsed query strings; request and response cookies (plus a `Cookie` builder with `SameSite`/`Secure`/`Max-Age`).
 - Signed values (HMAC-SHA256) and a minimal in-memory `Sessions` middleware.
 - `Result<Response, HttpError>` handlers and a global error handler that also formats 404/405.
 - Typed shared state.
-- Extractors: `Json<T>`, `Form<T>`, `Path<T>` (structs or scalars), `Query<T>`, `State<T>`, `Cookies<T>`, `Headers<T>`, `Bytes`, `String`, plus `Option`/`Result` wrappers.
+- Async extractors: `Json<T>`, `Form<T>`, `Path<T>` (structs or scalars), `Query<T>`, `State<T>`, `Cookies<T>`, `Headers<T>`, `MatchedPath`, `TypedHeader<T>`, `Bytes`, `String`, plus `Option`/`Result` wrappers.
 - Static files with streaming bodies, `ETag`/`Last-Modified` (304), and `Range` (206) support.
 - Response streaming and Server-Sent Events, with a heartbeat helper (`Response::sse_with_heartbeat`) and `req.last_event_id()` for resumption.
 - WebSocket routes with frame send/receive helpers and `{ "event": ..., "data": ... }` JSON envelopes.
@@ -63,7 +64,7 @@ After the crate is published:
 
 ```toml
 [dependencies]
-rustrest = "0.2"
+rustrest = "0.3"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
@@ -72,16 +73,26 @@ RustRest uses Rust edition 2024 and requires Rust `1.85` or newer.
 
 ### Cargo features
 
-All optional, disabled by default:
+All optional, disabled by default. The feature names introduced in `0.3.0` are mostly compatibility
+markers for the upcoming modularization work; current default source compatibility is preserved.
 
-| Feature   | Adds                                                                  |
-| --------- | --------------------------------------------------------------------- |
-| `tls`     | HTTPS via rustls: `app.listen_tls(...)` + `rustrest::tls::config_from_pem` |
-| `tracing` | `middleware::trace()` emitting structured spans/events per request    |
-| `brotli`  | Brotli as the preferred encoding in `middleware::compression()`       |
+| Feature        | Adds / marks                                                         |
+| -------------- | -------------------------------------------------------------------- |
+| `tls`          | HTTPS via rustls: `app.listen_tls(...)` + `rustrest::tls::config_from_pem` |
+| `tracing`      | `middleware::trace()` emitting structured spans/events per request   |
+| `brotli`       | Brotli support in `middleware::compression()`                        |
+| `compression`  | Compression middleware surface                                       |
+| `multipart`    | Multipart request parsing surface                                    |
+| `static-files` | Static file serving surface                                          |
+| `sse`          | Server-Sent Events surface                                           |
+| `websocket`    | WebSocket surface                                                    |
+| `openapi`      | OpenAPI and docs routes surface                                      |
+| `sessions`     | Signed values and in-memory sessions surface                         |
+| `metrics`      | Reserved for upcoming metrics/observability work                     |
+| `full`         | Enables all named feature flags plus optional integrations           |
 
 ```toml
-rustrest = { version = "0.2", features = ["tls", "tracing"] }
+rustrest = { version = "0.3", features = ["tls", "tracing"] }
 ```
 
 ## Quick Start
@@ -95,12 +106,12 @@ async fn main() -> std::io::Result<()> {
 
     app.get("/", |_req: Request| {
         Response::send("Hello from RustRest")
-    });
+    }).unwrap();
 
     app.get("/users/:id", |req: Request| {
         let id = req.param("id").unwrap_or("?");
         Response::send(&format!("Requested user: {}", id))
-    });
+    }).unwrap();
 
     app.listen("127.0.0.1:3000").await
 }
@@ -154,24 +165,28 @@ Request flow:
 
 ## Routes
 
+Route registration returns `Result<RouteHandle, RouteError>` so invalid patterns,
+duplicate/conflicting routes, duplicate names, and invalid host constraints fail
+at startup instead of becoming runtime surprises.
+
 ```rust
 let mut app = App::new();
 
-app.get("/", |_req: Request| Response::send("home"));
-app.post("/users", |_req: Request| Response::send("create"));
-app.put("/users/:id", |_req: Request| Response::send("update"));
-app.patch("/users/:id", |_req: Request| Response::send("patch"));
-app.delete("/users/:id", |_req: Request| Response::send("delete"));
-app.options("/users", |_req: Request| Response::send("options"));
-app.head("/health", |_req: Request| Response::send("ok"));
-app.all("/any", |_req: Request| Response::send("any method"));
+app.get("/", |_req: Request| Response::send("home")).unwrap();
+app.post("/users", |_req: Request| Response::send("create")).unwrap();
+app.put("/users/:id", |_req: Request| Response::send("update")).unwrap();
+app.patch("/users/:id", |_req: Request| Response::send("patch")).unwrap();
+app.delete("/users/:id", |_req: Request| Response::send("delete")).unwrap();
+app.options("/users", |_req: Request| Response::send("options")).unwrap();
+app.head("/health", |_req: Request| Response::send("ok")).unwrap();
+app.all("/any", |_req: Request| Response::send("any method")).unwrap();
 ```
 
 Matching prefers the most specific pattern regardless of registration order: static segments beat `:params`, `:params` beat trailing `*wildcards` (with backtracking across branches), and an exact-method route beats `all()` on the same path. Remaining ties go to the first-registered route.
 
 ```rust
-app.get("/users/:id", |_req: Request| Response::send("by id"));
-app.get("/users/me", |_req: Request| Response::send("me")); // still wins for /users/me
+app.get("/users/:id", |_req: Request| Response::send("by id")).unwrap();
+app.get("/users/me", |_req: Request| Response::send("me")).unwrap(); // still wins for /users/me
 ```
 
 ### Trailing Slashes
@@ -199,7 +214,7 @@ app.get("/users/:id/posts/:post_id", |req: Request| {
     let user_id = req.param("id").unwrap_or("?");
     let post_id = req.param("post_id").unwrap_or("?");
     Response::send(&format!("user={} post={}", user_id, post_id))
-});
+}).unwrap();
 ```
 
 ### Wildcards
@@ -209,7 +224,7 @@ Patterns such as `*name` capture the rest of the path. They are used internally 
 ```rust
 app.get("/files/*path", |req: Request| {
     Response::send(req.param("path").unwrap_or(""))
-});
+}).unwrap();
 ```
 
 ## Routers
@@ -222,16 +237,16 @@ use rustrest::{Request, Response, Router};
 fn users_router() -> Router {
     let mut router = Router::new();
 
-    router.get("/", |_req: Request| Response::send("user list"));
+    router.get("/", |_req: Request| Response::send("user list")).unwrap();
     router.get("/:id", |req: Request| {
         Response::send(req.param("id").unwrap_or("?"))
-    });
+    }).unwrap();
 
     router
 }
 
 let mut app = App::new();
-app.mount("/users", users_router());
+app.mount("/users", users_router()).unwrap();
 ```
 
 This creates:
@@ -243,10 +258,10 @@ Routers can be mounted inside other routers:
 
 ```rust
 let mut api = Router::new();
-api.mount("/users", users_router());
+api.mount("/users", users_router()).unwrap();
 
 let mut app = App::new();
-app.mount("/api", api);
+app.mount("/api", api).unwrap();
 ```
 
 Result:
@@ -261,7 +276,7 @@ A handler can be synchronous:
 ```rust
 app.get("/", |_req: Request| {
     Response::send("sync")
-});
+}).unwrap();
 ```
 
 Or asynchronous:
@@ -269,7 +284,7 @@ Or asynchronous:
 ```rust
 app.get("/async", |_req: Request| async move {
     Response::send("async")
-});
+}).unwrap();
 ```
 
 A handler can also return `Result<Response, E>` when `E` implements `IntoHttpError`:
@@ -279,7 +294,7 @@ use rustrest::{HttpError, Request, Response};
 
 app.get("/fallible", |_req: Request| -> Result<Response, HttpError> {
     Err(HttpError::bad_request("Invalid parameters"))
-});
+}).unwrap();
 ```
 
 If a handler panics, RustRest catches it and returns `500`.
@@ -310,12 +325,12 @@ req.query_all("tag");
 req.header("authorization");
 req.headers_all("x-forwarded-for");
 req.cookie("sid");
-req.bytes();              // raw body bytes
-req.text();               // lossy UTF-8 view of the body
-req.json::<MyType>();
-req.form::<MyForm>();
-req.multipart();
-req.extract::<Json<MyType>>();
+req.bytes().await?;              // collected raw body bytes
+req.text().await?;               // strict UTF-8 text
+req.text_lossy().await?;         // explicitly lossy UTF-8 text
+req.json::<MyType>().await?;
+req.form::<MyForm>().await?;
+req.multipart().await?;
 req.state::<Config>();
 req.remote_addr();
 req.last_event_id();      // SSE reconnection header
@@ -323,11 +338,11 @@ req.is_websocket_upgrade();
 req.websocket(|socket| async move { ... });
 ```
 
-The request body is fully buffered as bytes, capped by `app.max_body_size(...)` (64 KB by default; oversized bodies get `413`).
+The incoming request body is streamed into the handler and is only buffered when a body helper or body extractor is awaited. Collection is capped by `app.max_body_size(...)` (64 KB by default; oversized bodies get `413`).
 
 ## Typed Extractors
 
-RustRest includes extractors used through `Request::extract`.
+RustRest includes async extractors. Parts-only extractors use `extract_parts`; body-consuming extractors use `extract`. Route handlers can also receive typed extractor arguments directly.
 
 ```rust
 use rustrest::{Json, Path, Query, Request, Response, State};
@@ -353,24 +368,34 @@ struct Config {
     app_name: &'static str,
 }
 
-app.get("/users/:id", |req: Request| -> Result<Response, rustrest::HttpError> {
-    let Path(path) = req.extract::<Path<UserPath>>()?;
-    let Query(query) = req.extract::<Query<UserQuery>>()?;
-    let State(config) = req.extract::<State<Config>>()?;
+app.get("/users/:id", |mut req: Request| async move {
+    let Path(path) = req.extract_parts::<Path<UserPath>>().await?;
+    let Query(query) = req.extract_parts::<Query<UserQuery>>().await?;
+    let State(config) = req.extract_parts::<State<Config>>().await?;
 
-    Ok(Response::send(&format!(
+    Ok::<_, rustrest::HttpError>(Response::send(&format!(
         "{} id={} active={:?} tags={:?}",
         config.app_name,
         path.id,
         query.active,
         query.tag
     )))
-});
+}).unwrap();
 
-app.post("/users", |req: Request| -> Result<Response, rustrest::HttpError> {
-    let Json(user) = req.extract::<Json<CreateUser>>()?;
-    Ok(Response::send(&format!("Creating {}", user.name)).status(201))
-});
+app.post("/users", |mut req: Request| async move {
+    let Json(user) = req.extract::<Json<CreateUser>>().await?;
+    Ok::<_, rustrest::HttpError>(Response::send(&format!("Creating {}", user.name)).status(201))
+}).unwrap();
+
+async fn create_user(
+    State(config): State<Config>,
+    Path(path): Path<UserPath>,
+    Json(user): Json<CreateUser>,
+) -> Result<Response, rustrest::HttpError> {
+    Ok(Response::send(&format!("{}:{}:{}", config.app_name, path.id, user.name)).status(201))
+}
+
+app.post("/typed/users/:id", create_user).unwrap();
 ```
 
 ## Shared State
@@ -390,7 +415,7 @@ app.state(Config {
 app.get("/config", |req: Request| {
     let config = req.state::<Config>().expect("Config registered");
     Response::send(&config.database_url)
-});
+}).unwrap();
 ```
 
 Internally, state is stored in `Arc`, so `req.state::<T>()` returns `Option<Arc<T>>`.
@@ -487,6 +512,35 @@ let chunks = stream::iter(vec![
 Response::stream(chunks).content_type("text/plain; charset=utf-8")
 ```
 
+`Response::stream` also accepts fallible streams. Stream errors are propagated to the HTTP body
+instead of being swallowed:
+
+```rust
+let chunks = stream::iter(vec![
+    Ok::<_, std::io::Error>(Bytes::from_static(b"hello")),
+    Err(std::io::Error::other("read failed")),
+]);
+
+Response::stream(chunks)
+```
+
+HTTP trailers can be appended as the final body frame:
+
+```rust
+use hyper::HeaderMap;
+use hyper::header::HeaderValue;
+
+let mut trailers = HeaderMap::new();
+trailers.insert("x-checksum", HeaderValue::from_static("abc"));
+
+Response::stream(stream::iter(vec![Ok::<_, Infallible>(Bytes::from_static(b"data"))]))
+    .with_trailers(trailers)
+```
+
+For checked response construction, use `try_status`, `try_header`, `try_append_header`, and
+`try_with_trailers`. The fluent wrappers still exist; invalid values are recorded and rendered as a
+structured `500` at the HTTP boundary instead of panicking or silently disappearing.
+
 ## Middleware
 
 Middleware receives `Request` and `Next`.
@@ -520,8 +574,8 @@ router.layer(|req: Request, next: Next| async move {
     next(req).await
 });
 
-router.get("/health", |_req: Request| Response::send("ok"));
-app.mount("/api", router);
+router.get("/health", |_req: Request| Response::send("ok")).unwrap();
+app.mount("/api", router).unwrap();
 ```
 
 That middleware only runs for routes under `/api`.
@@ -539,6 +593,7 @@ app.layer(middleware::compression());
 app.layer(middleware::etag());
 app.layer(middleware::rate_limit(100, Duration::from_secs(60)));
 app.get("/slow", slow_handler)
+    .unwrap()
     .layer(middleware::timeout(Duration::from_secs(5)));
 ```
 
@@ -562,8 +617,8 @@ api.guard(|req: &Request| {
     req.header("x-api-key") == Some("secret")
 });
 
-api.get("/private", |_req: Request| Response::send("private"));
-app.mount("/api", api);
+api.get("/private", |_req: Request| Response::send("private")).unwrap();
+app.mount("/api", api).unwrap();
 ```
 
 If the guard fails, RustRest returns `403 Access denied`.
@@ -575,7 +630,7 @@ Global fallback:
 ```rust
 app.fallback(|_req: Request| {
     Response::send("Not found").status(404)
-});
+}).unwrap();
 ```
 
 Scoped fallback:
@@ -583,19 +638,19 @@ Scoped fallback:
 ```rust
 let mut api = Router::new();
 
-api.get("/health", |_req: Request| Response::send("ok"));
+api.get("/health", |_req: Request| Response::send("ok")).unwrap();
 api.fallback(|_req: Request| {
     Response::send("API route not found").status(404)
-});
+}).unwrap();
 
-app.mount("/api", api);
+app.mount("/api", api).unwrap();
 ```
 
 ## Static Files
 
 ```rust
 let mut app = App::new();
-app.static_files("/assets", "public");
+app.static_files("/assets", "public").unwrap();
 ```
 
 Examples:
@@ -626,7 +681,7 @@ app.get("/users/:id", |req: Request| -> Result<Response, HttpError> {
     })?;
 
     Ok(Response::send(id))
-});
+}).unwrap();
 ```
 
 Global error handler:
@@ -634,10 +689,10 @@ Global error handler:
 ```rust
 app.error_handler(|err: HttpError| {
     Response::json(&serde_json::json!({
-        "error": err.message(),
-        "status": err.status(),
+        "error": err.public_message(),
+        "status": err.status().as_u16(),
     }))
-    .status(err.status())
+    .status(err.status().as_u16())
 });
 ```
 
@@ -647,17 +702,18 @@ Routes can carry documentation, and the app can describe itself as OpenAPI 3.0:
 
 ```rust
 app.get("/users", list_users)
+    .unwrap()
     .summary("Lista usuarios")
     .description("Devuelve todos los usuarios registrados")
     .tag("users");
-app.get("/users/:id", show_user).tag("users");
+app.get("/users/:id", show_user).unwrap().tag("users");
 
 // A serde_json::Value with paths, methods, and path parameters:
-let doc = app.openapi("Mi API", "0.2.0");
+let doc = app.openapi("Mi API", "0.3.0");
 
 // Or serve it: GET /docs (Swagger UI) + GET /docs/openapi.json.
 // Snapshot semantics: call after registering the routes.
-app.serve_docs("/docs", "Mi API", "0.2.0");
+app.serve_docs("/docs", "Mi API", "0.3.0").unwrap();
 ```
 
 The generated document covers paths, methods, metadata, and `:param`/`*wildcard` path parameters (typed as strings). Request/response schemas are not introspected. `all()` routes are skipped.
@@ -675,10 +731,12 @@ app.get("/events", |_req: Request| {
     ]);
 
     Response::sse(events)
-});
+}).unwrap();
 ```
 
 The response uses `text/event-stream`, `Cache-Control: no-cache`, and `Connection: keep-alive`.
+Invalid SSE fields terminate the response body with a stream error rather than emitting malformed
+events.
 
 For long-lived streams, `sse_with_heartbeat` emits a `: keep-alive` comment whenever the source stream is idle for the given interval, and `req.last_event_id()` exposes the ID browsers resend when they reconnect:
 
@@ -689,7 +747,7 @@ app.get("/events", |req: Request| {
     let resume_after = req.last_event_id().map(str::to_string);
     let events = my_event_stream(resume_after);
     Response::sse_with_heartbeat(events, Duration::from_secs(15))
-});
+}).unwrap();
 ```
 
 ## WebSocket
@@ -723,7 +781,7 @@ app.websocket("/ws", |mut socket| async move {
             break;
         }
     }
-});
+}).unwrap();
 ```
 
 `Router` has the same API:
@@ -732,8 +790,8 @@ app.websocket("/ws", |mut socket| async move {
 let mut router = Router::new();
 router.websocket("/ws", |mut socket| async move {
     socket.send_text("hello").await.ok();
-});
-app.mount("/api", router);
+}).unwrap();
+app.mount("/api", router).unwrap();
 ```
 
 There is also a short alias:
@@ -741,7 +799,7 @@ There is also a short alias:
 ```rust
 app.ws("/ws", |mut socket| async move {
     socket.close().await.ok();
-});
+}).unwrap();
 ```
 
 ### WebSocket Methods
@@ -850,7 +908,7 @@ app.websocket_with("/ws", config, |mut socket| async move {
     while let Ok(Some(message)) = socket.recv().await {
         // ...
     }
-});
+}).unwrap();
 ```
 
 The first client-offered subprotocol the server supports is selected and echoed in `Sec-WebSocket-Protocol`. With `ping_interval`, a Ping frame is sent whenever the connection has been idle inside `recv()` for the interval.
@@ -875,7 +933,7 @@ app.websocket("/chat/:channel", |mut socket| async move {
         }
     }
     Ok::<(), rustrest::WsError>(())
-});
+}).unwrap();
 ```
 
 Rooms are scoped by the normalized route pattern. `socket.to(...)` excludes
@@ -911,7 +969,7 @@ app.websocket("/chat", move |mut socket| {
             }
         }
     }
-});
+}).unwrap();
 ```
 
 Lagging subscribers receive `RecvError::Lagged` and must handle skipped
@@ -924,7 +982,7 @@ RustRest includes a handshake helper:
 ```rust
 app.get("/ws", |req: Request| -> Result<Response, HttpError> {
     Response::websocket(&req)
-});
+}).unwrap();
 ```
 
 This validates upgrade headers and returns `101 Switching Protocols` with `Sec-WebSocket-Accept`. Prefer `app.websocket` for normal server-side WebSocket handlers because it also owns the upgraded stream and frame loop.
@@ -966,6 +1024,10 @@ The project includes:
 
 - Core unit tests in `src/app/tests.rs`.
 - A real HTTP integration test in `tests/http_integration.rs`.
+
+## Compatibility and releases
+
+See the [changelog](CHANGELOG.md) for notable changes, the [release policy](docs/releases.md) for compatibility guarantees, and the [migration guides](docs/migrations/README.md) for breaking upgrades. For this release, start with [Migrating from 0.2 to 0.3](docs/migrations/0.2-to-0.3.md).
 
 ## Publishing Preparation
 
@@ -1016,7 +1078,7 @@ src/
     form.rs              # Form bodies + multipart parser
     cookie.rs            # Cookie builder + sign/verify helpers
     session.rs           # Minimal in-memory Sessions middleware
-    middleware.rs        # Built-in middleware (Cors, compression, ...)
+    middleware/          # Built-in middleware (Cors, compression, conditionals, ...)
     error.rs             # HttpError and IntoHttpError
     state.rs             # Type-keyed StateStore
     testing.rs           # In-process TestClient
@@ -1027,20 +1089,21 @@ src/
 examples/
   basic.rs               # Minimal example
   api.rs                 # Full API example
+  streaming_upload.rs    # Streaming request body upload example
   websocket.rs           # WebSocket and browser client example
 tests/
   http_integration.rs    # Real HTTP integration tests
+  http_semantics.rs      # Compression/precondition protocol tests
   tls_integration.rs     # Real HTTPS integration test (feature `tls`)
 ```
 
 ## Current Limitations
 
-- Request bodies are fully buffered (configurable limit, 64 KB by default; oversized bodies get `413`).
-- Request streaming is not implemented yet (responses do stream).
+- Request body helpers and body extractors buffer on demand under configurable limits; multipart
+  parsing is still buffered rather than streaming each part.
 - Sessions are in-memory only (single process); use your own store for multi-instance deployments.
 - Rate limiting is in-memory and per process.
 - OpenAPI output covers paths, methods, and path parameters; request/response schemas are not introspected.
-- Handler argument macros are not implemented; extractors are used through `req.extract::<T>()`.
 
 ## License
 

@@ -1,6 +1,4 @@
-use rustrest::{
-    App, HttpError, Json, Next, Path, Query, Request, Response, Router, State, middleware,
-};
+use rustrest::{App, HttpError, Next, Path, Query, Request, Response, Router, State, middleware};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -29,37 +27,45 @@ fn users_router() -> Router {
 
     router.guard(|req: &Request| req.header("x-api-key") == Some("secret"));
 
-    router.get("/", |req: Request| -> Result<Response, HttpError> {
-        let Query(query) = req.extract::<Query<ListQuery>>()?;
-        let State(config) = req.extract::<State<Config>>()?;
-        let users = vec![User {
-            id: 1,
-            name: format!(
-                "{} - Ada ({})",
-                config.app_name,
-                query.active.unwrap_or(true)
-            ),
-        }];
-        Ok(Response::json(&users))
-    });
+    router
+        .get("/", |mut req: Request| async move {
+            let Query(query) = req.extract_parts::<Query<ListQuery>>().await?;
+            let State(config) = req.extract_parts::<State<Config>>().await?;
+            let users = vec![User {
+                id: 1,
+                name: format!(
+                    "{} - Ada ({})",
+                    config.app_name,
+                    query.active.unwrap_or(true)
+                ),
+            }];
+            Ok::<_, HttpError>(Response::json(&users))
+        })
+        .unwrap();
 
-    router.get("/:id", |req: Request| -> Result<Response, HttpError> {
-        let Path(path) = req.extract::<Path<UserPath>>()?;
-        Ok(Response::json(&User {
-            id: path.id,
-            name: "Ada".to_string(),
-        }))
-    });
+    router
+        .get("/:id", |mut req: Request| async move {
+            let Path(path) = req.extract_parts::<Path<UserPath>>().await?;
+            Ok::<_, HttpError>(Response::json(&User {
+                id: path.id,
+                name: "Ada".to_string(),
+            }))
+        })
+        .unwrap();
 
-    router.post("/", |req: Request| -> Result<Response, HttpError> {
-        let Json(mut user) = req.extract::<Json<User>>()?;
-        user.id = 100;
-        Ok(Response::json(&user).status(201))
-    });
+    router
+        .post("/", |mut req: Request| async move {
+            let mut user: User = req.json().await?;
+            user.id = 100;
+            Ok::<_, HttpError>(Response::json(&user).status(201))
+        })
+        .unwrap();
 
-    router.fallback(|_req: Request| {
-        Response::from_error(HttpError::not_found("User resource not found"))
-    });
+    router
+        .fallback(|_req: Request| {
+            Response::from_error(HttpError::not_found("User resource not found"))
+        })
+        .unwrap();
 
     router
 }
@@ -80,8 +86,8 @@ async fn main() -> std::io::Result<()> {
         next(req).await
     });
 
-    app.mount("/users", users_router());
-    app.fallback(|_req: Request| Response::not_found());
+    app.mount("/users", users_router()).unwrap();
+    app.fallback(|_req: Request| Response::not_found()).unwrap();
 
     app.listen("127.0.0.1:3000").await
 }
