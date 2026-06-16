@@ -51,9 +51,10 @@ impl ConditionalHeaders {
                 return PreconditionResult::Failed;
             }
         } else if let (Some(since), Some(last_modified)) = (self.if_unmodified_since, last_modified)
-            && modified_after(last_modified, since)
         {
-            return PreconditionResult::Failed;
+            if modified_after(last_modified, since) {
+                return PreconditionResult::Failed;
+            }
         }
 
         if let Some(if_none_match) = &self.if_none_match {
@@ -64,19 +65,20 @@ impl ConditionalHeaders {
                     PreconditionResult::Failed
                 };
             }
-        } else if safe
-            && let (Some(since), Some(last_modified)) = (self.if_modified_since, last_modified)
-            && not_modified_since(last_modified, since)
-        {
-            return PreconditionResult::NotModified;
+        } else if safe {
+            if let (Some(since), Some(last_modified)) = (self.if_modified_since, last_modified) {
+                if not_modified_since(last_modified, since) {
+                    return PreconditionResult::NotModified;
+                }
+            }
         }
 
-        if range_requested
-            && self.has_range
-            && let Some(if_range) = &self.if_range
-            && !if_range_matches(if_range, etag, last_modified)
-        {
-            return PreconditionResult::IgnoreRange;
+        if range_requested && self.has_range {
+            if let Some(if_range) = &self.if_range {
+                if !if_range_matches(if_range, etag, last_modified) {
+                    return PreconditionResult::IgnoreRange;
+                }
+            }
         }
 
         PreconditionResult::Proceed

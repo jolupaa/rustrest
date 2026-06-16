@@ -767,16 +767,17 @@ impl Router {
         host: Option<&HostPattern>,
         name: Option<&str>,
     ) -> Result<(), RouteError> {
-        if let Some(name) = name
-            && self
+        if let Some(name) = name {
+            if self
                 .routes
                 .iter()
                 .any(|route| route.name.as_deref() == Some(name))
-        {
-            return Err(RouteError::new(
-                RouteErrorKind::DuplicateName,
-                format!("Nombre de ruta duplicado: {name}"),
-            ));
+            {
+                return Err(RouteError::new(
+                    RouteErrorKind::DuplicateName,
+                    format!("Nombre de ruta duplicado: {name}"),
+                ));
+            }
         }
 
         let conflict_key = pattern.conflict_key();
@@ -963,15 +964,16 @@ fn validate_route_batch_insert(
     host: Option<&HostPattern>,
     name: Option<&str>,
 ) -> Result<(), RouteError> {
-    if let Some(name) = name
-        && routes
+    if let Some(name) = name {
+        if routes
             .iter()
             .any(|route| route.name.as_deref() == Some(name))
-    {
-        return Err(RouteError::new(
-            RouteErrorKind::DuplicateName,
-            format!("Nombre de ruta duplicado: {name}"),
-        ));
+        {
+            return Err(RouteError::new(
+                RouteErrorKind::DuplicateName,
+                format!("Nombre de ruta duplicado: {name}"),
+            ));
+        }
     }
 
     let conflict_key = pattern.conflict_key();
