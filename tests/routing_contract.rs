@@ -6,6 +6,22 @@ fn handler(_req: Request) -> Response {
 }
 
 #[test]
+fn public_route_error_kinds_support_forward_compatible_matches() {
+    let registration = match RouteErrorKind::MissingLeadingSlash {
+        RouteErrorKind::MissingLeadingSlash => "missing-leading-slash",
+        _ => "future-registration-error",
+    };
+    assert_eq!(registration, "missing-leading-slash");
+
+    let request = match RouteMatchErrorKind::TooManySegments {
+        RouteMatchErrorKind::InvalidPathEncoding => "invalid-path-encoding",
+        RouteMatchErrorKind::TooManySegments => "too-many-segments",
+        _ => "future-matching-error",
+    };
+    assert_eq!(request, "too-many-segments");
+}
+
+#[test]
 fn invalid_and_duplicate_routes_are_rejected_at_registration() {
     let mut router = Router::new();
     assert_eq!(
@@ -26,6 +42,65 @@ fn invalid_and_duplicate_routes_are_rejected_at_registration() {
         router.get("/users/:name", handler).unwrap_err().kind(),
         RouteErrorKind::ConflictingPattern
     );
+}
+
+#[test]
+fn encoded_static_route_shapes_do_not_collide_with_placeholders_or_separators() {
+    let mut router = Router::new();
+    router.get("/:id", handler).unwrap();
+    router.get("/%3A", handler).unwrap();
+    router.get("/*rest", handler).unwrap();
+    router.get("/%2A", handler).unwrap();
+    router.get("/a%2Fb", handler).unwrap();
+    router.get("/a/b", handler).unwrap();
+
+    let literal_colon = router
+        .resolve(&Method::GET, "/%3A", None)
+        .unwrap()
+        .expect("the encoded colon literal should resolve");
+    assert_eq!(literal_colon.pattern, "/%3A");
+    assert!(literal_colon.params.is_empty());
+
+    let parameter = router
+        .resolve(&Method::GET, "/value", None)
+        .unwrap()
+        .expect("the parameter route should still resolve");
+    assert_eq!(parameter.pattern, "/:id");
+    assert_eq!(
+        parameter.params.get("id").map(String::as_str),
+        Some("value")
+    );
+
+    let literal_star = router
+        .resolve(&Method::GET, "/%2A", None)
+        .unwrap()
+        .expect("the encoded star literal should resolve");
+    assert_eq!(literal_star.pattern, "/%2A");
+    assert!(literal_star.params.is_empty());
+
+    let wildcard = router
+        .resolve(&Method::GET, "/other/more", None)
+        .unwrap()
+        .expect("the wildcard route should still resolve");
+    assert_eq!(wildcard.pattern, "/*rest");
+    assert_eq!(
+        wildcard.params.get("rest").map(String::as_str),
+        Some("other/more")
+    );
+
+    let encoded_slash = router
+        .resolve(&Method::GET, "/a%2Fb", None)
+        .unwrap()
+        .expect("the encoded slash literal should remain one segment");
+    assert_eq!(encoded_slash.pattern, "/a%2Fb");
+    assert!(encoded_slash.params.is_empty());
+
+    let path_separator = router
+        .resolve(&Method::GET, "/a/b", None)
+        .unwrap()
+        .expect("the two-segment literal should resolve independently");
+    assert_eq!(path_separator.pattern, "/a/b");
+    assert!(path_separator.params.is_empty());
 }
 
 #[test]
@@ -67,29 +142,98 @@ fn captured_params_reject_invalid_percent_encoding() {
         invalid_utf8.kind(),
         RouteMatchErrorKind::InvalidPathEncoding
     );
+
+    for control in ["/users/%00", "/users/%0D%0A", "/users/%7F"] {
+        let error = match router.resolve(&Method::GET, control, None) {
+            Err(error) => error,
+            Ok(_) => panic!("expected decoded control character to be rejected"),
+        };
+        assert_eq!(error.kind(), RouteMatchErrorKind::InvalidPathEncoding);
+    }
+}
+
+#[test]
+fn percent_decoding_precedes_trie_matching_and_happens_once() {
+    let mut router = Router::new();
+    // Register the parameter first to prove that the encoded static segment
+    // still follows normal static-over-parameter precedence.
+    router.get("/users/:id", handler).unwrap();
+    router.get("/users/me", handler).unwrap();
+    router.get("/items/:id", handler).unwrap();
+    router.get("/café", handler).unwrap();
+
+    let encoded_static = router
+        .resolve(&Method::GET, "/users/%6De", None)
+        .unwrap()
+        .expect("encoded static path should match");
+    assert!(encoded_static.params.is_empty());
+
+    let encoded_unicode = router
+        .resolve(&Method::GET, "/caf%C3%A9", None)
+        .unwrap()
+        .expect("encoded UTF-8 static path should match");
+    assert!(encoded_unicode.params.is_empty());
+
+    let encoded_slash = router
+        .resolve(&Method::GET, "/items/%2F", None)
+        .unwrap()
+        .expect("encoded slash should remain one parameter segment");
+    assert_eq!(
+        encoded_slash.params.get("id").map(String::as_str),
+        Some("/")
+    );
+
+    let encoded_percent = router
+        .resolve(&Method::GET, "/items/%252F", None)
+        .unwrap()
+        .expect("double-encoded slash should match once-decoded");
+    assert_eq!(
+        encoded_percent.params.get("id").map(String::as_str),
+        Some("%2F")
+    );
+}
+
+#[test]
+fn static_segments_reject_invalid_percent_encoding_and_utf8() {
+    let mut router = Router::new();
+    router.get("/users/me", handler).unwrap();
+
+    for path in ["/users/%ZZ", "/users/%C3%28"] {
+        let error = match router.resolve(&Method::GET, path, None) {
+            Err(error) => error,
+            Ok(_) => panic!("expected invalid path encoding for {path}"),
+        };
+        assert_eq!(error.kind(), RouteMatchErrorKind::InvalidPathEncoding);
+    }
 }
 
 #[test]
 fn custom_method_and_host_constraints_are_routed() {
     let mut router = Router::new();
+    let purge = Method::from_bytes(b"PURGE").unwrap();
     router
-        .route(Method::CONNECT, "/tunnel/:id", handler)
+        .route(purge.clone(), "/cache/:id", handler)
         .unwrap()
         .host("api.example.com")
         .unwrap();
 
     assert!(
         router
-            .resolve(&Method::CONNECT, "/tunnel/7", Some("api.example.com"))
+            .resolve(&purge, "/cache/7", Some("api.example.com"))
             .unwrap()
             .is_some()
     );
     assert!(
         router
-            .resolve(&Method::CONNECT, "/tunnel/7", Some("www.example.com"))
+            .resolve(&purge, "/cache/7", Some("www.example.com"))
             .unwrap()
             .is_none()
     );
+
+    let error = router
+        .route(Method::CONNECT, "/tunnel/:id", handler)
+        .unwrap_err();
+    assert_eq!(error.kind(), RouteErrorKind::UnsupportedMethod);
 
     router
         .get("/wild/:id", handler)
@@ -191,7 +335,7 @@ fn multi_route_registration_failures_do_not_partially_mutate() {
     let mut app = App::new();
     app.head("/assets/*path", handler).unwrap();
 
-    let error = app.static_files("/assets", "public").unwrap_err();
+    let error = app.static_files("/assets", ".").unwrap_err();
     assert_eq!(error.kind(), RouteErrorKind::DuplicateRoute);
     assert!(
         app.routes()

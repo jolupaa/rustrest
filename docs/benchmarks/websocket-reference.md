@@ -64,3 +64,19 @@ CPUs), 16 GiB RAM, Rust 1.96.0, and an open-file limit of 1,048,575. All
 166 MiB server RSS, 376 MiB client RSS, 239% server CPU, 247% client CPU, and
 22,000 established TCP endpoints. This remains a short macOS smoke rather than
 the required 900-second Linux stability result.
+
+On August 1, 2026, the final framework-hardening tree repeated a release-mode
+smoke on macOS with 100 idle and 20 active connections for 5 seconds. All 120
+connections opened; 8,100 messages were sent and received exactly, with zero
+connect, send, receive, or unexpected-close failures. Round-trip latency was
+439 us p50, 853 us p95, and 1,376 us p99. The same tree passed all 247 pinned
+Autobahn cases: the checker inspected 494 behavior records across 248 reports
+and found no failed or unimplemented result.
+
+The same final tree then repeated the 10,000-idle/1,000-active connection
+count for 30 seconds. All 11,000 connections opened; 2,346,860 messages were
+sent and received exactly with zero failures or unexpected closes. Round-trip
+latency was 1,311 us p50, 4,013 us p95, and 7,052 us p99, and the client
+completed establishment, load, and close drain in 31,238 ms. This validates
+the final tree at the reference connection count, but the 900-second Linux run
+above remains the long-duration stability baseline.

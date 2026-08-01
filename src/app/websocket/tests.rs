@@ -167,17 +167,17 @@ struct RecoveringBroker {
 }
 
 impl WsBroker for RecoveringBroker {
-    fn publish<'a>(
-        &'a self,
+    fn publish(
+        &self,
         publication: WsBrokerPublication,
-    ) -> futures_util::future::BoxFuture<'a, Result<(), WsBrokerError>> {
+    ) -> futures_util::future::BoxFuture<'_, Result<(), WsBrokerError>> {
         self.inner.publish(publication)
     }
 
-    fn subscribe<'a>(
-        &'a self,
+    fn subscribe(
+        &self,
         node: WsNodeId,
-    ) -> futures_util::future::BoxFuture<'a, Result<WsBrokerStream, WsBrokerError>> {
+    ) -> futures_util::future::BoxFuture<'_, Result<WsBrokerStream, WsBrokerError>> {
         if self.subscriptions.fetch_add(1, Ordering::SeqCst) == 0 {
             Box::pin(async { Err(WsBrokerError::Unavailable) })
         } else {
@@ -213,17 +213,17 @@ struct ObservableBroker {
 }
 
 impl WsBroker for ObservableBroker {
-    fn publish<'a>(
-        &'a self,
+    fn publish(
+        &self,
         _publication: WsBrokerPublication,
-    ) -> futures_util::future::BoxFuture<'a, Result<(), WsBrokerError>> {
+    ) -> futures_util::future::BoxFuture<'_, Result<(), WsBrokerError>> {
         Box::pin(async { Ok(()) })
     }
 
-    fn subscribe<'a>(
-        &'a self,
+    fn subscribe(
+        &self,
         _node: WsNodeId,
-    ) -> futures_util::future::BoxFuture<'a, Result<WsBrokerStream, WsBrokerError>> {
+    ) -> futures_util::future::BoxFuture<'_, Result<WsBrokerStream, WsBrokerError>> {
         let subscription = self.subscriptions.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             if subscription == 0 {
@@ -321,6 +321,79 @@ fn websocket_config_resolves_process_route_and_disable_overrides() {
     assert_eq!(resolved.max_connection_lifetime, None);
 }
 
+#[test]
+fn websocket_resolved_defaults_are_production_bounded() {
+    let resolved = resolved_config(WebSocketConfig::new(), WebSocketConfig::new());
+
+    assert_eq!(resolved.max_message_size, Some(1024 * 1024));
+    assert_eq!(resolved.max_frame_size, Some(256 * 1024));
+    assert_eq!(resolved.inbound_capacity, 16);
+    assert_eq!(resolved.outbound_capacity, 16);
+    assert_eq!(resolved.send_timeout, Duration::from_secs(5));
+    assert_eq!(resolved.ping_interval, Some(Duration::from_secs(30)));
+    assert_eq!(resolved.idle_timeout, Some(Duration::from_secs(120)));
+    assert_eq!(
+        resolved.max_connection_lifetime,
+        Some(Duration::from_secs(24 * 60 * 60))
+    );
+    assert_eq!(
+        resolved.origin_policy,
+        OriginPolicy::same_host().allow_missing(false)
+    );
+    assert_eq!(resolved.process_max_connections, Some(2_000));
+    assert_eq!(resolved.max_connections_per_ip, Some(20));
+    let rate = resolved.message_rate_limit.as_ref().unwrap();
+    assert_eq!(rate.max_messages, 100);
+    assert_eq!(rate.interval, Duration::from_secs(1));
+    resolved.validate().unwrap();
+}
+
+#[test]
+fn websocket_safe_defaults_have_explicit_opt_outs() {
+    let app = WebSocketConfig::new()
+        .disable_max_connections()
+        .disable_max_connections_per_ip()
+        .disable_message_rate_limit();
+    let route = WebSocketConfig::new()
+        .disable_max_message_size()
+        .disable_max_frame_size()
+        .disable_ping()
+        .disable_idle_timeout()
+        .disable_max_connection_lifetime()
+        .origin_policy(OriginPolicy::any());
+
+    let resolved = resolved_config(app, route);
+
+    assert_eq!(resolved.max_message_size, None);
+    assert_eq!(resolved.max_frame_size, None);
+    assert_eq!(resolved.ping_interval, None);
+    assert_eq!(resolved.idle_timeout, None);
+    assert_eq!(resolved.max_connection_lifetime, None);
+    assert_eq!(resolved.process_max_connections, None);
+    assert_eq!(resolved.max_connections_per_ip, None);
+    assert!(resolved.message_rate_limit.is_none());
+    assert_eq!(resolved.origin_policy, OriginPolicy::any());
+    resolved.validate().unwrap();
+}
+
+#[test]
+fn same_host_origin_requires_the_transport_security_scheme() {
+    let policy = OriginPolicy::same_host().allow_missing(false);
+
+    assert!(policy.allows_for_transport(Some("https://app.example.com"), "app.example.com", true));
+    assert!(policy.allows_for_transport(Some("http://app.example.com"), "app.example.com", false));
+    assert!(!policy.allows_for_transport(
+        Some("http://app.example.com:443"),
+        "app.example.com:443",
+        true
+    ));
+    assert!(!policy.allows_for_transport(
+        Some("https://app.example.com:80"),
+        "app.example.com:80",
+        false
+    ));
+}
+
 fn handshake_request_without_host() -> RequestBuilder {
     Request::builder()
         .method("GET")
@@ -331,7 +404,9 @@ fn handshake_request_without_host() -> RequestBuilder {
 }
 
 fn handshake_request() -> RequestBuilder {
-    handshake_request_without_host().header("host", "localhost")
+    handshake_request_without_host()
+        .header("host", "localhost")
+        .header("origin", "http://localhost")
 }
 
 fn assert_websocket_error_status(req: &Request, expected: StatusCode) {
@@ -384,6 +459,7 @@ fn websocket_handshake_parses_upgrade_headers_as_tokens() {
     let req = Request::builder()
         .method("GET")
         .header("host", "localhost")
+        .header("origin", "http://localhost")
         .header("upgrade", "h2c")
         .header("upgrade", "WebSocket")
         .header("connection", "keep-alive")
@@ -456,6 +532,33 @@ fn websocket_with_rejects_disallowed_origin_with_403() {
 }
 
 #[test]
+fn websocket_default_origin_rejects_missing_and_any_explicitly_allows_it() {
+    let request = handshake_request_without_host()
+        .header("host", "localhost")
+        .build();
+    let defaults = resolved_config(WebSocketConfig::new(), WebSocketConfig::new());
+    let relaxed = resolved_config(
+        WebSocketConfig::new(),
+        WebSocketConfig::new().origin_policy(OriginPolicy::any()),
+    );
+
+    assert!(validate_handshake(&request, &defaults).is_err());
+    assert!(validate_handshake(&request, &relaxed).is_ok());
+}
+
+#[test]
+fn request_websocket_with_rejects_zero_channel_capacity_before_upgrade() {
+    let request = handshake_request().build();
+
+    let response = request.websocket_with(
+        WebSocketConfig::new().inbound_capacity(0),
+        |_socket| async move {},
+    );
+
+    assert_eq!(response.status, 500);
+}
+
+#[test]
 fn websocket_with_requires_subprotocol_overlap_when_configured() {
     let req = handshake_request()
         .header("sec-websocket-protocol", "graphql-ws")
@@ -487,6 +590,94 @@ fn websocket_config_negotiates_first_supported_subprotocol() {
     let config = WebSocketConfig::new().protocols(&["graphql-ws"]);
     assert_eq!(config.negotiate(&req), None);
     assert_eq!(WebSocketConfig::new().negotiate(&req), None);
+
+    // RFC 6455 subprotocol tokens are case-sensitive.
+    let case_mismatch = Request::builder()
+        .header("sec-websocket-protocol", "admin.v1")
+        .build();
+    let config = WebSocketConfig::new().protocols(&["Admin.V1"]);
+    assert_eq!(config.negotiate(&case_mismatch), None);
+}
+
+#[test]
+fn websocket_subprotocol_configuration_and_offers_require_valid_http_tokens() {
+    for invalid in ["", "has space", "chat,admin", "chat/admin", "\"chat\""] {
+        assert!(
+            WebSocketConfig::new()
+                .protocols(&[invalid])
+                .validate()
+                .is_err(),
+            "accepted invalid configured protocol {invalid:?}"
+        );
+    }
+    assert!(
+        WebSocketConfig::new()
+            .protocols(&["chat", "chat"])
+            .validate()
+            .is_err()
+    );
+    assert!(
+        WebSocketConfig::new()
+            .require_protocol(true)
+            .validate()
+            .is_err()
+    );
+    assert!(
+        WebSocketConfig::new()
+            .protocols(&["Chat", "chat"])
+            .validate()
+            .is_ok()
+    );
+
+    let request = handshake_request()
+        .header("sec-websocket-protocol", "chat, has space")
+        .build();
+    let config = resolved_config(
+        WebSocketConfig::new(),
+        WebSocketConfig::new().protocols(&["chat"]),
+    );
+    assert!(validate_handshake(&request, &config).is_err());
+
+    for offered in [", chat", "chat,", ",,chat,,"] {
+        let request = handshake_request()
+            .header("sec-websocket-protocol", offered)
+            .build();
+        let negotiated = match validate_handshake(&request, &config) {
+            Ok(negotiated) => negotiated,
+            Err(_) => panic!("a null-element-tolerant offer should be accepted: {offered:?}"),
+        };
+        assert_eq!(negotiated.as_deref(), Some("chat"), "offer={offered:?}");
+    }
+
+    for request in [
+        handshake_request()
+            .header("sec-websocket-protocol", "chat, chat")
+            .build(),
+        handshake_request()
+            .header("sec-websocket-protocol", "chat")
+            .header("sec-websocket-protocol", "chat")
+            .build(),
+        handshake_request()
+            .header("sec-websocket-protocol", ",,,")
+            .build(),
+    ] {
+        assert!(validate_handshake(&request, &config).is_err());
+    }
+
+    let case_distinct = handshake_request()
+        .header("sec-websocket-protocol", "Chat, chat")
+        .build();
+    let case_distinct_config = resolved_config(
+        WebSocketConfig::new(),
+        WebSocketConfig::new().protocols(&["Chat", "chat"]),
+    );
+    assert_eq!(
+        validate_handshake(&case_distinct, &case_distinct_config)
+            .ok()
+            .flatten()
+            .as_deref(),
+        Some("Chat")
+    );
 }
 
 #[tokio::test]
@@ -505,6 +696,29 @@ async fn ws_broadcast_fans_out_to_subscribers() {
     drop(a);
     drop(b);
     assert_eq!(room.send_text("nadie"), 0);
+}
+
+#[tokio::test]
+async fn zero_capacity_broadcast_and_broker_are_non_panicking() {
+    let broadcast = WsBroadcast::new(0);
+    let mut receiver = broadcast.subscribe();
+    assert_eq!(broadcast.send_text("uno"), 1);
+    assert_eq!(
+        receiver.recv().await.unwrap(),
+        WebSocketMessage::text("uno")
+    );
+
+    let broker = InMemoryWsBroker::new(0);
+    let node = WsNodeId::new(77);
+    let mut publications = broker.subscribe(node).await.unwrap();
+    let publication = WsBrokerPublication::new(
+        WsPublicationId::new(1),
+        node,
+        WsBrokerTarget::AllRoutes,
+        WsBrokerPayload::Text("uno".into()),
+    );
+    broker.publish(publication.clone()).await.unwrap();
+    assert_eq!(publications.next().await.unwrap().unwrap(), publication);
 }
 
 #[tokio::test]
@@ -673,6 +887,48 @@ async fn websocket_runtime_retains_shutdown_for_late_driver_subscribers() {
     let shutdown_rx = runtime.subscribe_shutdown();
 
     assert!(*shutdown_rx.borrow());
+}
+
+#[tokio::test]
+async fn websocket_shutdown_aborts_an_admitted_pending_upgrade() {
+    let runtime = WebSocketRuntimeHandle::local();
+    let config = resolved_config(WebSocketConfig::new(), WebSocketConfig::new());
+    let permit = runtime.admit("/ws", None, None, &config).unwrap();
+    let id = permit.id();
+    let upgrade = tokio::spawn(async move {
+        let _permit = permit;
+        std::future::pending::<()>().await;
+    });
+    assert!(runtime.register_upgrade_task(id, upgrade.abort_handle()));
+
+    runtime.begin_shutdown().await;
+    runtime.abort_remaining();
+    tokio::time::timeout(Duration::from_millis(100), runtime.wait_until_empty())
+        .await
+        .expect("aborting the pending upgrade must release its admission");
+    assert_eq!(runtime.stats().active_connections, 0);
+}
+
+#[tokio::test]
+async fn websocket_shutdown_is_bounded_when_an_entry_has_no_abort_handle() {
+    let runtime = WebSocketRuntimeHandle::local();
+    let config = resolved_config(
+        WebSocketConfig::new().close_timeout(Duration::from_millis(10)),
+        WebSocketConfig::new(),
+    );
+    let permit = runtime.admit("/ws", None, None, &config).unwrap();
+
+    let result = tokio::time::timeout(Duration::from_millis(100), runtime.shutdown())
+        .await
+        .expect("shutdown must not wait forever for an unabortable entry");
+    assert!(matches!(
+        result,
+        Err(WsError::Timeout(WebSocketTimeout::Shutdown))
+    ));
+    assert_eq!(runtime.stats().active_connections, 1);
+
+    drop(permit);
+    assert_eq!(runtime.stats().active_connections, 0);
 }
 
 #[test]

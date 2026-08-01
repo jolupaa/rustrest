@@ -1,7 +1,8 @@
 use std::future::pending;
+use std::io;
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use hyper::body::Bytes;
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
@@ -9,6 +10,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::Instant;
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use tokio_tungstenite::tungstenite::error::CapacityError;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role};
@@ -120,8 +122,12 @@ async fn run(
                 code: CloseCode::Away,
                 reason: "El servidor se esta cerrando".into(),
             };
-            let _ =
-                write_control(&mut stream, ControlCommand::Disconnect(Some(frame.clone()))).await;
+            let _ = write_control(
+                &mut stream,
+                ControlCommand::Disconnect(Some(frame.clone())),
+                config.send_timeout,
+            )
+            .await;
             let close_info = close_info(Some(&frame), WebSocketCloseInitiator::Runtime, false);
             let _ = channels.close_tx.send(Some(close_info.clone()));
             return DriverOutcome {
@@ -265,29 +271,68 @@ async fn drive(
     let mut control_open = true;
     let mut outbound_open = true;
     let mut handler_completed = false;
+    let mut sender_tracking_closed = false;
     let mut state = DriverState::new();
 
     loop {
-        tokio::select! {
-            biased;
+        // Preserve shutdown priority without a permanently biased select. If
+        // shutdown races with another ready branch, at most one bounded branch
+        // runs before this preflight observes it on the next iteration.
+        if !state.close_sent && *shutdown_rx.borrow_and_update() {
+            if let Err(error) = initiate_runtime_shutdown(
+                stream,
+                &mut state,
+                control_rx,
+                outbound_rx,
+                &mut control_open,
+                &mut outbound_open,
+                config,
+                runtime,
+                id,
+            )
+            .await
+            {
+                return protocol_outcome(inbound_tx, error);
+            }
+            continue;
+        }
 
+        // A handler can enqueue its final message or Close command immediately
+        // before its future resolves. Process that bounded queue snapshot before
+        // synthesizing the handler's normal Close so scheduler order cannot
+        // discard application data or replace an explicit close code.
+        if handler_completed
+            && !state.close_sent
+            && (sender_tracking_closed || *sender_count_rx.borrow_and_update() == 0)
+        {
+            if let Err(error) = initiate_handler_completion(
+                stream,
+                &mut state,
+                control_rx,
+                outbound_rx,
+                &mut control_open,
+                &mut outbound_open,
+                config,
+                runtime,
+                id,
+            )
+            .await
+            {
+                return protocol_outcome(inbound_tx, error);
+            }
+            continue;
+        }
+
+        tokio::select! {
             _ = wait_for_shutdown(shutdown_rx), if !state.close_sent => {
-                close_command_channels(
+                if let Err(error) = initiate_runtime_shutdown(
+                    stream,
+                    &mut state,
                     control_rx,
                     outbound_rx,
                     &mut control_open,
                     &mut outbound_open,
-                );
-                let frame = CloseFrame {
-                    code: CloseCode::Away,
-                    reason: "apagado del servidor".into(),
-                };
-                if let Err(error) = initiate_close(
-                    stream,
-                    &mut state,
-                    Some(frame),
-                    WebSocketCloseInitiator::Runtime,
-                    config.close_timeout,
+                    config,
                     runtime,
                     id,
                 )
@@ -315,13 +360,16 @@ async fn drive(
                     );
                 }
                 if matches!(&command, ControlCommand::Close(_)) {
-                    for message in take_queued_before_close(outbound_rx) {
-                        let bytes = message.len();
-                        let message_type = application_message_type(&message);
-                        if let Err(error) = stream.send(message).await {
-                            return protocol_outcome(inbound_tx, error);
-                        }
-                        runtime.record_message(id, true, bytes, message_type);
+                    if let Err(error) = send_queued_outbound(
+                        stream,
+                        outbound_rx,
+                        config.send_timeout,
+                        runtime,
+                        id,
+                    )
+                    .await
+                    {
+                        return protocol_outcome(inbound_tx, error);
                     }
                 }
                 match command {
@@ -336,7 +384,7 @@ async fn drive(
                             &mut state,
                             frame,
                             initiator,
-                            config.close_timeout,
+                            config,
                             runtime,
                             id,
                         )
@@ -346,7 +394,9 @@ async fn drive(
                         }
                     }
                     command => {
-                        if let Err(error) = write_control(stream, command).await {
+                        if let Err(error) =
+                            write_control(stream, command, config.send_timeout).await
+                        {
                             return protocol_outcome(inbound_tx, error);
                         }
                     }
@@ -375,7 +425,7 @@ async fn drive(
                     &mut state,
                     Some(frame),
                     WebSocketCloseInitiator::Timeout,
-                    config.close_timeout,
+                    config,
                     runtime,
                     id,
                 )
@@ -401,7 +451,7 @@ async fn drive(
                     &mut state,
                     Some(frame),
                     WebSocketCloseInitiator::Timeout,
-                    config.close_timeout,
+                    config,
                     runtime,
                     id,
                 )
@@ -427,7 +477,7 @@ async fn drive(
                     &mut state,
                     Some(frame),
                     WebSocketCloseInitiator::Timeout,
-                    config.close_timeout,
+                    config,
                     runtime,
                     id,
                 )
@@ -444,7 +494,9 @@ async fn drive(
                 };
                 let bytes = message.len();
                 let message_type = application_message_type(&message);
-                if let Err(error) = stream.send(message).await {
+                if let Err(error) =
+                    send_with_timeout(stream, message, config.send_timeout).await
+                {
                     return protocol_outcome(inbound_tx, error);
                 }
                 runtime.record_message(id, true, bytes, message_type);
@@ -472,7 +524,7 @@ async fn drive(
                                     &mut state,
                                     Some(frame),
                                     WebSocketCloseInitiator::Runtime,
-                                    config.close_timeout,
+                                    config,
                                     runtime,
                                     id,
                                 )
@@ -500,7 +552,9 @@ async fn drive(
                             }
                         }
                         if message.is_ping() || message.is_close() {
-                            if let Err(error) = stream.flush().await {
+                            if let Err(error) =
+                                flush_with_timeout(stream, config.send_timeout).await
+                            {
                                 return protocol_outcome(inbound_tx, error);
                             }
                         }
@@ -536,7 +590,7 @@ async fn drive(
                                 &mut state,
                                 Some(frame),
                                 WebSocketCloseInitiator::Runtime,
-                                config.close_timeout,
+                                config,
                                 runtime,
                                 id,
                             )
@@ -573,7 +627,7 @@ async fn drive(
                             &mut state,
                             Some(frame),
                             WebSocketCloseInitiator::ProtocolError,
-                            config.close_timeout,
+                            config,
                             runtime,
                             id,
                         )
@@ -590,7 +644,13 @@ async fn drive(
             _ = wait_until(ping_deadline(&state, config)), if !state.close_sent => {
                 let payload = Bytes::copy_from_slice(&state.next_ping_token.to_be_bytes());
                 state.next_ping_token = state.next_ping_token.wrapping_add(1);
-                if let Err(error) = stream.send(WebSocketMessage::Ping(payload.clone())).await {
+                if let Err(error) = send_with_timeout(
+                    stream,
+                    WebSocketMessage::Ping(payload.clone()),
+                    config.send_timeout,
+                )
+                .await
+                {
                     return protocol_outcome(inbound_tx, error);
                 }
                 state.pending_ping = Some((payload, Instant::now()));
@@ -602,33 +662,6 @@ async fn drive(
                     runtime.record_handler_failed(id);
                 }
                 match result {
-                    Ok(Ok(())) if !state.close_sent => {
-                        if *sender_count_rx.borrow() == 0 {
-                            close_command_channels(
-                                control_rx,
-                                outbound_rx,
-                                &mut control_open,
-                                &mut outbound_open,
-                            );
-                            let frame = CloseFrame {
-                                code: CloseCode::Normal,
-                                reason: "".into(),
-                            };
-                            if let Err(error) = initiate_close(
-                                stream,
-                                &mut state,
-                                Some(frame),
-                                WebSocketCloseInitiator::Handler,
-                                config.close_timeout,
-                                runtime,
-                                id,
-                            )
-                            .await
-                            {
-                                return protocol_outcome(inbound_tx, error);
-                            }
-                        }
-                    }
                     Ok(Ok(())) => {}
                     Ok(Err(_)) | Err(_) if !state.close_sent => {
                         close_command_channels(
@@ -646,7 +679,7 @@ async fn drive(
                             &mut state,
                             Some(frame),
                             WebSocketCloseInitiator::Handler,
-                            config.close_timeout,
+                            config,
                             runtime,
                             id,
                         )
@@ -660,34 +693,105 @@ async fn drive(
             }
 
             changed = sender_count_rx.changed(), if handler_completed && !state.close_sent => {
-                if changed.is_err() || *sender_count_rx.borrow_and_update() == 0 {
-                    close_command_channels(
-                        control_rx,
-                        outbound_rx,
-                        &mut control_open,
-                        &mut outbound_open,
-                    );
-                    let frame = CloseFrame {
-                        code: CloseCode::Normal,
-                        reason: "".into(),
-                    };
-                    if let Err(error) = initiate_close(
-                        stream,
-                        &mut state,
-                        Some(frame),
-                        WebSocketCloseInitiator::Handler,
-                        config.close_timeout,
-                        runtime,
-                        id,
-                    )
-                    .await
-                    {
-                        return protocol_outcome(inbound_tx, error);
-                    }
+                if changed.is_err() {
+                    sender_tracking_closed = true;
+                } else {
+                    let _ = sender_count_rx.borrow_and_update();
                 }
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn initiate_handler_completion(
+    stream: &mut WebSocketTransport,
+    state: &mut DriverState,
+    control_rx: &mut mpsc::Receiver<ControlCommand>,
+    outbound_rx: &mut mpsc::Receiver<OutboundCommand>,
+    control_open: &mut bool,
+    outbound_open: &mut bool,
+    config: &ResolvedWebSocketConfig,
+    runtime: &WebSocketRuntimeHandle,
+    id: WebSocketId,
+) -> Result<(), TungsteniteError> {
+    close_command_channels(control_rx, outbound_rx, control_open, outbound_open);
+
+    while let Ok(command) = control_rx.try_recv() {
+        match command {
+            ControlCommand::Close(frame) => {
+                send_queued_outbound(stream, outbound_rx, config.send_timeout, runtime, id).await?;
+                return initiate_close(
+                    stream,
+                    state,
+                    frame,
+                    WebSocketCloseInitiator::Local,
+                    config,
+                    runtime,
+                    id,
+                )
+                .await;
+            }
+            ControlCommand::Disconnect(frame) => {
+                return initiate_close(
+                    stream,
+                    state,
+                    frame,
+                    WebSocketCloseInitiator::Runtime,
+                    config,
+                    runtime,
+                    id,
+                )
+                .await;
+            }
+            command => write_control(stream, command, config.send_timeout).await?,
+        }
+    }
+
+    send_queued_outbound(stream, outbound_rx, config.send_timeout, runtime, id).await?;
+    let frame = CloseFrame {
+        code: CloseCode::Normal,
+        reason: "".into(),
+    };
+    initiate_close(
+        stream,
+        state,
+        Some(frame),
+        WebSocketCloseInitiator::Handler,
+        config,
+        runtime,
+        id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn initiate_runtime_shutdown(
+    stream: &mut WebSocketTransport,
+    state: &mut DriverState,
+    control_rx: &mut mpsc::Receiver<ControlCommand>,
+    outbound_rx: &mut mpsc::Receiver<OutboundCommand>,
+    control_open: &mut bool,
+    outbound_open: &mut bool,
+    config: &ResolvedWebSocketConfig,
+    runtime: &WebSocketRuntimeHandle,
+    id: WebSocketId,
+) -> Result<(), TungsteniteError> {
+    close_command_channels(control_rx, outbound_rx, control_open, outbound_open);
+    let frame = CloseFrame {
+        code: CloseCode::Away,
+        reason: "apagado del servidor".into(),
+    };
+    initiate_close(
+        stream,
+        state,
+        Some(frame),
+        WebSocketCloseInitiator::Runtime,
+        config,
+        runtime,
+        id,
+    )
+    .await
 }
 
 fn close_command_channels(
@@ -729,18 +833,23 @@ async fn initiate_close(
     state: &mut DriverState,
     frame: Option<CloseFrame>,
     initiator: WebSocketCloseInitiator,
-    close_timeout: Duration,
+    config: &ResolvedWebSocketConfig,
     runtime: &WebSocketRuntimeHandle,
     id: WebSocketId,
-) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+) -> Result<(), TungsteniteError> {
     if state.close_sent {
         return Ok(());
     }
     runtime.record_closing(id);
     state.close_info = Some(close_info(frame.as_ref(), initiator, false));
-    stream.send(WebSocketMessage::Close(frame)).await?;
     state.close_sent = true;
-    state.close_deadline = Some(Instant::now() + close_timeout);
+    state.close_deadline = Instant::now().checked_add(config.close_timeout);
+    send_with_timeout(
+        stream,
+        WebSocketMessage::Close(frame),
+        config.send_timeout.min(config.close_timeout),
+    )
+    .await?;
     Ok(())
 }
 
@@ -750,7 +859,7 @@ fn ping_deadline(state: &DriverState, config: &ResolvedWebSocketConfig) -> Optio
     } else {
         config
             .ping_interval
-            .map(|interval| state.last_inbound_frame + interval)
+            .and_then(|interval| state.last_inbound_frame.checked_add(interval))
     }
 }
 
@@ -758,19 +867,19 @@ fn pong_deadline(state: &DriverState, config: &ResolvedWebSocketConfig) -> Optio
     state
         .pending_ping
         .as_ref()
-        .map(|(_, sent_at)| *sent_at + config.pong_timeout)
+        .and_then(|(_, sent_at)| sent_at.checked_add(config.pong_timeout))
 }
 
 fn idle_deadline(state: &DriverState, config: &ResolvedWebSocketConfig) -> Option<Instant> {
     config
         .idle_timeout
-        .map(|timeout| state.last_application_message + timeout)
+        .and_then(|timeout| state.last_application_message.checked_add(timeout))
 }
 
 fn lifetime_deadline(state: &DriverState, config: &ResolvedWebSocketConfig) -> Option<Instant> {
     config
         .max_connection_lifetime
-        .map(|lifetime| state.opened_at + lifetime)
+        .and_then(|lifetime| state.opened_at.checked_add(lifetime))
 }
 
 fn message_rate_exceeded(
@@ -828,10 +937,27 @@ fn take_queued_before_close(
     messages
 }
 
+async fn send_queued_outbound(
+    stream: &mut WebSocketTransport,
+    outbound_rx: &mut mpsc::Receiver<OutboundCommand>,
+    timeout: Duration,
+    runtime: &WebSocketRuntimeHandle,
+    id: WebSocketId,
+) -> Result<(), TungsteniteError> {
+    for message in take_queued_before_close(outbound_rx) {
+        let bytes = message.len();
+        let message_type = application_message_type(&message);
+        send_with_timeout(stream, message, timeout).await?;
+        runtime.record_message(id, true, bytes, message_type);
+    }
+    Ok(())
+}
+
 async fn write_control(
     stream: &mut WebSocketTransport,
     command: ControlCommand,
-) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+    timeout: Duration,
+) -> Result<(), TungsteniteError> {
     let message = match command {
         ControlCommand::Ping(payload) => WebSocketMessage::Ping(payload),
         ControlCommand::Pong(payload) => WebSocketMessage::Pong(payload),
@@ -839,20 +965,55 @@ async fn write_control(
             WebSocketMessage::Close(frame)
         }
     };
-    stream.send(message).await
+    send_with_timeout(stream, message, timeout).await
+}
+
+async fn send_with_timeout<S>(
+    stream: &mut S,
+    message: WebSocketMessage,
+    timeout: Duration,
+) -> Result<(), TungsteniteError>
+where
+    S: Sink<WebSocketMessage, Error = TungsteniteError> + Unpin,
+{
+    tokio::time::timeout(timeout, stream.send(message))
+        .await
+        .map_err(|_| transport_write_timeout())?
+}
+
+async fn flush_with_timeout<S>(stream: &mut S, timeout: Duration) -> Result<(), TungsteniteError>
+where
+    S: Sink<WebSocketMessage, Error = TungsteniteError> + Unpin,
+{
+    tokio::time::timeout(timeout, stream.flush())
+        .await
+        .map_err(|_| transport_write_timeout())?
+}
+
+fn transport_write_timeout() -> TungsteniteError {
+    TungsteniteError::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "tiempo limite de escritura WebSocket agotado",
+    ))
 }
 
 fn protocol_outcome(
     inbound_tx: &mpsc::Sender<Result<WebSocketMessage, WebSocketError>>,
-    error: tokio_tungstenite::tungstenite::Error,
+    error: TungsteniteError,
 ) -> DriverOutcome {
+    let timed_out =
+        matches!(&error, TungsteniteError::Io(error) if error.kind() == io::ErrorKind::TimedOut);
     let reason = error.to_string();
     let _ = inbound_tx.try_send(Err(error.into()));
     DriverOutcome {
         close_info: WebSocketCloseInfo {
             code: 1006,
             reason,
-            initiator: WebSocketCloseInitiator::ProtocolError,
+            initiator: if timed_out {
+                WebSocketCloseInitiator::Timeout
+            } else {
+                WebSocketCloseInitiator::ProtocolError
+            },
             clean: false,
         },
         handler_completed: false,
@@ -883,8 +1044,10 @@ fn peer_disconnect_info() -> WebSocketCloseInfo {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
 
     use super::*;
     use crate::app::websocket::runtime::WebSocketRuntimeHandle;
@@ -892,6 +1055,56 @@ mod tests {
     use crate::app::websocket::{
         ResolvedWebSocketConfig, WebSocketConfig, WebSocketObservation, WebSocketObserver,
     };
+
+    struct StalledSink;
+
+    impl Sink<WebSocketMessage> for StalledSink {
+        type Error = TungsteniteError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: WebSocketMessage) -> Result<(), Self::Error> {
+            unreachable!("poll_ready never permits a send")
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_send_and_flush_have_hard_deadlines() {
+        let mut sink = StalledSink;
+        let timeout = Duration::from_millis(10);
+
+        let send_error = send_with_timeout(&mut sink, WebSocketMessage::text("payload"), timeout)
+            .await
+            .unwrap_err();
+        let flush_error = flush_with_timeout(&mut sink, timeout).await.unwrap_err();
+
+        for error in [send_error, flush_error] {
+            assert!(matches!(
+                error,
+                TungsteniteError::Io(ref source)
+                    if source.kind() == io::ErrorKind::TimedOut
+            ));
+        }
+    }
 
     #[tokio::test]
     async fn close_drain_only_takes_the_initial_queue_snapshot() {

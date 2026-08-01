@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Framework core. The implementation is split into focused submodules; this
 //! file wires them together and re-exports the public API (also surfaced at the
 //! crate root via `lib.rs`).
@@ -30,18 +28,18 @@ pub use cookie::{Cookie, SameSite, sign_value, verify_value};
 pub use error::{BoxError, HttpError, IntoHttpError};
 pub use extract::{
     ConnectInfo, Cookies, Extension, Form, FromRequest, FromRequestParts, Headers, Json,
-    MatchedPath, OriginalUri, Path, Query, State, TypedHeader,
+    MatchedPath, OptionalRejection, OriginalUri, Path, Query, State, TypedHeader,
 };
-pub use form::MultipartPart;
+pub use form::{MultipartLimits, MultipartPart};
 pub use handler::{ErrorHandler, Handler, IntoHandler, IntoMiddleware, Middleware, Next};
 pub use request::{Request, RequestBuilder, RequestParts};
 pub use response::{IntoResponse, Response, ResponseBuildError};
 pub use router::{
-    HostPattern, RouteError, RouteErrorKind, RouteHandle, RouteInfo, RouteMatchError,
-    RouteMatchErrorKind, RoutePattern, Router,
+    Dotfiles, HostPattern, RouteError, RouteErrorKind, RouteHandle, RouteInfo, RouteMatchError,
+    RouteMatchErrorKind, RoutePattern, Router, StaticFilesOptions,
 };
 pub use server::{App, TrailingSlash};
-pub use session::Sessions;
+pub use session::{SessionConfigError, SessionDataError, SessionDataErrorKind, Sessions};
 pub use sse::{SseError, SseEvent};
 pub use state::StateStore;
 pub use testing::{TestClient, TestRequest};

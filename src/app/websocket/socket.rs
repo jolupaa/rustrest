@@ -209,9 +209,17 @@ impl SocketShared {
             code: CloseCode::Again,
             reason: "Cliente WebSocket demasiado lento".into(),
         };
-        self.control
-            .send(ControlCommand::Disconnect(Some(frame)))
+        self.send_control(ControlCommand::Disconnect(Some(frame)))
             .await
+    }
+
+    async fn send_control(&self, command: ControlCommand) -> Result<(), WsError> {
+        tokio::time::timeout(self.send_timeout, self.control.send(command))
+            .await
+            .map_err(|_| {
+                self.runtime.record_saturated_send(self.id, true);
+                WsError::Timeout(WebSocketTimeout::Send)
+            })?
             .map_err(|_| WsError::Closed)
     }
 }
@@ -228,8 +236,10 @@ pub(crate) fn channel_pair(
     config: &ResolvedWebSocketConfig,
     runtime: WebSocketRuntimeHandle,
 ) -> (WebSocket, InternalWebSocketSender, DriverChannels) {
-    let (inbound_tx, inbound) = mpsc::channel(config.inbound_capacity);
-    let (outbound, outbound_rx) = mpsc::channel(config.outbound_capacity);
+    // Resolved configs are validated before upgrade. Keep this final boundary
+    // non-panicking as defense in depth for future internal call paths.
+    let (inbound_tx, inbound) = mpsc::channel(config.inbound_capacity.max(1));
+    let (outbound, outbound_rx) = mpsc::channel(config.outbound_capacity.max(1));
     let (control, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
     let (close_tx, close_rx) = watch::channel(None);
     let (sender_count_tx, sender_count_rx) = watch::channel(1);
@@ -663,11 +673,7 @@ impl WebSocketSender {
     }
 
     async fn send_control(&self, command: ControlCommand) -> Result<(), WsError> {
-        self.shared
-            .control
-            .send(command)
-            .await
-            .map_err(|_| WsError::Closed)
+        self.shared.send_control(command).await
     }
 }
 
@@ -684,12 +690,16 @@ impl WebSocketReceiver {
     where
         T: DeserializeOwned,
     {
-        match self.recv().await? {
-            Some(message) if message.is_text() || message.is_binary() => {
-                Ok(Some(serde_json::from_slice(&message.into_data())?))
+        loop {
+            match self.recv().await? {
+                Some(message @ (WebSocketMessage::Text(_) | WebSocketMessage::Binary(_))) => {
+                    return Ok(Some(serde_json::from_slice(&message.into_data())?));
+                }
+                Some(WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_)) => continue,
+                Some(WebSocketMessage::Close(_) | WebSocketMessage::Frame(_)) | None => {
+                    return Ok(None);
+                }
             }
-            Some(_) => Ok(None),
-            None => Ok(None),
         }
     }
 
@@ -822,6 +832,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_control_queue_wait_is_bounded() {
+        let (sender, _channels, runtime) =
+            sender_with_policy(BackpressurePolicy::Wait, Duration::from_millis(20));
+        for _ in 0..CONTROL_CHANNEL_CAPACITY {
+            sender
+                .try_send_control(ControlCommand::Ping(Bytes::new()))
+                .unwrap();
+        }
+
+        let error = sender.ping(Bytes::new()).await.unwrap_err();
+
+        assert!(matches!(error, WsError::Timeout(WebSocketTimeout::Send)));
+        assert_eq!(runtime.stats().saturated_sends, 1);
+    }
+
+    #[tokio::test]
     async fn websocket_backpressure_reject_does_not_wait() {
         let (sender, _channels, runtime) =
             sender_with_policy(BackpressurePolicy::Reject, Duration::from_secs(1));
@@ -914,5 +940,46 @@ mod tests {
         let error = sender.close_with(1000, reason).await.unwrap_err();
 
         assert!(matches!(error, WsError::InvalidClose { code: 1000, .. }));
+    }
+
+    #[tokio::test]
+    async fn websocket_recv_json_skips_control_frames_without_reporting_eof() {
+        let runtime = WebSocketRuntimeHandle::local();
+        let config =
+            ResolvedWebSocketConfig::from_layers(&WebSocketConfig::new(), &WebSocketConfig::new());
+        let (socket, _internal_sender, channels) = channel_pair(
+            SocketMetadata {
+                id: WebSocketId(1),
+                remote_addr: None,
+                route: "/ws".to_string(),
+                protocol: None,
+            },
+            &config,
+            runtime,
+        );
+        let (mut receiver, _sender) = socket.split();
+
+        channels
+            .inbound_tx
+            .try_send(Ok(WebSocketMessage::Ping("ping".into())))
+            .unwrap();
+        channels
+            .inbound_tx
+            .try_send(Ok(WebSocketMessage::Pong("pong".into())))
+            .unwrap();
+        channels
+            .inbound_tx
+            .try_send(Ok(WebSocketMessage::text(r#"{"ok":true}"#)))
+            .unwrap();
+
+        let value = tokio::time::timeout(
+            Duration::from_secs(1),
+            receiver.recv_json::<serde_json::Value>(),
+        )
+        .await
+        .expect("JSON receive should not stall on control frames")
+        .unwrap()
+        .expect("application data should follow control frames");
+        assert_eq!(value["ok"], true);
     }
 }

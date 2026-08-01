@@ -20,6 +20,9 @@ impl WebSocketObserver for MetadataObserver {
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let mut app = App::new();
+    // El perfil de referencia abre 11.000 sockets; alinear tambien el limite
+    // global de transporte con los limites WebSocket configurados abajo.
+    app.max_connections(12_000);
     app.websocket_hub(WsHub::local());
     if std::env::var("RUSTREST_WS_OBSERVER").as_deref() != Ok("off") {
         app.websocket_observer(Arc::new(MetadataObserver));

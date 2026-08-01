@@ -27,6 +27,24 @@ pub trait FromRequest: Sized {
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send;
 }
 
+/// Lets an extractor rejection distinguish “value absent” from malformed,
+/// oversized, or otherwise invalid input when wrapped in `Option<E>`.
+///
+/// The default is conservative: errors are propagated. Custom rejection
+/// types should return `true` only for a genuine absence that is safe for
+/// `Option<E>` to turn into `None`.
+pub trait OptionalRejection: IntoResponse + Send {
+    fn is_missing(&self) -> bool {
+        false
+    }
+}
+
+impl OptionalRejection for HttpError {
+    fn is_missing(&self) -> bool {
+        self.code() == "missing_header"
+    }
+}
+
 pub struct Json<T>(pub T);
 pub struct Form<T>(pub T);
 pub struct Path<T>(pub T);
@@ -48,7 +66,7 @@ where
 
     async fn from_request(req: &mut Request) -> Result<Self, Self::Rejection> {
         require_content_type(
-            req.header("content-type"),
+            req.singleton_header("content-type")?,
             is_json_content_type,
             "application/json",
         )?;
@@ -66,7 +84,7 @@ where
 
     async fn from_request(req: &mut Request) -> Result<Self, Self::Rejection> {
         require_content_type(
-            req.header("content-type"),
+            req.singleton_header("content-type")?,
             |value| value.eq_ignore_ascii_case("application/x-www-form-urlencoded"),
             "application/x-www-form-urlencoded",
         )?;
@@ -111,7 +129,12 @@ where
         serde_html_form::from_str(parts.raw_query().unwrap_or(""))
             .map(Query)
             .map_err(|err| {
-                HttpError::bad_request(format!("Invalid query string: {}", err)).with_source(err)
+                HttpError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_query",
+                    "La cadena de consulta no es valida",
+                )
+                .with_source(err)
             })
     }
 }
@@ -140,7 +163,12 @@ where
         deserialize_string_map(parts.cookies())
             .map(Cookies)
             .map_err(|err| {
-                HttpError::bad_request(format!("Invalid cookies: {}", err)).with_source(err)
+                HttpError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_cookies",
+                    "Las cookies de la solicitud no son validas",
+                )
+                .with_source(err)
             })
     }
 }
@@ -155,7 +183,12 @@ where
         deserialize_string_map(parts.headers())
             .map(Headers)
             .map_err(|err| {
-                HttpError::bad_request(format!("Invalid headers: {}", err)).with_source(err)
+                HttpError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_headers",
+                    "Los encabezados de la solicitud no son validos",
+                )
+                .with_source(err)
             })
     }
 }
@@ -264,22 +297,32 @@ impl FromRequestParts for Version {
 impl<E> FromRequest for Option<E>
 where
     E: FromRequest,
+    E::Rejection: OptionalRejection,
 {
-    type Rejection = HttpError;
+    type Rejection = E::Rejection;
 
     async fn from_request(req: &mut Request) -> Result<Self, Self::Rejection> {
-        Ok(E::from_request(req).await.ok())
+        match E::from_request(req).await {
+            Ok(value) => Ok(Some(value)),
+            Err(rejection) if rejection.is_missing() => Ok(None),
+            Err(rejection) => Err(rejection),
+        }
     }
 }
 
 impl<E> FromRequestParts for Option<E>
 where
     E: FromRequestParts,
+    E::Rejection: OptionalRejection,
 {
-    type Rejection = HttpError;
+    type Rejection = E::Rejection;
 
     async fn from_request_parts(parts: &mut RequestParts<'_>) -> Result<Self, Self::Rejection> {
-        Ok(E::from_request_parts(parts).await.ok())
+        match E::from_request_parts(parts).await {
+            Ok(value) => Ok(Some(value)),
+            Err(rejection) if rejection.is_missing() => Ok(None),
+            Err(rejection) => Err(rejection),
+        }
     }
 }
 
@@ -310,7 +353,12 @@ where
     T: DeserializeOwned,
 {
     let encoded = serde_urlencoded::to_string(params).map_err(|err| {
-        HttpError::bad_request(format!("Invalid path parameters: {}", err)).with_source(err)
+        HttpError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_path_parameters",
+            "Los parametros de ruta no son validos",
+        )
+        .with_source(err)
     })?;
     match serde_urlencoded::from_str(&encoded) {
         Ok(value) => Ok(value),
@@ -321,10 +369,12 @@ where
                     return Ok(value);
                 }
             }
-            Err(
-                HttpError::bad_request(format!("Invalid path parameters: {}", struct_error))
-                    .with_source(struct_error),
+            Err(HttpError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_path_parameters",
+                "Los parametros de ruta no son validos",
             )
+            .with_source(struct_error))
         }
     }
 }

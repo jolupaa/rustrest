@@ -1,18 +1,21 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{Debug, Display};
 use std::future::Future;
-use std::io::SeekFrom;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
 
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use futures_util::Stream;
 use hyper::body::Bytes;
 use hyper::{Method, StatusCode};
 use percent_encoding::percent_decode_str;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use super::trie::RouteIndex;
 use super::websocket::ResolvedWebSocketConfig;
@@ -22,6 +25,13 @@ use super::{
 };
 
 pub(crate) const METHOD_ALL: &str = "*";
+const MAX_PATH_SEGMENTS: usize = 256;
+const STATIC_OPEN_CONCURRENCY: usize = 64;
+const STATIC_STREAM_CHANNEL_CAPACITY: usize = 1;
+const DEFAULT_STATIC_STREAM_START_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_STATIC_STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_STATIC_STREAM_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
+static STATIC_OPEN_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 /// A single segment of a route pattern.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -33,27 +43,65 @@ pub(crate) enum Segment {
     Wildcard(String),
 }
 
+/// A parameter-name-independent route shape used for conflict detection.
+///
+/// Keeping segment kinds and boundaries structural avoids conflating literals
+/// such as `:`, `*`, or `a/b` with placeholder markers or path separators.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ConflictSegment {
+    Static(String),
+    Param,
+    Wildcard,
+}
+
 /// A validated, canonical route pattern such as `/users/:id`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RoutePattern {
     rendered: String,
     segments: Vec<Segment>,
     parameter_names: Vec<String>,
+    conflict_key: Vec<ConflictSegment>,
 }
 
+/// Stable classification for errors raised while registering or configuring a route.
+///
+/// This enum is non-exhaustive so RustRest can add new validation failures without
+/// breaking downstream code. Consumers must include a wildcard arm when matching it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RouteErrorKind {
+    /// A route pattern does not start with `/`.
     MissingLeadingSlash,
+    /// A parameter or wildcard has no name.
     EmptyParameter,
+    /// A parameter or wildcard name contains unsupported characters.
+    InvalidParameter,
+    /// A route pattern declares the same parameter name more than once.
     DuplicateParameter,
+    /// A wildcard appears before the final path segment.
     NonTerminalWildcard,
+    /// A route pattern exceeds the framework's segment limit.
+    TooManySegments,
+    /// The same method, path, and host constraint are already registered.
     DuplicateRoute,
+    /// A structurally equivalent parameterized pattern is already registered.
     ConflictingPattern,
+    /// A named route reuses a name that is already registered.
     DuplicateName,
+    /// A host constraint is malformed or unsupported.
     InvalidHostPattern,
+    /// URL generation did not receive a required route parameter.
     MissingUrlParameter,
+    /// URL generation received a parameter not declared by the route.
     UnexpectedUrlParameter,
+    /// A registered route pattern contains malformed percent encoding.
     InvalidPercentEncoding,
+    /// A static-file root could not be opened safely.
+    InvalidStaticRoot,
+    /// Static-file options are internally inconsistent or unsafe.
+    InvalidStaticOptions,
+    /// The HTTP method cannot be represented by an ordinary response route.
+    UnsupportedMethod,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,9 +131,17 @@ impl Display for RouteError {
 
 impl Error for RouteError {}
 
+/// Stable classification for failures encountered while matching an incoming path.
+///
+/// This enum is non-exhaustive so new path-validation failures can be introduced
+/// compatibly. Consumers must include a wildcard arm when matching it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RouteMatchErrorKind {
+    /// The request path contains malformed encoding, invalid UTF-8, or decoded controls.
     InvalidPathEncoding,
+    /// The request path exceeds the framework's segment limit.
+    TooManySegments,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,6 +155,13 @@ impl RouteMatchError {
         Self {
             kind: RouteMatchErrorKind::InvalidPathEncoding,
             message: "La ruta contiene codificacion porcentual invalida".to_string(),
+        }
+    }
+
+    pub fn too_many_segments() -> Self {
+        Self {
+            kind: RouteMatchErrorKind::TooManySegments,
+            message: format!("La ruta no puede contener mas de {MAX_PATH_SEGMENTS} segmentos"),
         }
     }
 
@@ -124,6 +187,12 @@ impl From<RouteMatchError> for HttpError {
                 "La ruta contiene codificacion porcentual invalida",
             )
             .with_source(error),
+            RouteMatchErrorKind::TooManySegments => HttpError::new(
+                StatusCode::URI_TOO_LONG,
+                "too_many_path_segments",
+                "La ruta contiene demasiados segmentos",
+            )
+            .with_source(error),
         }
     }
 }
@@ -138,6 +207,12 @@ impl RoutePattern {
         }
 
         let raw_segments: Vec<&str> = path_segments(path);
+        if raw_segments.len() > MAX_PATH_SEGMENTS {
+            return Err(RouteError::new(
+                RouteErrorKind::TooManySegments,
+                format!("Las rutas no pueden contener mas de {MAX_PATH_SEGMENTS} segmentos"),
+            ));
+        }
         let mut segments = Vec::with_capacity(raw_segments.len());
         let mut parameter_names = Vec::new();
         let mut seen = HashSet::new();
@@ -156,7 +231,7 @@ impl RoutePattern {
                 validate_parameter_name(name, &mut seen, &mut parameter_names)?;
                 segments.push(Segment::Wildcard(name.to_string()));
             } else {
-                segments.push(Segment::Static((*raw).to_string()));
+                segments.push(Segment::Static(decode_route_static_segment(raw)?));
             }
         }
 
@@ -165,10 +240,19 @@ impl RoutePattern {
 
     fn from_validated_segments(segments: Vec<Segment>, parameter_names: Vec<String>) -> Self {
         let rendered = render_pattern(&segments);
+        let conflict_key = segments
+            .iter()
+            .map(|segment| match segment {
+                Segment::Static(value) => ConflictSegment::Static(value.clone()),
+                Segment::Param(_) => ConflictSegment::Param,
+                Segment::Wildcard(_) => ConflictSegment::Wildcard,
+            })
+            .collect();
         Self {
             rendered,
             segments,
             parameter_names,
+            conflict_key,
         }
     }
 
@@ -190,21 +274,8 @@ impl RoutePattern {
         &self.parameter_names
     }
 
-    fn conflict_key(&self) -> String {
-        if self.segments.is_empty() {
-            return "/".to_string();
-        }
-
-        let mut out = String::new();
-        for segment in &self.segments {
-            out.push('/');
-            match segment {
-                Segment::Static(value) => out.push_str(value),
-                Segment::Param(_) => out.push(':'),
-                Segment::Wildcard(_) => out.push('*'),
-            }
-        }
-        out
+    fn conflict_key(&self) -> &[ConflictSegment] {
+        &self.conflict_key
     }
 }
 
@@ -219,6 +290,15 @@ fn validate_parameter_name(
             "Los parametros de ruta no pueden estar vacios",
         ));
     }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(RouteError::new(
+            RouteErrorKind::InvalidParameter,
+            format!("Nombre de parametro de ruta no valido: {name}"),
+        ));
+    }
     if !seen.insert(name.to_string()) {
         return Err(RouteError::new(
             RouteErrorKind::DuplicateParameter,
@@ -230,6 +310,12 @@ fn validate_parameter_name(
 }
 
 fn validate_segments(segments: Vec<Segment>) -> Result<RoutePattern, RouteError> {
+    if segments.len() > MAX_PATH_SEGMENTS {
+        return Err(RouteError::new(
+            RouteErrorKind::TooManySegments,
+            format!("Las rutas no pueden contener mas de {MAX_PATH_SEGMENTS} segmentos"),
+        ));
+    }
     let mut parameter_names = Vec::new();
     let mut seen = HashSet::new();
     let last = segments.len().saturating_sub(1);
@@ -254,6 +340,40 @@ fn validate_segments(segments: Vec<Segment>) -> Result<RoutePattern, RouteError>
         segments,
         parameter_names,
     ))
+}
+
+fn decode_route_static_segment(raw: &str) -> Result<String, RouteError> {
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return Err(RouteError::new(
+                    RouteErrorKind::InvalidPercentEncoding,
+                    "El patron de ruta contiene codificacion porcentual invalida",
+                ));
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    let decoded = percent_decode_str(raw).decode_utf8().map_err(|_| {
+        RouteError::new(
+            RouteErrorKind::InvalidPercentEncoding,
+            "El patron de ruta contiene UTF-8 porcentual no valido",
+        )
+    })?;
+    if decoded.chars().any(char::is_control) {
+        return Err(RouteError::new(
+            RouteErrorKind::InvalidPercentEncoding,
+            "El patron de ruta contiene caracteres de control",
+        ));
+    }
+    Ok(decoded.into_owned())
 }
 
 /// A registered route: method, parsed path pattern, handler, and the
@@ -396,6 +516,7 @@ pub(crate) fn path_segments(path: &str) -> Vec<&str> {
 }
 
 /// Parses a route pattern like `/users/:id` into segments.
+#[cfg(test)]
 pub(crate) fn parse_pattern(path: &str) -> Vec<Segment> {
     RoutePattern::parse(path)
         .expect("valid route pattern")
@@ -404,40 +525,53 @@ pub(crate) fn parse_pattern(path: &str) -> Vec<Segment> {
 
 /// Matches a parsed pattern against concrete path segments, capturing params.
 /// Returns `None` if the pattern does not match.
+#[cfg(test)]
 pub(crate) fn match_pattern(
     pattern: &[Segment],
     segments: &[&str],
 ) -> Option<HashMap<String, String>> {
-    match_pattern_strict(pattern, segments).ok().flatten()
+    let decoded = segments
+        .iter()
+        .map(|segment| decode_path_segment(segment))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    match_decoded_pattern(pattern, &decoded)
 }
 
-fn match_pattern_strict(
+fn decode_path_segments(path: &str) -> Result<Vec<Cow<'_, str>>, RouteMatchError> {
+    let segments = path_segments(path);
+    if segments.len() > MAX_PATH_SEGMENTS {
+        return Err(RouteMatchError::too_many_segments());
+    }
+    segments.into_iter().map(decode_path_segment).collect()
+}
+
+fn match_decoded_pattern(
     pattern: &[Segment],
-    segments: &[&str],
-) -> Result<Option<HashMap<String, String>>, RouteMatchError> {
+    segments: &[Cow<'_, str>],
+) -> Option<HashMap<String, String>> {
     let mut params = HashMap::new();
     let mut index = 0;
     for (pattern_index, seg) in pattern.iter().enumerate() {
         if let Segment::Wildcard(name) = seg {
             if pattern_index != pattern.len() - 1 {
-                return Ok(None);
+                return None;
             }
-            let mut decoded = Vec::new();
-            for segment in &segments[index..] {
-                decoded.push(decode_path_segment(segment)?);
-            }
-            params.insert(name.clone(), decoded.join("/"));
-            return Ok(Some(params));
+            let captured = segments[index..]
+                .iter()
+                .map(|segment| segment.as_ref())
+                .collect::<Vec<_>>()
+                .join("/");
+            params.insert(name.clone(), captured);
+            return Some(params);
         }
 
-        let Some(actual) = segments.get(index) else {
-            return Ok(None);
-        };
+        let actual = segments.get(index)?;
         match seg {
-            Segment::Static(s) if s == *actual => {}
-            Segment::Static(_) => return Ok(None),
+            Segment::Static(s) if s == actual.as_ref() => {}
+            Segment::Static(_) => return None,
             Segment::Param(name) => {
-                params.insert(name.clone(), decode_path_segment(actual)?);
+                params.insert(name.clone(), actual.to_string());
             }
             Segment::Wildcard(_) => unreachable!("wildcards are handled before segment matching"),
         }
@@ -445,17 +579,20 @@ fn match_pattern_strict(
     }
 
     if index != segments.len() {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(params))
+    Some(params)
 }
 
-fn decode_path_segment(segment: &str) -> Result<String, RouteMatchError> {
+fn decode_path_segment(segment: &str) -> Result<Cow<'_, str>, RouteMatchError> {
     validate_percent_triplets(segment)?;
-    percent_decode_str(segment)
+    let decoded = percent_decode_str(segment)
         .decode_utf8()
-        .map(|value| value.into_owned())
-        .map_err(|_| RouteMatchError::invalid_path_encoding())
+        .map_err(|_| RouteMatchError::invalid_path_encoding())?;
+    if decoded.chars().any(char::is_control) {
+        return Err(RouteMatchError::invalid_path_encoding());
+    }
+    Ok(decoded)
 }
 
 fn validate_percent_triplets(input: &str) -> Result<(), RouteMatchError> {
@@ -475,6 +612,91 @@ fn validate_percent_triplets(input: &str) -> Result<(), RouteMatchError> {
         }
     }
     Ok(())
+}
+
+/// Policy for files or directories whose name starts with `.`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Dotfiles {
+    /// Return 404 without touching dotfiles. This is the safe default.
+    #[default]
+    Deny,
+    /// Serve dotfiles that are otherwise contained beneath the static root.
+    Allow,
+}
+
+/// Security policy for a static-file mount.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StaticFilesOptions {
+    dotfiles: Dotfiles,
+    stream_start_timeout: Option<Duration>,
+    stream_stall_timeout: Option<Duration>,
+    stream_max_duration: Option<Duration>,
+}
+
+impl StaticFilesOptions {
+    pub const fn new() -> Self {
+        Self {
+            dotfiles: Dotfiles::Deny,
+            stream_start_timeout: Some(DEFAULT_STATIC_STREAM_START_TIMEOUT),
+            stream_stall_timeout: Some(DEFAULT_STATIC_STREAM_STALL_TIMEOUT),
+            stream_max_duration: Some(DEFAULT_STATIC_STREAM_MAX_DURATION),
+        }
+    }
+
+    pub const fn dotfiles(mut self, policy: Dotfiles) -> Self {
+        self.dotfiles = policy;
+        self
+    }
+
+    /// Maximum time the response body may remain completely unpolled before
+    /// its file and admission permit are released. The safe default is one
+    /// minute, longer than the default request/middleware deadline.
+    pub const fn stream_start_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_start_timeout = Some(timeout);
+        self
+    }
+
+    /// Disables the first-body-poll deadline. Only use this when the transport
+    /// guarantees that response bodies are polled or cancelled promptly.
+    pub const fn disable_stream_start_timeout(mut self) -> Self {
+        self.stream_start_timeout = None;
+        self
+    }
+
+    /// Maximum time a static-file producer may remain blocked while handing a
+    /// chunk to the HTTP transport. The safe default is 15 seconds.
+    pub const fn stream_stall_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_stall_timeout = Some(timeout);
+        self
+    }
+
+    /// Disables the stalled-consumer deadline. Only use this when an upstream
+    /// proxy enforces an equivalent response-write timeout.
+    pub const fn disable_stream_stall_timeout(mut self) -> Self {
+        self.stream_stall_timeout = None;
+        self
+    }
+
+    /// Maximum total lifetime of a static-file producer. The safe default is
+    /// five minutes, which prevents slow-drip consumers from holding a file
+    /// descriptor and the global admission permit forever.
+    pub const fn stream_max_duration(mut self, timeout: Duration) -> Self {
+        self.stream_max_duration = Some(timeout);
+        self
+    }
+
+    /// Disables the total stream lifetime. Only use this with an equivalent
+    /// externally enforced response lifetime.
+    pub const fn disable_stream_max_duration(mut self) -> Self {
+        self.stream_max_duration = None;
+        self
+    }
+}
+
+impl Default for StaticFilesOptions {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// A collection of routes that can be defined independently (e.g. in its own
@@ -659,7 +881,32 @@ impl Router {
     where
         P: Into<PathBuf>,
     {
-        let root = Arc::new(root.into());
+        self.static_files_with_options(prefix, root, StaticFilesOptions::default())
+    }
+
+    /// Mounts a capability-confined static directory with an explicit
+    /// dotfile policy.
+    pub fn static_files_with_options<P>(
+        &mut self,
+        prefix: &str,
+        root: P,
+        options: StaticFilesOptions,
+    ) -> Result<(), RouteError>
+    where
+        P: Into<PathBuf>,
+    {
+        validate_static_options(options)?;
+        let root_path = root.into();
+        let root = Dir::open_ambient_dir(&root_path, ambient_authority()).map_err(|error| {
+            RouteError::new(
+                RouteErrorKind::InvalidStaticRoot,
+                format!(
+                    "No se pudo abrir la raiz de archivos estaticos {}: {error}",
+                    root_path.display()
+                ),
+            )
+        })?;
+        let root = Arc::new(root);
         let pattern = join_paths(prefix, "/*path");
         let get_pattern = RoutePattern::parse(&pattern)?;
         let head_pattern = get_pattern.clone();
@@ -668,8 +915,9 @@ impl Router {
         self.validate_route_insert("HEAD", &head_pattern, None, None)?;
 
         self.routes
-            .push(static_route("GET", get_pattern, Arc::clone(&root)));
-        self.routes.push(static_route("HEAD", head_pattern, root));
+            .push(static_route("GET", get_pattern, Arc::clone(&root), options));
+        self.routes
+            .push(static_route("HEAD", head_pattern, root, options));
         self.index.take();
         Ok(())
     }
@@ -696,6 +944,16 @@ impl Router {
     where
         H: IntoHandler<M>,
     {
+        // CONNECT changes the HTTP connection into a tunnel and therefore
+        // cannot be implemented by an ordinary request/response handler. Do
+        // not advertise a route whose successful response would not own the
+        // transport; a dedicated tunnel API can add this safely in the future.
+        if method.eq_ignore_ascii_case(Method::CONNECT.as_str()) {
+            return Err(RouteError::new(
+                RouteErrorKind::UnsupportedMethod,
+                "CONNECT requiere una API de tunel dedicada y no se puede registrar como ruta HTTP",
+            ));
+        }
         let pattern = RoutePattern::parse(path)?;
         self.validate_route_insert(method, &pattern, None, None)?;
 
@@ -863,7 +1121,11 @@ impl Router {
         path: &str,
         host: Option<&str>,
     ) -> Result<Option<MatchedRoute>, RouteMatchError> {
-        let segments = path_segments(path);
+        // Decode and validate every request segment exactly once before trie
+        // lookup. The vector retains segment boundaries, so an encoded slash
+        // (`%2F`) remains data inside one captured parameter rather than
+        // becoming a path separator.
+        let segments = decode_path_segments(path)?;
         for index in self.index().find_candidates(method, &segments) {
             let route = &self.routes[index];
             if !host_matches(route.host.as_ref(), host) {
@@ -871,7 +1133,40 @@ impl Router {
             }
             // The index only returns routes whose pattern matches these
             // segments structurally, so `None` here is defensive.
-            let Some(params) = match_pattern_strict(route.pattern.segments(), &segments)? else {
+            let Some(params) = match_decoded_pattern(route.pattern.segments(), &segments) else {
+                continue;
+            };
+            return Ok(Some(MatchedRoute {
+                handler: Arc::clone(&route.handler),
+                middlewares: route.middlewares.clone(),
+                params,
+                pattern: route.pattern.as_str().to_string(),
+                kind: route.kind.clone(),
+                body_limit: route.meta.body_limit,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Resolves only ordinary HTTP routes. This is used for implicit `HEAD`
+    /// fallback so a WebSocket route registered as `GET` is never invoked as
+    /// an HTTP handler.
+    pub(crate) fn resolve_http_method(
+        &self,
+        method: &str,
+        path: &str,
+        host: Option<&str>,
+    ) -> Result<Option<MatchedRoute>, RouteMatchError> {
+        let segments = decode_path_segments(path)?;
+        for index in self.index().find_candidates(method, &segments) {
+            let route = &self.routes[index];
+            if let RouteKind::WebSocket(_) = &route.kind {
+                continue;
+            }
+            if !host_matches(route.host.as_ref(), host) {
+                continue;
+            }
+            let Some(params) = match_decoded_pattern(route.pattern.segments(), &segments) else {
                 continue;
             };
             return Ok(Some(MatchedRoute {
@@ -922,14 +1217,16 @@ impl Router {
         path: &str,
         host: Option<&str>,
     ) -> Result<Vec<String>, RouteMatchError> {
-        let segments = path_segments(path);
+        let segments = decode_path_segments(path)?;
         let mut methods = Vec::new();
         for (index, method) in self.index().matching_methods(&segments) {
             let route = &self.routes[index];
             if !host_matches(route.host.as_ref(), host) {
                 continue;
             }
-            match_pattern_strict(route.pattern.segments(), &segments)?;
+            if match_decoded_pattern(route.pattern.segments(), &segments).is_none() {
+                continue;
+            }
             if method != METHOD_ALL && !methods.contains(&method) {
                 methods.push(method);
             }
@@ -1069,7 +1366,7 @@ where
     for segment in pattern.segments() {
         out.push('/');
         match segment {
-            Segment::Static(value) => out.push_str(value),
+            Segment::Static(value) => out.push_str(&encode_path_segment(value)),
             Segment::Param(name) => {
                 let value = params.get(name).expect("checked above");
                 out.push_str(&encode_path_segment(value));
@@ -1100,11 +1397,16 @@ fn encode_path_segment(input: &str) -> String {
     encoded
 }
 
-fn static_route(method: &str, pattern: RoutePattern, root: Arc<PathBuf>) -> Route {
+fn static_route(
+    method: &str,
+    pattern: RoutePattern,
+    root: Arc<Dir>,
+    options: StaticFilesOptions,
+) -> Route {
     let handler: Handler = Arc::new(
         move |req| -> Pin<Box<dyn Future<Output = Response> + Send>> {
             let root = Arc::clone(&root);
-            Box::pin(async move { serve_static_file(root, req).await })
+            Box::pin(async move { serve_static_file(root, req, options).await })
         },
     );
 
@@ -1121,11 +1423,10 @@ fn static_route(method: &str, pattern: RoutePattern, root: Arc<PathBuf>) -> Rout
 }
 
 /// Builds an `Allow` header value from the matched methods, implicitly adding
-/// `HEAD` (when `GET` is present) and `OPTIONS`, both of which the server
-/// answers automatically.
-pub(crate) fn allow_header_value(allowed: &[String]) -> String {
+/// `HEAD` only when an ordinary HTTP `GET` can serve it, plus `OPTIONS`.
+pub(crate) fn allow_header_value(allowed: &[String], implicit_head: bool) -> String {
     let mut methods = allowed.to_vec();
-    if methods.iter().any(|m| m == "GET") && !methods.iter().any(|m| m == "HEAD") {
+    if implicit_head && !methods.iter().any(|m| m == "HEAD") {
         methods.push("HEAD".to_string());
     }
     if !methods.iter().any(|m| m == "OPTIONS") {
@@ -1156,7 +1457,7 @@ fn render_pattern(pattern: &[Segment]) -> String {
     for segment in pattern {
         out.push('/');
         match segment {
-            Segment::Static(s) => out.push_str(s),
+            Segment::Static(s) => out.push_str(&encode_path_segment(s)),
             Segment::Param(name) => {
                 out.push(':');
                 out.push_str(name);
@@ -1281,26 +1582,55 @@ fn join_paths(prefix: &str, suffix: &str) -> String {
     }
 }
 
-async fn serve_static_file(root: Arc<PathBuf>, req: Request) -> Response {
-    let Some(mut file_path) = safe_static_path(&root, req.param("path").unwrap_or("")) else {
-        return Response::bad_request();
+async fn serve_static_file(root: Arc<Dir>, req: Request, options: StaticFilesOptions) -> Response {
+    let relative = match safe_static_relative(req.param("path").unwrap_or(""), options.dotfiles) {
+        Ok(relative) => relative,
+        Err(StaticPathRejection::Hidden) => return Response::not_found(),
+        Err(StaticPathRejection::Invalid) => return Response::bad_request(),
     };
-
-    if matches!(tokio::fs::metadata(&file_path).await, Ok(metadata) if metadata.is_dir()) {
-        file_path.push("index.html");
-    }
-
-    let Ok(metadata) = tokio::fs::metadata(&file_path).await else {
-        return Response::not_found();
+    let admission = Arc::clone(
+        STATIC_OPEN_ADMISSION.get_or_init(|| Arc::new(Semaphore::new(STATIC_OPEN_CONCURRENCY))),
+    );
+    let permit = match admission.acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => return Response::internal_server_error(),
     };
-    let total_len = metadata.len();
-    let modified = metadata.modified().ok();
+    let opened =
+        tokio::task::spawn_blocking(move || (open_static_file(&root, relative), permit)).await;
+    let (opened, permit) = match opened {
+        Ok(opened) => opened,
+        Err(error) => {
+            return Response::from_error(
+                HttpError::internal_server_error("No se pudo abrir el archivo estatico")
+                    .with_source(error),
+            );
+        }
+    };
+    let OpenedStaticFile {
+        file,
+        relative_path,
+        total_len,
+        modified,
+    } = match opened {
+        Ok(opened) => opened,
+        Err(error) if static_error_is_not_found(&error) => {
+            return Response::not_found();
+        }
+        Err(error) => {
+            return Response::from_error(
+                HttpError::internal_server_error("No se pudo abrir el archivo estatico")
+                    .with_source(error),
+            );
+        }
+    };
     let etag = modified.map(|time| {
         let stamp = time
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        format!("\"{:x}-{:x}\"", total_len, stamp)
+        // Length + modification time is efficient but is not a byte-for-byte
+        // content hash, so it is a weak validator by definition.
+        format!("W/\"{:x}-{:x}\"", total_len, stamp)
     });
 
     let validators = |res: Response| -> Response {
@@ -1314,7 +1644,19 @@ async fn serve_static_file(root: Arc<PathBuf>, req: Request) -> Response {
         res
     };
 
-    let range_requested = req.header("range").is_some();
+    // RFC range processing applies to GET. A HEAD request must describe the
+    // full selected representation rather than turning a Range field into a
+    // misleading 206/416 response with no body.
+    let range_header = req.method.eq_ignore_ascii_case("GET").then(|| {
+        let values = req.headers_all("range");
+        if values.is_empty() {
+            req.header("range").map(str::to_string)
+        } else {
+            Some(values.join(","))
+        }
+    });
+    let range_header = range_header.flatten();
+    let range_requested = range_header.is_some();
     let preconditions =
         super::middleware::evaluate_preconditions(&req, etag.as_deref(), modified, range_requested);
     match preconditions {
@@ -1333,8 +1675,8 @@ async fn serve_static_file(root: Arc<PathBuf>, req: Request) -> Response {
     let range = if preconditions == super::middleware::PreconditionResult::IgnoreRange {
         None
     } else {
-        match req
-            .header("range")
+        match range_header
+            .as_deref()
             .map(|raw| parse_byte_range(raw, total_len))
         {
             Some(RangeParse::Satisfiable(start, end)) => Some((start, end)),
@@ -1349,26 +1691,70 @@ async fn serve_static_file(root: Arc<PathBuf>, req: Request) -> Response {
         }
     };
 
-    let Ok(mut file) = tokio::fs::File::open(&file_path).await else {
-        return Response::not_found();
-    };
+    // HEAD is metadata-only. Do not start the eager supervised producer: an
+    // empty stream retains the selected representation length without making
+    // finalization compare it to an empty buffered body. The opened file and
+    // admission permit are dropped as this handler returns.
+    if req.method.eq_ignore_ascii_case("HEAD") {
+        return validators(
+            Response::stream(futures_util::stream::empty::<std::io::Result<Bytes>>())
+                .content_type(content_type_for_path(&relative_path))
+                .header("content-length", &total_len.to_string()),
+        );
+    }
 
     let (start, len, mut response_status) = match range {
         Some((start, end)) => (start, end - start + 1, 206),
         None => (0, total_len, 200),
     };
-    if start > 0 && file.seek(SeekFrom::Start(start)).await.is_err() {
-        return Response::internal_server_error();
-    }
     // An empty file has nothing to stream; serve it as a normal 200.
     if len == 0 {
         response_status = 200;
+        return validators(
+            Response::stream(futures_util::stream::empty::<std::io::Result<Bytes>>())
+                .status(response_status)
+                .content_type(content_type_for_path(&relative_path))
+                .header("content-length", "0"),
+        );
     }
 
-    let mut res = Response::stream(file_stream(file, len))
-        .status(response_status)
-        .content_type(content_type_for_path(&file_path))
-        .header("content-length", &len.to_string());
+    let (file, permit) = if start > 0 {
+        let seek = tokio::task::spawn_blocking(move || {
+            let mut file = file;
+            let result = file.seek(SeekFrom::Start(start));
+            (file, permit, result)
+        })
+        .await;
+        match seek {
+            Ok((file, permit, Ok(_))) => (file, permit),
+            Ok((_file, _permit, Err(error))) => {
+                return Response::from_error(
+                    HttpError::internal_server_error("No se pudo posicionar el archivo estatico")
+                        .with_source(error),
+                );
+            }
+            Err(error) => {
+                return Response::from_error(
+                    HttpError::internal_server_error("No se pudo posicionar el archivo estatico")
+                        .with_source(error),
+                );
+            }
+        }
+    } else {
+        (file, permit)
+    };
+
+    let mut res = Response::stream(file_stream(
+        file,
+        len,
+        permit,
+        options.stream_start_timeout,
+        options.stream_stall_timeout,
+        options.stream_max_duration,
+    ))
+    .status(response_status)
+    .content_type(content_type_for_path(&relative_path))
+    .header("content-length", &len.to_string());
     if let Some((start, end)) = range {
         res = res.header(
             "content-range",
@@ -1376,6 +1762,15 @@ async fn serve_static_file(root: Arc<PathBuf>, req: Request) -> Response {
         );
     }
     validators(res)
+}
+
+fn static_error_is_not_found(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        // cap-std intentionally reports a symlink/capability-root escape as a
+        // synthetic PermissionDenied error. Hide that client-selected path as
+        // 404 while preserving genuine OS permission/resource errors as 500.
+        || error.kind() == std::io::ErrorKind::PermissionDenied
+            && error.to_string() == "a path led outside of the filesystem"
 }
 
 enum RangeParse {
@@ -1387,9 +1782,13 @@ enum RangeParse {
 /// Parses a single-range `Range: bytes=...` header against a resource of
 /// `total_len` bytes. Multi-range and malformed headers are ignored.
 fn parse_byte_range(raw: &str, total_len: u64) -> RangeParse {
-    let Some(spec) = raw.trim().strip_prefix("bytes=") else {
+    let Some((unit, spec)) = raw.trim().split_once('=') else {
         return RangeParse::Ignored;
     };
+    if !unit.trim().eq_ignore_ascii_case("bytes") {
+        return RangeParse::Ignored;
+    }
+    let spec = spec.trim();
     if spec.contains(',') {
         return RangeParse::Ignored;
     }
@@ -1430,52 +1829,313 @@ fn parse_byte_range(raw: &str, total_len: u64) -> RangeParse {
     RangeParse::Satisfiable(start, end)
 }
 
-/// Streams `len` bytes from `file` in 64 KB chunks. On a read error the
-/// body terminates with that error instead of silently ending early.
+struct PendingStaticStream {
+    file: std::fs::File,
+    permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+enum StaticStreamState {
+    Pending {
+        source: Arc<Mutex<Option<PendingStaticStream>>>,
+        cancel_start_lease: Option<oneshot::Sender<()>>,
+        len: u64,
+        stall_timeout: Option<Duration>,
+        max_duration: Option<Duration>,
+    },
+    Active {
+        receiver: mpsc::Receiver<std::io::Result<Bytes>>,
+        remaining: u64,
+    },
+    Finished,
+}
+
+/// Lazily streams `len` bytes from `file` in 64 KB chunks through a one-chunk
+/// channel. The producer starts only on the body's first poll, so outbound
+/// middleware time does not consume its stall/lifetime budgets. A separate
+/// start lease releases an entirely unpolled file. Each blocking OS read owns
+/// the admission permit, so timing out its Tokio join cannot detach an
+/// unaccounted file descriptor. On any early exit, the consumer emits
+/// `UnexpectedEof` rather than silently ending before Content-Length.
 fn file_stream(
-    file: tokio::fs::File,
+    file: std::fs::File,
     len: u64,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    start_timeout: Option<Duration>,
+    stall_timeout: Option<Duration>,
+    max_duration: Option<Duration>,
 ) -> impl Stream<Item = std::io::Result<Bytes>> + Send {
-    futures_util::stream::unfold((file, len), |(mut file, remaining)| async move {
-        if remaining == 0 {
-            return None;
+    let source = Arc::new(Mutex::new(Some(PendingStaticStream { file, permit })));
+    let supervisor_source = Arc::clone(&source);
+    let (cancel_start_lease, start_lease_cancelled) = oneshot::channel();
+    tokio::spawn(async move {
+        match start_timeout {
+            Some(timeout) => {
+                tokio::select! {
+                    _ = tokio::time::sleep(timeout) => {}
+                    _ = start_lease_cancelled => {}
+                }
+            }
+            None => {
+                let _ = start_lease_cancelled.await;
+            }
         }
-        let chunk = remaining.min(64 * 1024) as usize;
-        let mut buffer = vec![0u8; chunk];
-        match file.read(&mut buffer).await {
-            Ok(0) => Some((
-                Err(std::io::Error::new(
+        supervisor_source
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+    });
+
+    futures_util::stream::unfold(
+        StaticStreamState::Pending {
+            source,
+            cancel_start_lease: Some(cancel_start_lease),
+            len,
+            stall_timeout,
+            max_duration,
+        },
+        |mut state| async move {
+            loop {
+                match state {
+                    StaticStreamState::Pending {
+                        source,
+                        mut cancel_start_lease,
+                        len,
+                        stall_timeout,
+                        max_duration,
+                    } => {
+                        let source = source
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take();
+                        // Wakes the start-lease supervisor. The source has
+                        // already moved to this body poll, so its cleanup is a
+                        // no-op.
+                        drop(cancel_start_lease.take());
+                        let Some(source) = source else {
+                            return Some((
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "static file body was not polled before its start deadline",
+                                )),
+                                StaticStreamState::Finished,
+                            ));
+                        };
+                        state = StaticStreamState::Active {
+                            receiver: spawn_static_file_producer(
+                                source,
+                                len,
+                                stall_timeout,
+                                max_duration,
+                            ),
+                            remaining: len,
+                        };
+                    }
+                    StaticStreamState::Active {
+                        mut receiver,
+                        remaining,
+                    } => match receiver.recv().await {
+                        Some(Ok(bytes)) => {
+                            let remaining = remaining.saturating_sub(bytes.len() as u64);
+                            return Some((
+                                Ok(bytes),
+                                StaticStreamState::Active {
+                                    receiver,
+                                    remaining,
+                                },
+                            ));
+                        }
+                        Some(Err(error)) => {
+                            return Some((Err(error), StaticStreamState::Finished));
+                        }
+                        None if remaining > 0 => {
+                            return Some((
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "static file stream ended before content-length bytes were sent",
+                                )),
+                                StaticStreamState::Finished,
+                            ));
+                        }
+                        None => return None,
+                    },
+                    StaticStreamState::Finished => return None,
+                }
+            }
+        },
+    )
+}
+
+fn spawn_static_file_producer(
+    source: PendingStaticStream,
+    len: u64,
+    stall_timeout: Option<Duration>,
+    max_duration: Option<Duration>,
+) -> mpsc::Receiver<std::io::Result<Bytes>> {
+    let (sender, receiver) = mpsc::channel(STATIC_STREAM_CHANNEL_CAPACITY);
+    tokio::spawn(async move {
+        let mut source = source;
+        let mut remaining = len;
+        let now = tokio::time::Instant::now();
+        let deadline = max_duration.and_then(|duration| now.checked_add(duration));
+
+        while remaining > 0 {
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                break;
+            }
+            let chunk = remaining.min(64 * 1024) as usize;
+            let read_task = tokio::task::spawn_blocking(move || {
+                let PendingStaticStream { mut file, permit } = source;
+                let mut buffer = vec![0u8; chunk];
+                let read = file.read(&mut buffer);
+                (PendingStaticStream { file, permit }, buffer, read)
+            });
+            let (next_source, mut buffer, read) = match deadline_remaining(deadline) {
+                Some(remaining_time) => match tokio::time::timeout(remaining_time, read_task).await
+                {
+                    Ok(Ok(read)) => read,
+                    // The blocking read retains source (including the permit)
+                    // until the OS operation actually returns.
+                    Ok(Err(_)) | Err(_) => break,
+                },
+                None => match read_task.await {
+                    Ok(read) => read,
+                    Err(_) => break,
+                },
+            };
+            source = next_source;
+            let item = match read {
+                Ok(0) => Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "static file ended before content-length bytes were read",
                 )),
-                (file, 0),
-            )),
-            Err(error) => Some((Err(error), (file, 0))),
-            Ok(read) => {
-                buffer.truncate(read);
-                Some((Ok(Bytes::from(buffer)), (file, remaining - read as u64)))
+                Err(error) => Err(error),
+                Ok(read) => {
+                    buffer.truncate(read);
+                    remaining -= read as u64;
+                    Ok(Bytes::from(buffer))
+                }
+            };
+            let terminal = item.is_err();
+            if !send_static_chunk(&sender, item, stall_timeout, deadline).await {
+                break;
+            }
+            if terminal {
+                break;
             }
         }
+    });
+    receiver
+}
+
+async fn send_static_chunk(
+    sender: &mpsc::Sender<std::io::Result<Bytes>>,
+    item: std::io::Result<Bytes>,
+    stall_timeout: Option<Duration>,
+    deadline: Option<tokio::time::Instant>,
+) -> bool {
+    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+        return false;
+    }
+    let timeout = match (stall_timeout, deadline_remaining(deadline)) {
+        (Some(stall), Some(lifetime)) => Some(stall.min(lifetime)),
+        (Some(stall), None) => Some(stall),
+        (None, Some(lifetime)) => Some(lifetime),
+        (None, None) => None,
+    };
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, sender.send(item))
+            .await
+            .is_ok_and(|result| result.is_ok()),
+        None => sender.send(item).await.is_ok(),
+    }
+}
+
+fn deadline_remaining(deadline: Option<tokio::time::Instant>) -> Option<Duration> {
+    deadline.map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+}
+
+fn validate_static_options(options: StaticFilesOptions) -> Result<(), RouteError> {
+    let now = std::time::Instant::now();
+    for (name, timeout) in [
+        ("stream_start_timeout", options.stream_start_timeout),
+        ("stream_stall_timeout", options.stream_stall_timeout),
+        ("stream_max_duration", options.stream_max_duration),
+    ] {
+        if timeout.is_some_and(|timeout| timeout.is_zero() || now.checked_add(timeout).is_none()) {
+            return Err(RouteError::new(
+                RouteErrorKind::InvalidStaticOptions,
+                format!("{name} debe ser positivo y representable"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+struct OpenedStaticFile {
+    file: std::fs::File,
+    relative_path: PathBuf,
+    total_len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn open_static_file(root: &Dir, mut relative_path: PathBuf) -> std::io::Result<OpenedStaticFile> {
+    let mut file = root.open(&relative_path)?;
+    let mut metadata = file.metadata()?;
+    if metadata.is_dir() {
+        relative_path.push("index.html");
+        file = root.open(&relative_path)?;
+        metadata = file.metadata()?;
+    }
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "la ruta estatica no es un archivo regular",
+        ));
+    }
+    Ok(OpenedStaticFile {
+        file: file.into_std(),
+        relative_path,
+        total_len: metadata.len(),
+        modified: metadata.modified().ok().map(|time| time.into_std()),
     })
 }
 
-fn safe_static_path(root: &FsPath, requested: &str) -> Option<PathBuf> {
+#[derive(Clone, Copy)]
+enum StaticPathRejection {
+    Hidden,
+    Invalid,
+}
+
+fn safe_static_relative(
+    requested: &str,
+    dotfiles: Dotfiles,
+) -> Result<PathBuf, StaticPathRejection> {
     let relative = if requested.is_empty() {
         "index.html"
     } else {
         requested
     };
 
-    let mut path = root.to_path_buf();
+    let mut path = PathBuf::new();
     for component in FsPath::new(relative).components() {
         match component {
-            Component::Normal(part) => path.push(part),
+            Component::Normal(part) => {
+                if dotfiles == Dotfiles::Deny && part.to_string_lossy().starts_with('.') {
+                    return Err(StaticPathRejection::Hidden);
+                }
+                path.push(part);
+            }
+            Component::CurDir if dotfiles == Dotfiles::Deny => {
+                return Err(StaticPathRejection::Hidden);
+            }
             Component::CurDir => {}
-            Component::Prefix(_) | Component::RootDir | Component::ParentDir => return None,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
+                return Err(StaticPathRejection::Invalid);
+            }
         }
     }
 
-    Some(path)
+    Ok(path)
 }
 
 fn content_type_for_path(path: &FsPath) -> &'static str {
@@ -1501,5 +2161,139 @@ fn content_type_for_path(path: &FsPath) -> &'static str {
 impl Default for Router {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod static_stream_deadline_tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    fn test_file(label: &str) -> (PathBuf, Vec<u8>) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rustrest-static-{label}-{}-{unique}.bin",
+            std::process::id()
+        ));
+        let body = vec![b'x'; 4 * 64 * 1024];
+        std::fs::write(&path, &body).unwrap();
+        (path, body)
+    }
+
+    #[tokio::test]
+    async fn stalled_static_consumer_releases_the_file_admission_permit() {
+        let (path, body) = test_file("stall");
+        let file = std::fs::File::open(&path).unwrap();
+        let admission = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&admission).acquire_owned().await.unwrap();
+        let mut stream = Box::pin(file_stream(
+            file,
+            body.len() as u64,
+            permit,
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_millis(25)),
+            Some(Duration::from_secs(1)),
+        ));
+
+        assert_eq!(stream.next().await.unwrap().unwrap().len(), 64 * 1024);
+        let reacquired = tokio::time::timeout(
+            Duration::from_secs(2),
+            Arc::clone(&admission).acquire_owned(),
+        )
+        .await
+        .expect("a stalled response must release static admission")
+        .unwrap();
+        drop(reacquired);
+
+        let mut saw_deadline_error = false;
+        while let Some(chunk) = stream.next().await {
+            if let Err(error) = chunk {
+                assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+                saw_deadline_error = true;
+                break;
+            }
+        }
+        assert!(saw_deadline_error);
+
+        drop(stream);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn entirely_unpolled_static_body_releases_its_start_lease() {
+        let (path, body) = test_file("unpolled");
+        let file = std::fs::File::open(&path).unwrap();
+        let admission = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&admission).acquire_owned().await.unwrap();
+        let mut stream = Box::pin(file_stream(
+            file,
+            body.len() as u64,
+            permit,
+            Some(Duration::from_millis(25)),
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_secs(1)),
+        ));
+
+        let reacquired = tokio::time::timeout(
+            Duration::from_secs(2),
+            Arc::clone(&admission).acquire_owned(),
+        )
+        .await
+        .expect("an unpolled response must release static admission")
+        .unwrap();
+        drop(reacquired);
+        assert_eq!(
+            stream.next().await.unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+
+        drop(stream);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn outbound_middleware_delay_does_not_consume_the_stall_budget() {
+        let (path, body) = test_file("middleware");
+        let file = std::fs::File::open(&path).unwrap();
+        let admission = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&admission).acquire_owned().await.unwrap();
+        let mut stream = Box::pin(file_stream(
+            file,
+            body.len() as u64,
+            permit,
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_millis(25)),
+            Some(Duration::from_secs(1)),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let mut received = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(received, body);
+
+        drop(stream);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn static_stream_deadlines_must_be_positive_and_representable() {
+        for options in [
+            StaticFilesOptions::new().stream_start_timeout(Duration::ZERO),
+            StaticFilesOptions::new().stream_stall_timeout(Duration::ZERO),
+            StaticFilesOptions::new().stream_max_duration(Duration::ZERO),
+            StaticFilesOptions::new().stream_start_timeout(Duration::MAX),
+            StaticFilesOptions::new().stream_stall_timeout(Duration::MAX),
+            StaticFilesOptions::new().stream_max_duration(Duration::MAX),
+        ] {
+            assert_eq!(
+                validate_static_options(options).unwrap_err().kind(),
+                RouteErrorKind::InvalidStaticOptions
+            );
+        }
     }
 }

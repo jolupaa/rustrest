@@ -4,10 +4,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use rustrest::{
-    App, BackpressurePolicy, InMemoryWsBroker, WebSocketCapacityError, WebSocketConfig,
-    WebSocketEvent, WebSocketObservation, WebSocketObserver, WebSocketRuntimeHandle,
-    WsBroadcastError, WsBroadcastReport, WsBroker, WsBrokerPayload, WsBrokerPublication,
-    WsBrokerTarget, WsError, WsHub, WsNodeId, WsPublicationId,
+    App, BackpressurePolicy, InMemoryWsBroker, OriginPolicy, WebSocketCapacityError,
+    WebSocketConfig, WebSocketEvent, WebSocketObservation, WebSocketObserver,
+    WebSocketRuntimeHandle, WsBroadcastError, WsBroadcastReport, WsBroker, WsBrokerPayload,
+    WsBrokerPublication, WsBrokerTarget, WsError, WsHub, WsNodeId, WsPublicationId,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -68,6 +68,9 @@ async fn spawn_app_with_runtime(
     configure: impl FnOnce(&mut App),
 ) -> (SocketAddr, WebSocketRuntimeHandle, ServerGuard) {
     let mut app = App::new();
+    app.websocket_defaults(
+        WebSocketConfig::new().origin_policy(OriginPolicy::same_host().allow_missing(true)),
+    );
     configure(&mut app);
     let runtime = app.websocket_runtime();
 
@@ -120,6 +123,9 @@ async fn spawn_broker_app(
         .build()
         .unwrap();
     let mut app = App::new();
+    app.websocket_defaults(
+        WebSocketConfig::new().origin_policy(OriginPolicy::same_host().allow_missing(true)),
+    );
     app.websocket_hub(hub);
     for path in ["/chat/:channel", "/admin/chat/:channel"] {
         let report_tx = report_tx.clone();
@@ -246,6 +252,9 @@ async fn assert_no_websocket_message(
 async fn websocket_room_broadcast_excludes_sender_and_respects_route_scope() {
     let (report_tx, mut report_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new();
+    app.websocket_defaults(
+        WebSocketConfig::new().origin_policy(OriginPolicy::same_host().allow_missing(true)),
+    );
     let hub = app.websocket_hub_handle();
     for path in ["/chat/:channel", "/admin/chat/:channel"] {
         let report_tx = report_tx.clone();
@@ -517,6 +526,9 @@ async fn websocket_broker_failure_keeps_local_report() {
 async fn websocket_local_administration_sends_disconnects_and_snapshots_rooms() {
     let (id_tx, mut id_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new();
+    app.websocket_defaults(
+        WebSocketConfig::new().origin_policy(OriginPolicy::same_host().allow_missing(true)),
+    );
     let hub = app.websocket_hub_handle();
     let _ = app.websocket("/admin/:tenant", move |socket| {
         let id_tx = id_tx.clone();
@@ -788,6 +800,9 @@ async fn websocket_observer_tracing_records_metadata_without_payload() {
     };
     tracing::subscriber::set_global_default(subscriber).unwrap();
     let mut app = App::new();
+    app.websocket_defaults(
+        WebSocketConfig::new().origin_policy(OriginPolicy::same_host().allow_missing(true)),
+    );
     let _ = app.websocket("/ws", |mut socket| async move {
         if let Some(message) = socket.recv().await.unwrap() {
             socket.send(message).await.unwrap();
@@ -907,7 +922,11 @@ async fn websocket_rejects_duplicate_version() {
 #[tokio::test]
 async fn websocket_process_capacity_rejects_before_101() {
     let (addr, _server) = spawn_app(|app| {
-        app.websocket_defaults(WebSocketConfig::new().max_connections(1));
+        app.websocket_defaults(
+            WebSocketConfig::new()
+                .max_connections(1)
+                .origin_policy(OriginPolicy::same_host().allow_missing(true)),
+        );
         let _ = app.websocket("/ws", |_socket| async move {
             std::future::pending::<()>().await;
         });
@@ -989,6 +1008,9 @@ async fn websocket_ip_capacity_rejects_with_retry_after_before_101() {
 #[tokio::test]
 async fn websocket_routes_exchange_messages_and_events() {
     let mut app = App::new();
+    app.websocket_defaults(
+        WebSocketConfig::new().origin_policy(OriginPolicy::same_host().allow_missing(true)),
+    );
     let _ = app.websocket("/ws", |mut socket| async move {
         while let Some(message) = socket.recv().await.unwrap() {
             if message.is_text() {
@@ -1033,6 +1055,9 @@ async fn websocket_config_negotiates_protocol_pings_and_limits_message_size() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     let mut app = App::new();
+    app.websocket_defaults(
+        WebSocketConfig::new().origin_policy(OriginPolicy::same_host().allow_missing(true)),
+    );
     let config = WebSocketConfig::new()
         .protocols(&["superchat"])
         .ping_interval(Duration::from_millis(100))
@@ -1820,7 +1845,11 @@ async fn websocket_message_rate_resets_after_window_rollover() {
 #[tokio::test]
 async fn websocket_shutdown_sends_1001_and_drains_cooperative_client() {
     let mut app = App::new();
-    app.websocket_defaults(WebSocketConfig::new().close_timeout(Duration::from_millis(200)));
+    app.websocket_defaults(
+        WebSocketConfig::new()
+            .close_timeout(Duration::from_millis(200))
+            .origin_policy(OriginPolicy::same_host().allow_missing(true)),
+    );
     let _ = app.websocket("/ws", |_socket| async move {
         std::future::pending::<()>().await;
     });
@@ -1863,7 +1892,11 @@ async fn websocket_shutdown_sends_1001_and_drains_cooperative_client() {
 async fn websocket_shutdown_waits_for_uncooperative_client_close_timeout() {
     let close_timeout = Duration::from_millis(150);
     let mut app = App::new();
-    app.websocket_defaults(WebSocketConfig::new().close_timeout(close_timeout));
+    app.websocket_defaults(
+        WebSocketConfig::new()
+            .close_timeout(close_timeout)
+            .origin_policy(OriginPolicy::same_host().allow_missing(true)),
+    );
     let _ = app.websocket("/ws", |_socket| async move {
         std::future::pending::<()>().await;
     });
@@ -1931,7 +1964,11 @@ async fn websocket_runtime_close_targets_one_connection_and_reports_missing_id()
 #[tokio::test]
 async fn websocket_runtime_shutdown_drains_and_rejects_future_upgrades() {
     let (addr, runtime, _server) = spawn_app_with_runtime(|app| {
-        app.websocket_defaults(WebSocketConfig::new().close_timeout(Duration::from_millis(200)));
+        app.websocket_defaults(
+            WebSocketConfig::new()
+                .close_timeout(Duration::from_millis(200))
+                .origin_policy(OriginPolicy::same_host().allow_missing(true)),
+        );
         let _ = app.websocket("/ws", |_socket| async move {
             std::future::pending::<()>().await;
         });

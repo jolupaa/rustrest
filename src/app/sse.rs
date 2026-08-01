@@ -47,6 +47,7 @@ impl SseEvent {
         self
     }
 
+    #[cfg(test)]
     pub(super) fn format(&self) -> String {
         self.try_format()
             .expect("SseEvent::format is only used with already valid test events")
@@ -79,16 +80,39 @@ impl SseEvent {
             out.push_str(&retry.to_string());
             out.push('\n');
         }
-        for line in self.data.lines() {
-            out.push_str("data: ");
-            out.push_str(line);
-            out.push('\n');
-        }
-        if self.data.is_empty() {
-            out.push_str("data: \n");
-        }
+        append_data_lines(&mut out, &self.data);
         out.push('\n');
         Ok(out)
+    }
+}
+
+/// Prefixes every logical line, including bare-CR lines and a trailing empty
+/// line. `str::lines()` does not split on a lone CR, which would let data such
+/// as `safe\rid: injected` create an unintended SSE field at the client.
+fn append_data_lines(out: &mut String, data: &str) {
+    let bytes = data.as_bytes();
+    let mut start = 0;
+    let mut cursor = 0;
+    loop {
+        if cursor == bytes.len() {
+            out.push_str("data: ");
+            out.push_str(&data[start..cursor]);
+            out.push('\n');
+            return;
+        }
+        if matches!(bytes[cursor], b'\r' | b'\n') {
+            out.push_str("data: ");
+            out.push_str(&data[start..cursor]);
+            out.push('\n');
+            if bytes[cursor] == b'\r' && bytes.get(cursor + 1) == Some(&b'\n') {
+                cursor += 2;
+            } else {
+                cursor += 1;
+            }
+            start = cursor;
+        } else {
+            cursor += 1;
+        }
     }
 }
 

@@ -11,7 +11,9 @@ The goal is to provide a small, direct, easy-to-understand API for building HTTP
 - HTTP/1.1 and HTTP/2 server built on `hyper` 1.x and `tokio`.
 - Synchronous and asynchronous handlers.
 - Route helpers for `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`, and `HEAD`.
-- Trie-indexed routing (O(path length)) where static segments beat `:params` and `:params` beat `*wildcards`, with backtracking.
+- Trie-indexed, non-recursive routing whose lookup work scales with decoded
+  path length plus compatible trie branches/candidates explored (worst case
+  bounded by the index size), with static > `:params` > `*wildcards`.
 - Validated route registration with named routes (`url_for`), strict percent-decoded params, and optional host constraints.
 - Automatic `405 Method Not Allowed` (+`Allow`), auto-`HEAD` from `GET`, and auto-`OPTIONS`.
 - Mountable `Router` with nested prefixes.
@@ -20,16 +22,21 @@ The goal is to provide a small, direct, easy-to-understand API for building HTTP
 - OpenAPI 3.0 generation (`app.openapi(...)`) with per-route `.summary/.description/.tag` metadata, plus a Swagger UI route (`app.serve_docs(...)`).
 - Global, router-scoped, and per-route onion middleware with `next`.
 - Router guards; app and router fallbacks.
-- Graceful shutdown (`listen_with_shutdown` / `serve_with_shutdown`) and a panic-proof accept loop.
-- Configurable body limit (413), request timeout (408), and header-read timeout.
+- Graceful shutdown (`listen_with_shutdown` / `serve_with_shutdown`), bounded
+  connection admission, and a panic-proof accept loop.
+- Configurable body, request-target, query, header, connection, and timeout limits.
 - Streaming, binary-safe request bodies with async `bytes`, strict `text`, JSON, form, and multipart helpers.
 - Client address via `req.remote_addr()`; duplicate headers via `req.headers_all()`.
 - Parsed query strings; request and response cookies (plus a `Cookie` builder with `SameSite`/`Secure`/`Max-Age`).
-- Signed values (HMAC-SHA256) and a minimal in-memory `Sessions` middleware.
+- Signed values (HMAC-SHA256) and a bounded, expiring in-memory `Sessions` middleware.
 - `Result<Response, HttpError>` handlers and a global error handler that also formats 404/405.
 - Typed shared state.
-- Async extractors: `Json<T>`, `Form<T>`, `Path<T>` (structs or scalars), `Query<T>`, `State<T>`, `Cookies<T>`, `Headers<T>`, `MatchedPath`, `TypedHeader<T>`, `Bytes`, `String`, plus `Option`/`Result` wrappers.
-- Static files with streaming bodies, `ETag`/`Last-Modified` (304), and `Range` (206) support.
+- Async extractors: `Json<T>`, `Form<T>`, `Path<T>` (structs or scalars),
+  `Query<T>`, `State<T>`, `Cookies<T>`, `Headers<T>`, `MatchedPath`,
+  `TypedHeader<T>`, `Bytes`, `String`, plus absence-aware `Option` and
+  rejection-preserving `Result` wrappers.
+- Capability-rooted static files with streaming bodies, weak
+  `ETag`/`Last-Modified` (304), and `Range` (206) support.
 - Response streaming and Server-Sent Events, with a heartbeat helper (`Response::sse_with_heartbeat`) and `req.last_event_id()` for resumption.
 - WebSocket routes with frame send/receive helpers and `{ "event": ..., "data": ... }` JSON envelopes.
 - `WebSocketConfig` for subprotocol negotiation, incoming message size limits, and automatic keepalive pings; `WsBroadcast` for fan-out to many sockets.
@@ -156,12 +163,14 @@ use rustrest::{App, Router, Request, Response};
 Request flow:
 
 1. `App::listen` accepts TCP connections.
-2. Hyper receives an HTTP request.
-3. RustRest builds a `Request`.
-4. `Router` finds the most specific matching route through a trie index.
-5. RustRest builds the middleware chain.
-6. The handler returns `Response` or `Result<Response, E>`.
-7. `Response` is converted into a Hyper response.
+2. RustRest performs the raw HTTP/1 framing preflight (HTTP/2 is replayed
+   transparently).
+3. Hyper parses the HTTP request.
+4. RustRest validates the request head and builds a `Request`.
+5. `Router` finds the most specific matching route through a trie index.
+6. RustRest builds the middleware chain.
+7. The handler returns `Response` or `Result<Response, E>`.
+8. `Response` is finalized and converted into a Hyper response.
 
 ## Routes
 
@@ -179,8 +188,13 @@ app.patch("/users/:id", |_req: Request| Response::send("patch")).unwrap();
 app.delete("/users/:id", |_req: Request| Response::send("delete")).unwrap();
 app.options("/users", |_req: Request| Response::send("options")).unwrap();
 app.head("/health", |_req: Request| Response::send("ok")).unwrap();
-app.all("/any", |_req: Request| Response::send("any method")).unwrap();
+app.all("/any", |_req: Request| Response::send("any ordinary method")).unwrap();
 ```
+
+`route(Method, ...)` supports extension methods such as `PURGE`. `CONNECT` is
+intentionally rejected at registration and returns `501` even through
+`all()`: tunneling is unsafe to model as a normal response handler because it
+must take ownership of the upgraded transport.
 
 Matching prefers the most specific pattern regardless of registration order: static segments beat `:params`, `:params` beat trailing `*wildcards` (with backtracking across branches), and an exact-method route beats `all()` on the same path. Remaining ties go to the first-registered route.
 
@@ -188,6 +202,22 @@ Matching prefers the most specific pattern regardless of registration order: sta
 app.get("/users/:id", |_req: Request| Response::send("by id")).unwrap();
 app.get("/users/me", |_req: Request| Response::send("me")).unwrap(); // still wins for /users/me
 ```
+
+Request path segments are strict percent-decoded exactly once before trie
+lookup, so encoded static segments retain static-route precedence. An encoded
+slash such as `%2F` remains data inside one segment rather than changing the
+route shape. Static segments in registered patterns are normalized by the same
+rules, so `/caf%C3%A9` and `/café` conflict instead of becoming ambiguous.
+Malformed/non-UTF-8 percent encoding and decoded control characters are
+rejected in both incoming paths and registered static patterns.
+
+Parameter and wildcard names must be non-empty ASCII letters, digits,
+underscores, or hyphens; duplicate parameter names are rejected, and a
+wildcard must be the final segment. Registration, mounting, and incoming
+matching are all capped at 256 path segments. Trie lookup is iterative, so a
+deep path within that bound cannot exhaust the call stack. Automatic `HEAD`
+fallback and `Allow` only consider ordinary HTTP `GET` routes, never a
+WebSocket-only route.
 
 ### Trailing Slashes
 
@@ -299,6 +329,78 @@ app.get("/fallible", |_req: Request| -> Result<Response, HttpError> {
 
 If a handler panics, RustRest catches it and returns `500`.
 
+## Server limits and shutdown
+
+`App::new()` uses finite transport defaults: a 10-second HTTP/1-header or
+HTTP/2-client-preface deadline, a 30-second request/body/handler deadline, a
+10-second TLS handshake deadline when TLS is enabled, a 10-second
+graceful-shutdown deadline, at most 10,000 admitted connections, an 8 KiB
+request target, an 8 KiB query string, 100 request header fields, and 32 KiB of
+logical request header data (field-name plus field-value bytes). The HTTP/1
+parser's allocation budget also includes bounded framing overhead, and the
+configurable header-count limit is hard-capped at 1,024.
+
+HTTP/2 is limited to 100 concurrent streams per connection and a 64 KiB send
+buffer. Idle HTTP/2 connections receive a PING every 30 seconds and have 10
+seconds to acknowledge it.
+
+```rust
+app.header_read_timeout(Duration::from_secs(5))
+    .request_timeout(Duration::from_secs(20))
+    .http2_keep_alive_interval(Duration::from_secs(20))
+    .http2_keep_alive_timeout(Duration::from_secs(5))
+    .graceful_shutdown_timeout(Duration::from_secs(15))
+    .max_connections(2_000)
+    .max_request_target_size(4 * 1024)
+    .max_query_string_size(2 * 1024)
+    .max_request_header_count(64)
+    .max_request_header_bytes(16 * 1024);
+
+// Available with the `tls` feature.
+app.tls_handshake_timeout(Duration::from_secs(5));
+```
+
+`disable_header_read_timeout()`, `disable_request_timeout()`,
+`disable_http2_keep_alive()`, and `disable_connection_limit()` are explicit
+escape hatches for endpoints or trusted deployments that assume those budgets
+elsewhere. The request deadline ends when the handler returns, so it does not
+cap the lifetime of a response stream. The connection limit includes TLS
+handshakes and upgraded connections. When the graceful deadline expires,
+remaining plaintext, TLS-handshake, HTTP, pending-upgrade, and WebSocket tasks
+are aborted.
+
+For strict request-smuggling resistance, RustRest inspects the complete first
+raw HTTP/1 head (including Hyper-compatible leading empty lines) and rejects
+any request containing both `Transfer-Encoding` and `Content-Length`, in either
+field order, before Hyper or application code sees it. Ordinary HTTP/1
+connections intentionally serve exactly one request and then close, so this
+raw framing check protects every request without reimplementing Hyper's body
+parser. This is a compatibility and throughput tradeoff: use HTTP/2 when
+upstream connection multiplexing matters.
+
+Prior-knowledge HTTP/2 must deliver the full client preface and initial
+`SETTINGS` frame within the same deadline. Under TLS, ALPN selects one strict
+protocol path: negotiated `h2` is never handed to an HTTP/1 parser, and
+`http/1.1` (or no ALPN) is never interpreted as HTTP/2.
+
+WebSocket candidates use a separate upgrade-capable HTTP/1 path. A successful
+`101 Switching Protocols` keeps the upgraded connection; a rejected or
+unsuccessful candidate is forced closed and cannot be used to pipeline another
+HTTP request. HTTP/2 multiplexing is unaffected.
+
+The raw framing preflight and Hyper parser errors occur before middleware; the
+framing preflight emits a fixed Spanish problem response. Once Hyper has parsed
+the request, request-target/query/logical-header/authority limits use the
+global error renderer but still do not enter middleware. Routing errors such
+as invalid percent encoding, and framework-level `Content-Length` validation
+errors, do enter global middleware. HTTP/1.1 requests require a valid authority
+(normally one `Host` field). HTTP/2 `:authority` is exposed as `Host` when a
+physical Host field is absent; duplicate or conflicting authority values are
+rejected with `400`. Both sources require strict `host[:port]` syntax: no
+userinfo or whitespace, a non-empty host, and an optional decimal port from 0
+through 65535. Authority comparison normalizes hostname case, IPv6 spellings,
+and scheme-default ports.
+
 ## Request
 
 Main public fields:
@@ -309,10 +411,8 @@ pub struct Request {
     pub path: String,
     pub raw_query: Option<String>,
     pub query: HashMap<String, Vec<String>>,
-    pub headers: HashMap<String, String>,
-    pub cookies: HashMap<String, String>,
     pub params: HashMap<String, String>,
-    // body and connection details are private; use the methods below
+    // headers, cookies, body and connection details are private; use methods
 }
 ```
 
@@ -324,13 +424,26 @@ req.query("page");
 req.query_all("tag");
 req.header("authorization");
 req.headers_all("x-forwarded-for");
+req.singleton_header("authorization")?;
+req.headers();                   // read-only collapsed view
+req.set_header("authorization", "Bearer ...")?;
+req.append_header("x-tag", "dos")?;
+req.remove_header("authorization");
 req.cookie("sid");
+req.cookies();                   // read-only parsed view
+req.set_cookie("sid", "rotated")?;
+req.remove_cookie("sid");
 req.bytes().await?;              // collected raw body bytes
 req.text().await?;               // strict UTF-8 text
 req.text_lossy().await?;         // explicitly lossy UTF-8 text
 req.json::<MyType>().await?;
 req.form::<MyForm>().await?;
 req.multipart().await?;
+req.multipart_with_limits(
+    MultipartLimits::new()
+        .max_parts(32)
+        .max_part_bytes(1_048_576),
+).await?;
 req.state::<Config>();
 req.remote_addr();
 req.last_event_id();      // SSE reconnection header
@@ -338,7 +451,29 @@ req.is_websocket_upgrade();
 req.websocket(|socket| async move { ... });
 ```
 
-The incoming request body is streamed into the handler and is only buffered when a body helper or body extractor is awaited. Collection is capped by `app.max_body_size(...)` (64 KB by default; oversized bodies get `413`).
+`header()` is a collapsed convenience view. Use `headers_all()` for
+list-valued or intentionally repeatable fields, and
+`singleton_header()` for fields whose grammar permits at most one occurrence.
+The latter returns `400 duplicate_header` instead of silently choosing between
+ambiguous duplicates.
+
+The incoming request body is streamed into the handler and is only buffered
+when a body helper or body extractor is awaited. Both collection and
+`req.take_body_stream()` enforce `app.max_body_size(...)` (64 KiB by default)
+or the route-specific limit incrementally. Even
+`req.body_mut().collect(larger_limit)` uses the smaller of its argument and
+that hard application/route ceiling; callers can tighten the limit, never
+raise it. Buffered helpers render oversized bodies as `413`; the raw stream
+yields one terminal limit error and then ends, so streaming handlers can map
+or log it explicitly.
+
+Multipart parsing is binary-safe and recognizes MIME delimiter lines and
+quoted parameters. It rejects folded headers, invalid header names, duplicate
+`Content-Disposition`/`Content-Type` fields, and control or DEL characters in
+part-header values (horizontal tab is allowed). It is still buffered under the
+overall request limit. `MultipartLimits` defaults to 128 parts, 32 headers and
+16 KiB of header data per part, and 8 MiB per part; each value can be lowered
+independently.
 
 ## Typed Extractors
 
@@ -397,6 +532,16 @@ async fn create_user(
 
 app.post("/typed/users/:id", create_user).unwrap();
 ```
+
+`Option<E>` means “the value may be absent,” not “ignore every rejection.”
+It converts an error to `None` only when `E::Rejection` implements
+`OptionalRejection` and `is_missing()` returns `true`; malformed input,
+unsupported media types, and body-limit failures such as `413` propagate to
+the error handler. RustRest's `HttpError` implementation treats only
+`missing_header` as absence. Custom rejection types are conservative by
+default and should opt in only for a genuine, safe absence. Use `Result<E,
+E::Rejection>` when the handler intentionally needs to inspect every
+rejection.
 
 ## Shared State
 
@@ -471,7 +616,106 @@ Response::send("ok")
 Response::send("ok").cookie("sid", "abc123")
 ```
 
-Currently, `cookie` generates `Path=/; HttpOnly`.
+The `Response::cookie` convenience method delegates to the same `Cookie`
+builder as `Response::set_cookie` and generates `Path=/; HttpOnly`. `Cookie`
+applies component-specific filtering: names, values, and domains are reduced
+to their allowed ASCII characters, while paths drop controls and semicolons,
+so control characters cannot become response headers. `SameSite=None`,
+`__Secure-`, and `__Host-` cookies are always `Secure`; `__Host-` also forces
+`Path=/` and omits `Domain`.
+
+Delete a cookie with the same scope that created it. `clear_cookie(name)` is
+the root-path shortcut; `clear_cookie_with` preserves the supplied `Path`,
+`Domain`, and security attributes while forcing an empty value and
+`Max-Age=0`:
+
+```rust
+Response::send("ok").clear_cookie_with(
+    Cookie::new("sid", "")
+        .path("/admin")
+        .domain("example.com")
+        .secure(true),
+)
+```
+
+`sign_value(secret, value)` is a general HMAC helper: it authenticates the
+exact original string but does not encode it into the cookie-octet grammar.
+When a signed value will be stored in a cookie, encode arbitrary Unicode,
+whitespace, commas, semicolons, or other disallowed bytes before signing.
+Passing such a raw signed string through `Cookie::new` would sanitize it and
+therefore invalidate its signature. The built-in session IDs already use a
+cookie-safe representation.
+
+### Sessions
+
+```rust
+use rustrest::{SameSite, Sessions};
+use std::time::Duration;
+
+let sessions = Sessions::try_new("a-random-secret-with-at-least-32-bytes")?
+    .idle_timeout(Duration::from_secs(30 * 60))
+    .max_sessions(20_000)
+    .max_entries_per_session(32)
+    .max_session_key_bytes(128)
+    .max_session_value_bytes(8 * 1024)
+    .max_session_data_bytes(32 * 1024)
+    .same_site(SameSite::Lax)
+    .secure_cookies(true);
+
+app.layer(sessions.middleware());
+```
+
+`Sessions::try_new` rejects secrets shorter than 32 bytes. Every consuming
+builder has a fallible `try_*` counterpart (`try_cookie_name`,
+`try_idle_timeout`, `try_max_sessions`, and so on); the infallible variants
+panic on invalid configuration. Complete configuration before cloning
+`Sessions` or calling `middleware()`. While storage has another live clone or
+middleware handle, fallible builders return `SessionConfigError` and
+infallible builders panic instead of silently letting handles use incompatible
+cookie, expiry, or size policies.
+
+The default store is sharded, expires sessions after 24 hours of inactivity,
+and retains at most 10,000 sessions. Each session is also limited to 64 entries,
+256-byte keys, 16 KiB values, and 64 KiB of aggregate key-plus-value data by
+default. Admission is lazy: middleware exposes a transient `req.session_id()`
+to handlers, but a read-only anonymous request neither occupies the store nor
+receives a session cookie. The first successful `Sessions::set` persists that
+ID. At capacity, new writes return `SessionUnavailable`; live sessions are
+never evicted to admit anonymous traffic. Expired capacity is recovered from
+an exact ordered expiry frontier per shard in bounded batches, without scanning
+the complete store.
+`Sessions::set` returns `Result<(), SessionDataError>` and never silently grows
+past those bounds:
+
+```rust
+sessions.set(session_id, "usuario", "42")?;
+```
+
+Access extends the server-side idle deadline. Middleware revalidates and
+renews the session when the response is ready, then reissues the signed cookie
+with a matching, upward-rounded `Max-Age`. A presented session that expired or
+was cleared while the handler ran is not resurrected; the client receives a
+deletion cookie instead. An invalid or expired presented cookie is likewise
+deleted when the handler does not persist a replacement. An application cookie
+suppresses the automatic cookie only when its effective scope is the same
+host-only root path, so a same-name
+`Domain` or narrower-path cookie cannot accidentally disable session refresh.
+Cookies are `HttpOnly`, use `SameSite=Lax` by default, and become `Secure` on
+direct TLS requests.
+`secure_cookies(true)` is intended for deployments behind a trusted
+TLS-terminating proxy.
+
+Requests containing the configured session-cookie name more than once are
+rejected with `400 duplicate_session_cookie` before handlers run. This avoids
+ambiguous browser/proxy ordering from becoming a session-fixation primitive.
+
+Because a session response sets or refreshes client-specific state, the
+middleware also prevents shared-cache reuse. It preserves valid existing
+`Cache-Control` fields and appends `private` unless a `private` or `no-store`
+directive is already present. An invalid field fails closed as
+`Cache-Control: private, no-store`. If sessions are mounted globally, this
+policy applies to every response; mount them on a router when public cacheable
+routes should remain outside the session scope.
 
 ### Redirects
 
@@ -537,9 +781,41 @@ Response::stream(stream::iter(vec![Ok::<_, Infallible>(Bytes::from_static(b"data
     .with_trailers(trailers)
 ```
 
+Trailer delivery is protocol-dependent and must be treated as best effort.
+HTTP/2 carries trailing fields natively. For HTTP/1.1, Hyper emits them only
+when the request advertises `TE: trailers`; otherwise the declared late fields
+can be discarded, and HTTP/1.0 cannot carry them. Clients must tolerate an
+absent trailer rather than making it the only source of correctness-critical
+metadata.
+
 For checked response construction, use `try_status`, `try_header`, `try_append_header`, and
 `try_with_trailers`. The fluent wrappers still exist; invalid values are recorded and rendered as a
 structured `500` at the HTTP boundary instead of panicking or silently disappearing.
+Framing, routing, authentication, representation-control, and cookie fields such as
+`Content-Length`, `Transfer-Encoding`, `Host`, `Content-Type`, and `Set-Cookie` are forbidden in
+trailers. `ETag` and application integrity fields may be emitted late, but
+`Keep-Alive` and any field nominated by `Connection` are rejected. Explicit
+`Transfer-Encoding` is rejected on all responses; Hyper selects transport framing.
+
+The network server and `TestClient` apply the same finalization rules and
+materialize the same implicit `Content-Type` and buffered
+`Content-Length` headers. Repeated `Content-Length` values must be valid and
+identical, a buffered body's length must match, and trailers cannot be
+combined with `Content-Length`.
+
+A final response cannot be an interim `100`–`199` status. RustRest rejects
+those statuses except for a valid `101 Switching Protocols`, which must include
+the WebSocket `Connection`, `Upgrade`, and one non-empty
+`Sec-WebSocket-Accept` field. Bodies and trailers are removed from `204`,
+`205`, and `304` responses (a valid `Content-Length` may remain on `304` as
+allowed by HTTP semantics). Invalid responses become a structured `500` with
+the construction detail retained only as a private error source.
+
+Automatic and explicit `HEAD` responses run the corresponding handler and then
+discard its body and trailers. For a buffered body they retain or synthesize
+the `Content-Length` that the equivalent `GET` representation would have sent,
+and an explicit mismatched length is still rejected. Timeout and framework
+error responses follow the same `HEAD` rule.
 
 ## Middleware
 
@@ -589,21 +865,56 @@ use std::time::Duration;
 app.layer(middleware::tracing());
 app.layer(middleware::request_id());
 app.layer(middleware::cors());
-app.layer(middleware::compression());
 app.layer(middleware::etag());
+app.layer(middleware::compression());
 app.layer(middleware::rate_limit(100, Duration::from_secs(60)));
+app.layer(
+    middleware::RateLimit::new(100, Duration::from_secs(60))
+        .max_clients(25_000),
+);
 app.get("/slow", slow_handler)
     .unwrap()
     .layer(middleware::timeout(Duration::from_secs(5)));
 ```
 
+The first registered middleware is outermost and therefore sees the response
+last. Register `etag()` before `compression()` so the validator is calculated
+from the final content-coded bytes; compression removes validators that describe
+the unencoded representation.
+
 - `tracing`: prints method, path, and status.
-- `request_id`: propagates or generates `x-request-id`.
-- `cors`: adds permissive CORS headers (see the configurable `Cors` builder for allowlists, credentials, and preflight).
+- `request_id`: propagates exactly one non-empty, printable-ASCII
+  `x-request-id` up to 128 bytes; duplicate, control-containing, whitespace,
+  non-ASCII, empty, or oversized input is replaced with a generated ID.
+- `cors`: adds permissive CORS headers (see the configurable `Cors` builder
+  for allowlists, credentials, and preflight). Configurable responses include
+  `Vary: Origin` whenever the result can depend on the origin—even when it is
+  denied—and preflights also vary by
+  `Access-Control-Request-Method`/`Access-Control-Request-Headers`. `Origin`
+  and `Access-Control-Request-Method` are singleton fields; duplicates receive
+  `400` instead of being collapsed. Repeated
+  `Access-Control-Request-Headers` lines are combined as a list.
 - `gzip`: compresses byte responses when the client accepts `gzip`.
-- `compression` / `compression_with_min_size`: content negotiation for gzip/deflate (plus brotli with the `brotli` feature), skipping small bodies.
-- `etag`: strong `ETag` for buffered 200 responses and `304 Not Modified` on matching `If-None-Match`.
-- `rate_limit(max, window)`: fixed-window per-client-IP limiting; over the limit returns `429` with `Retry-After`.
+- `compression` / `compression_with_min_size`: weighted negotiation for
+  gzip/deflate (plus brotli with the `brotli` feature), including `identity`,
+  pre-encoded responses, correct `Vary`, and `406` when no acceptable
+  representation exists. A transformation removes stale validators,
+  digests, length, and range metadata; large buffered bodies are compressed
+  on a bounded blocking pool. Repeated `Accept-Encoding` field lines are
+  combined as one list, and any repeated `Cache-Control` field containing
+  `no-transform` prevents transformation.
+- `etag`: strong SHA-256 `ETag` for all buffered 200 responses, including empty
+  bodies, with RFC-ordered precondition handling for `GET` and `HEAD`.
+  Repeated list-valued `If-Match`/`If-None-Match` fields are combined. Large
+  hashes run on a bounded blocking pool. Unsafe-method preconditions must be
+  checked by application middleware before the mutating handler; a
+  response-side ETag layer cannot safely reject a mutation afterward.
+- `rate_limit(max, window)`: bounded fixed-window per-client-IP limiting; over
+  the limit returns `429` with `Retry-After` rounded up to the next whole
+  second.
+- `RateLimit::new(max, window).max_clients(n)`: configures the tracked-client
+  bound (10,000 by default); clients beyond it share one bounded overflow
+  bucket and expired buckets are swept periodically.
 - `timeout(duration)`: cuts off the wrapped handler with `408`; scope it per route or per router.
 
 ## Guards
@@ -649,8 +960,21 @@ app.mount("/api", api).unwrap();
 ## Static Files
 
 ```rust
+use rustrest::{App, Dotfiles, StaticFilesOptions};
+use std::time::Duration;
+
 let mut app = App::new();
 app.static_files("/assets", "public").unwrap();
+
+// Explicit opt-in when hidden files are intentionally public.
+app.static_files_with_options(
+    "/public-dotfiles",
+    "public",
+    StaticFilesOptions::new()
+        .dotfiles(Dotfiles::Allow)
+        .stream_stall_timeout(Duration::from_secs(20))
+        .stream_max_duration(Duration::from_secs(10 * 60)),
+).unwrap();
 ```
 
 Examples:
@@ -658,7 +982,28 @@ Examples:
 - `/assets/app.css` serves `public/app.css`.
 - `/assets/images/logo.png` serves `public/images/logo.png`.
 
-RustRest blocks path traversal with `..` and assigns content types for common file extensions.
+The root directory is opened and pinned when the route is registered, so a
+missing or inaccessible root returns `RouteError` immediately. File lookup is
+capability-relative: `..`, absolute paths, symlink escapes, and path-swap races
+cannot leave that root. Dotfiles are denied with `404` by default; use
+`StaticFilesOptions` and `Dotfiles::Allow` only for an intentional public
+mount. Blocking filesystem open/metadata work runs outside Tokio's async
+workers under bounded admission. A supervised, one-chunk producer retains the
+file descriptor and admission permit only while the transport is progressing:
+the body is lazy, an entirely unpolled body expires after one minute, and the
+safe defaults close an active producer after 15 seconds stalled or five
+minutes total. `stream_start_timeout`, `stream_stall_timeout`, and
+`stream_max_duration` can raise those limits; the explicit `disable_*`
+variants should be used only when an edge proxy enforces equivalent
+body-start, response-write, and lifetime bounds. File contents remain streamed
+with bounded read-ahead. A missing file is `404`;
+permission, descriptor, and other non-`NotFound` I/O failures are `500`.
+Metadata-derived validators are correctly emitted as weak `ETag` values,
+range units such as `BYTES=` are matched case-insensitively, and common
+extensions receive a content type. Byte ranges apply only to `GET`; `HEAD`
+describes the complete representation. `If-Range` dates must exactly match the
+resource's whole-second modification time, and ambiguous duplicate fields
+fall back to the full response.
 
 ## Error Handling
 
@@ -696,6 +1041,10 @@ app.error_handler(|err: HttpError| {
 });
 ```
 
+Deserializer and internal handler details are retained as private error
+sources rather than copied into public problem responses. If the custom error
+handler itself panics, RustRest falls back to a generic `500`.
+
 ## OpenAPI & Docs UI
 
 Routes can carry documentation, and the app can describe itself as OpenAPI 3.0:
@@ -716,7 +1065,18 @@ let doc = app.openapi("Mi API", "0.3.0");
 app.serve_docs("/docs", "Mi API", "0.3.0").unwrap();
 ```
 
-The generated document covers paths, methods, metadata, and `:param`/`*wildcard` path parameters (typed as strings). Request/response schemas are not introspected. `all()` routes are skipped.
+The generated document covers paths, methods, metadata, and
+`:param`/`*wildcard` path parameters (typed as strings). Request/response
+schemas are not introspected. Methods supported by an OpenAPI Path Item become
+ordinary operations. `all()` and extension methods are preserved in the
+`x-rustrest-custom-methods` array with their original `method` instead of
+being silently dropped.
+Swagger UI assets use an exact version and the generated page includes a restrictive CSP whose
+script hash authorizes only its escaped initializer, plus a no-referrer policy.
+The title and spec URL are escaped for their HTML/JavaScript contexts. If
+host-specific routes collapse to the same OpenAPI path and method, the first
+registered operation is retained and
+`x-rustrest-duplicate-routes` reports the number of variants.
 
 ## Server-Sent Events
 
@@ -734,11 +1094,15 @@ app.get("/events", |_req: Request| {
 }).unwrap();
 ```
 
-The response uses `text/event-stream`, `Cache-Control: no-cache`, and `Connection: keep-alive`.
+The response uses `text/event-stream` and `Cache-Control: no-cache`. RustRest
+leaves persistence and framing to the server, so it does not emit the
+HTTP/2-forbidden `Connection` header.
 Invalid SSE fields terminate the response body with a stream error rather than emitting malformed
-events.
+events. Event data treats bare carriage returns, line feeds, and CRLF pairs as
+line boundaries and prefixes every resulting line with `data:`, preventing
+embedded CR data from being interpreted as a new SSE field.
 
-For long-lived streams, `sse_with_heartbeat` emits a `: keep-alive` comment whenever the source stream is idle for the given interval, and `req.last_event_id()` exposes the ID browsers resend when they reconnect:
+For long-lived streams, `sse_with_heartbeat` emits a `: keep-alive` comment whenever the source stream is idle for the given interval, and `req.last_event_id()` exposes the ID browsers resend when they reconnect. A zero heartbeat disables heartbeat generation:
 
 ```rust
 use std::time::Duration;
@@ -911,7 +1275,25 @@ app.websocket_with("/ws", config, |mut socket| async move {
 }).unwrap();
 ```
 
-The first client-offered subprotocol the server supports is selected and echoed in `Sec-WebSocket-Protocol`. With `ping_interval`, a Ping frame is sent whenever the connection has been idle inside `recv()` for the interval.
+Unset WebSocket settings resolve to bounded defaults: 1 MiB messages, 256 KiB
+frames, 16-slot inbound/outbound queues, 128 KiB/1 MiB write buffers, a
+five-second send/write and close timeout, Ping every 30 seconds with a
+10-second Pong allowance, a 120-second idle timeout, a 24-hour lifetime,
+2,000 process connections, 20 connections per IP, 100 incoming messages per
+second, 32 rooms per connection, and 128-byte room names. The default
+backpressure policy waits only for the finite send timeout.
+
+The default origin policy is same-host, rejects a missing `Origin`, and
+verifies that its scheme matches plaintext versus TLS. Non-browser endpoints
+must opt out explicitly when they intentionally omit `Origin`.
+
+The first client-offered subprotocol the server supports is selected and echoed
+in `Sec-WebSocket-Protocol`. Subprotocol names are case-sensitive, must be
+unique valid HTTP tokens, and malformed client offer lists receive `400`.
+Transport writes and flushes, including Close, are
+bounded by the configured timeout so a peer that stops reading cannot wedge
+shutdown. JSON/event receive helpers transparently process Ping/Pong control
+frames rather than reporting them as application end-of-stream.
 
 ### Rooms and Managed Broadcasts
 
@@ -973,19 +1355,20 @@ app.websocket("/chat", move |mut socket| {
 ```
 
 Lagging subscribers receive `RecvError::Lagged` and must handle skipped
-messages explicitly. Prefer `WsHub` for managed WebSocket fan-out.
+messages explicitly. A zero constructor capacity is normalized to one rather
+than panicking. Prefer `WsHub` for managed WebSocket fan-out.
 
 ### Manual Handshake Helper
 
-RustRest includes a handshake helper:
-
-```rust
-app.get("/ws", |req: Request| -> Result<Response, HttpError> {
-    Response::websocket(&req)
-}).unwrap();
-```
-
-This validates upgrade headers and returns `101 Switching Protocols` with `Sec-WebSocket-Accept`. Prefer `app.websocket` for normal server-side WebSocket handlers because it also owns the upgraded stream and frame loop.
+`Response::websocket(&req)` is deprecated. A response-only helper cannot own
+Hyper's private upgraded transport, so registering it as a network route would
+otherwise emit `101` and immediately close the socket. It now refuses real
+network upgrades; synthetic requests may still use it temporarily to validate
+handshake response construction directly. At the server boundary, even a
+well-formed manual `101` is rejected unless the consuming WebSocket API marked
+the response as owning the upgrade. Use `app.websocket`, `router.websocket`,
+or `req.websocket(handler)`, all of which own the upgraded stream and frame
+loop.
 
 ## Serving with an Existing TcpListener
 
@@ -1023,11 +1406,26 @@ cargo test
 The project includes:
 
 - Core unit tests in `src/app/tests.rs`.
-- A real HTTP integration test in `tests/http_integration.rs`.
+- HTTP routing, framing/body, semantic, TLS, and WebSocket integration suites
+  under `tests/`.
+- Five fuzz targets, including route-pattern and path matching.
+
+`Request::builder()` and `TestClient` mirror network normalization closely.
+`RequestBuilder::path("/items?page=2")` splits path and query, while a later
+`.path("/items")` clears the previous query. Repeated `Cookie` headers are
+processed in arrival order and the last duplicate cookie name wins, as on the
+server. `.json(&value)` sets `application/json` and panics if serialization
+fails rather than silently sending an empty payload; use
+`.try_json(&value)` for fallible construction. `TestClient::send()` finalizes
+responses, so assertions see the implicit `Content-Type` and buffered
+`Content-Length` that a network client receives.
 
 ## Compatibility and releases
 
-See the [changelog](CHANGELOG.md) for notable changes, the [release policy](docs/releases.md) for compatibility guarantees, and the [migration guides](docs/migrations/README.md) for breaking upgrades. For this release, start with [Migrating from 0.2 to 0.3](docs/migrations/0.2-to-0.3.md).
+See the [changelog](CHANGELOG.md) for notable changes, the [release
+policy](docs/releases.md) for compatibility guarantees, and the [migration
+guides](docs/migrations/README.md) for breaking upgrades. For this release,
+start with [Migrating from 0.3 to 0.4](docs/migrations/0.3-to-0.4.md).
 
 ## Publishing Preparation
 
@@ -1100,9 +1498,17 @@ tests/
 ## Current Limitations
 
 - Request body helpers and body extractors buffer on demand under configurable limits; multipart
-  parsing is still buffered rather than streaming each part.
-- Sessions are in-memory only (single process); use your own store for multi-instance deployments.
-- Rate limiting is in-memory and per process.
+  parsing has per-part limits but does not stream individual parts.
+- Ordinary HTTP/1 connections close after one response by design; use HTTP/2
+  or an edge proxy when upstream multiplexing/reuse is required.
+- HTTP/2 keepalive closes unresponsive peers, but a responsive idle peer can
+  retain a global connection permit. Keep the finite connection cap enabled
+  and enforce per-IP/idle policy at the edge until the framework can add a
+  stream-aware HTTP/2 idle policy without terminating legitimate long-lived
+  SSE responses.
+- Sessions are bounded and expiring but remain in-memory and single-process; use an external store
+  for multi-instance deployments.
+- Rate limiting is bounded but remains in-memory and per process.
 - OpenAPI output covers paths, methods, and path parameters; request/response schemas are not introspected.
 
 ## License
