@@ -253,6 +253,7 @@ impl WebSocketRuntimeHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = observer;
     }
 
+    #[cfg(test)]
     pub(crate) fn stop_accepting(&self) {
         self.registry().accepting = false;
     }
@@ -360,6 +361,26 @@ impl WebSocketRuntimeHandle {
         };
         self.inner.registry_changed.notify_waiters();
         registered
+    }
+
+    /// Makes the detached HTTP-upgrade task abortable during the short window
+    /// between WebSocket admission and driver registration. The driver later
+    /// replaces this handle atomically; a driver that won the race is never
+    /// overwritten with its already-finishing upgrade task.
+    pub(crate) fn register_upgrade_task(
+        &self,
+        id: WebSocketId,
+        upgrade_abort: AbortHandle,
+    ) -> bool {
+        let mut registry = self.registry();
+        let Some(entry) = registry.connections.get_mut(&id) else {
+            return false;
+        };
+        if entry.driver_abort.is_some() {
+            return false;
+        }
+        entry.driver_abort = Some(upgrade_abort);
+        true
     }
 
     pub(crate) fn join(&self, id: WebSocketId, rooms: &[String]) -> Result<(), WsError> {
@@ -596,7 +617,11 @@ impl WebSocketRuntimeHandle {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.abort_remaining();
-                self.wait_until_empty().await;
+                // An admitted connection that never registered an upgrade or
+                // driver abort handle cannot be force-cancelled here. Never
+                // turn the public shutdown API into an unbounded wait for
+                // such a malformed/stalled lifecycle entry.
+                let _ = tokio::time::timeout(grace, self.wait_until_empty()).await;
                 Err(error)
             }
         }

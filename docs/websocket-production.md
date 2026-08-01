@@ -14,8 +14,9 @@ connection administration, and optional multi-node fan-out through
 
 ## 2. Secure handshake and `OriginPolicy`
 
-Configure an explicit origin policy for browser-facing routes. Same-host is a
-reasonable default when the WebSocket and web application share an origin:
+The resolved default is same-host, requires an `Origin` header, and checks that
+its scheme matches the transport (`http`/`ws` for plaintext,
+`https`/`wss` for TLS):
 
 ```rust
 let config = WebSocketConfig::new()
@@ -24,8 +25,9 @@ let config = WebSocketConfig::new()
 
 `Origin` is not an authentication mechanism. Non-browser clients can choose
 their own value. Use `OriginPolicy::allow([...])` when trusted frontends use
-known origins, and reserve `OriginPolicy::any()` for non-browser endpoints or
-controlled validation routes.
+known origins. A non-browser endpoint that legitimately omits the header must
+opt out explicitly with `OriginPolicy::same_host().allow_missing(true)` or,
+when cross-origin access is intentional, `OriginPolicy::any()`.
 
 ## 3. Authentication before upgrade
 
@@ -47,9 +49,26 @@ commonly appear in proxy and access logs. Prefer secure cookies or an
 
 ## 4. Configuration defaults and memory budgeting
 
-Set finite message, frame, queue, connection, and time limits. The
-[`examples/websocket.rs`](../examples/websocket.rs) example shows a complete
-route configuration.
+RustRest resolves unset WebSocket values to bounded production-oriented
+defaults:
+
+| Limit | Default |
+| --- | ---: |
+| Message / frame | 1 MiB / 256 KiB |
+| Inbound / outbound queue | 16 / 16 messages |
+| Write / maximum write buffer | 128 KiB / 1 MiB |
+| Send/write timeout | 5 seconds |
+| Ping / Pong timeout | 30 / 10 seconds |
+| Idle / maximum lifetime | 120 seconds / 24 hours |
+| Close timeout | 5 seconds |
+| Process / per-IP connections | 2,000 / 20 |
+| Incoming message rate | 100 per second |
+| Rooms / room-name bytes | 32 / 128 |
+
+Tune these values from measured traffic. Size ceilings, ping, idle, lifetime,
+process/per-IP connection limits, and message-rate limits have explicit
+`disable_*` methods; disabling them transfers the resource-bounding
+responsibility to the application or edge proxy.
 
 A conservative per-connection queue budget is approximately:
 
@@ -71,6 +90,12 @@ then set process/route/IP connection ceilings accordingly.
 uses the same bounded outbound queue. `BackpressurePolicy::Wait` applies a
 finite `send_timeout`; `Reject` returns capacity immediately; `Disconnect`
 initiates Close 1013 for a slow consumer.
+
+`send_timeout` also bounds every transport send and flush, including Ping,
+Pong, and Close writes. A peer that stops reading therefore cannot pin the
+driver indefinitely or prevent shutdown deadlines from progressing.
+The driver checks shutdown before each fair event-selection pass, so a
+continuously busy socket cannot starve shutdown indefinitely.
 
 ```rust
 let (mut receiver, sender) = socket.split();
@@ -145,13 +170,29 @@ runtime suppresses origin echo and keeps a bounded deduplication window.
 another node or client received it. Ordering, persistence, replay, and
 delivery guarantees are adapter-specific. The built-in `InMemoryWsBroker` is
 process-local and intended for tests or small single-process deployments.
+`InMemoryWsBroker::new(0)` and `WsBroadcast::new(0)` normalize zero to a
+capacity of one instead of panicking; use a positive, intentionally budgeted
+capacity in production.
 
 ## 9. Graceful shutdown and close codes
 
 Use `listen_with_shutdown`, `serve_with_shutdown`, or the TLS equivalent.
 Shutdown stops new WebSocket admission, sends Close 1001 with reason
 `apagado del servidor`, waits for each configured close timeout, and aborts
-remaining drivers before returning.
+remaining drivers before returning. Pending upgrade tasks are registered with
+the runtime as soon as they are detached, so the same graceful deadline can
+abort a peer that never completes the upgrade.
+
+When an application handler finishes, the driver first drains the bounded
+queue of commands/messages it already accepted and honors an application
+Close before synthesizing Close 1000. A final echo queued immediately before
+handler return is therefore not discarded by the completion race.
+
+RustRest normally closes an HTTP/1 connection after one ordinary response to
+apply strict raw framing validation to every request. A syntactic WebSocket
+candidate is served on an isolated upgrade-capable path; only a successful
+`101 Switching Protocols` remains open. A rejected upgrade is marked
+`Connection: close`, so it cannot become a pipeline bypass.
 
 Use Close 1000 for normal completion, 1008 for policy/authorization failures,
 1009 for oversized messages, 1011 for internal handler failures, and 1013 for
@@ -271,19 +312,20 @@ compression extensions; RustRest does not currently negotiate
 `permessage-deflate`. All other cases must report neither `FAILED` nor
 `UNIMPLEMENTED`.
 
-On Docker Desktop, where host networking does not expose the host loopback in
-the same way as Linux, bind the example to all interfaces and override only the
-runner connection URL:
+On macOS, the runner automatically uses Docker Desktop's
+`host.docker.internal` bridge instead of Linux host networking. For a custom
+port, override the local preflight and container connection URLs:
 
 ```bash
-RUSTREST_ADDR=0.0.0.0:3001 cargo run --release --example websocket
+RUSTREST_ADDR=127.0.0.1:3001 cargo run --release --example websocket
 AUTOBAHN_ENDPOINT_URL=http://127.0.0.1:3001/autobahn \
 AUTOBAHN_SERVER_URL=ws://host.docker.internal:3001/autobahn \
   ./scripts/run-autobahn.sh
 ```
 
 The repository CI repeats default/TLS/tracing/brotli feature checks, all-feature
-Clippy, rustfmt, a Rust 1.85.1 MSRV build, all four fuzz target builds, a
-100-idle/20-active network smoke, and the complete
-non-performance/non-compression Autobahn gate on every push and pull request.
-Failed network jobs upload their JSON, HTML, and server log artifacts.
+Clippy, rustfmt, a Rust 1.85.1 MSRV build, all five fuzz target builds,
+application/fuzz dependency audits, a 100-idle/20-active network smoke, and the
+complete non-performance/non-compression Autobahn gate on every push and pull
+request. A weekly schedule refreshes the dependency audit. Failed network jobs
+upload their JSON, HTML, and server log artifacts.

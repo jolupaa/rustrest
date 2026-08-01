@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rustrest::{Request, Response};
+use rustrest::Request;
 
 fuzz_target!(|data: &[u8]| {
     let text = String::from_utf8_lossy(data);
@@ -19,5 +19,5 @@ fuzz_target!(|data: &[u8]| {
         .header("sec-websocket-version", version)
         .header("origin", origin)
         .build();
-    let _ = Response::websocket(&request);
+    let _ = request.websocket(|_socket| async move {});
 });

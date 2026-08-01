@@ -16,15 +16,10 @@ pub(crate) fn allocate_node_id() -> WsNodeId {
 }
 
 pub trait WsBroker: Send + Sync + 'static {
-    fn publish<'a>(
-        &'a self,
-        publication: WsBrokerPublication,
-    ) -> BoxFuture<'a, Result<(), WsBrokerError>>;
+    fn publish(&self, publication: WsBrokerPublication)
+    -> BoxFuture<'_, Result<(), WsBrokerError>>;
 
-    fn subscribe<'a>(
-        &'a self,
-        node: WsNodeId,
-    ) -> BoxFuture<'a, Result<WsBrokerStream, WsBrokerError>>;
+    fn subscribe(&self, node: WsNodeId) -> BoxFuture<'_, Result<WsBrokerStream, WsBrokerError>>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -151,8 +146,12 @@ pub struct InMemoryWsBroker {
 }
 
 impl InMemoryWsBroker {
+    /// Creates the process-local broker.
+    ///
+    /// A zero capacity is normalized to one so untrusted configuration cannot
+    /// trigger Tokio's zero-capacity panic.
     pub fn new(capacity: usize) -> Self {
-        let (sender, _) = tokio::sync::broadcast::channel(capacity);
+        let (sender, _) = tokio::sync::broadcast::channel(capacity.max(1));
         Self {
             sender: Mutex::new(Some(sender)),
         }
@@ -167,10 +166,10 @@ impl InMemoryWsBroker {
 }
 
 impl WsBroker for InMemoryWsBroker {
-    fn publish<'a>(
-        &'a self,
+    fn publish(
+        &self,
         publication: WsBrokerPublication,
-    ) -> BoxFuture<'a, Result<(), WsBrokerError>> {
+    ) -> BoxFuture<'_, Result<(), WsBrokerError>> {
         Box::pin(async move {
             let sender = self
                 .sender
@@ -182,10 +181,7 @@ impl WsBroker for InMemoryWsBroker {
         })
     }
 
-    fn subscribe<'a>(
-        &'a self,
-        _node: WsNodeId,
-    ) -> BoxFuture<'a, Result<WsBrokerStream, WsBrokerError>> {
+    fn subscribe(&self, _node: WsNodeId) -> BoxFuture<'_, Result<WsBrokerStream, WsBrokerError>> {
         Box::pin(async move {
             let receiver = self
                 .sender

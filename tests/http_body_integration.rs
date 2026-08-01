@@ -170,7 +170,7 @@ async fn route_timeout_wraps_only_the_selected_route() {
 }
 
 #[tokio::test]
-async fn known_oversized_content_length_is_rejected_before_middleware_or_body_poll() {
+async fn known_oversized_content_length_is_visible_to_global_middleware_before_body_poll() {
     let middleware_ran = Arc::new(AtomicBool::new(false));
     let handler_ran = Arc::new(AtomicBool::new(false));
     let mut app = App::new();
@@ -208,12 +208,12 @@ async fn known_oversized_content_length_is_rejected_before_middleware_or_body_po
         response.contains(r#""code":"payload_too_large""#),
         "{response}"
     );
-    assert!(!middleware_ran.load(Ordering::SeqCst));
+    assert!(middleware_ran.load(Ordering::SeqCst));
     assert!(!handler_ran.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
-async fn invalid_content_length_is_rejected_before_middleware_or_handler() {
+async fn invalid_content_length_is_visible_to_global_middleware_before_handler() {
     let middleware_ran = Arc::new(AtomicBool::new(false));
     let handler_ran = Arc::new(AtomicBool::new(false));
     let mut app = App::new();
@@ -237,8 +237,25 @@ async fn invalid_content_length_is_rejected_before_middleware_or_handler() {
         .await;
 
     assert_problem_code(&response, 400, "invalid_content_length");
-    assert!(!middleware_ran.load(Ordering::SeqCst));
+    assert!(middleware_ran.load(Ordering::SeqCst));
     assert!(!handler_ran.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn malformed_path_is_visible_to_global_middleware() {
+    let middleware_runs = Arc::new(AtomicUsize::new(0));
+    let middleware_counter = Arc::clone(&middleware_runs);
+    let mut app = App::new();
+    app.layer(move |req: Request, next: Next| {
+        middleware_counter.fetch_add(1, Ordering::SeqCst);
+        async move { next(req).await }
+    });
+    let _ = app.get("/users/:id", |_req: Request| Response::send("ok"));
+
+    let response = TestClient::new(app).get("/users/%ZZ").send().await;
+
+    assert_problem_code(&response, 400, "invalid_path_encoding");
+    assert_eq!(middleware_runs.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -270,7 +287,7 @@ async fn content_length_errors_use_the_global_error_handler() {
 }
 
 #[tokio::test]
-async fn conflicting_content_length_is_rejected_before_middleware_or_handler() {
+async fn conflicting_content_length_is_visible_to_global_middleware_before_handler() {
     for values in [["5", "6"], ["5, 6", ""]] {
         let middleware_runs = Arc::new(AtomicUsize::new(0));
         let handler_runs = Arc::new(AtomicUsize::new(0));
@@ -294,7 +311,7 @@ async fn conflicting_content_length_is_rejected_before_middleware_or_handler() {
         let response = request.body("hello").send().await;
 
         assert_problem_code(&response, 400, "invalid_content_length");
-        assert_eq!(middleware_runs.load(Ordering::SeqCst), 0);
+        assert_eq!(middleware_runs.load(Ordering::SeqCst), 1);
         assert_eq!(handler_runs.load(Ordering::SeqCst), 0);
     }
 }
@@ -378,6 +395,57 @@ async fn assert_http1_content_length_parse_error(content_length_headers: &str) {
     assert_eq!(handler_runs.load(Ordering::SeqCst), 0);
 }
 
+async fn assert_http1_ambiguous_framing_rejected_at_transport(
+    leading_lines: &str,
+    framing_headers: &str,
+) {
+    let middleware_runs = Arc::new(AtomicUsize::new(0));
+    let handler_runs = Arc::new(AtomicUsize::new(0));
+    let mut app = App::new();
+    app.error_handler(|error: HttpError| {
+        Response::send(error.code())
+            .status(error.status().as_u16())
+            .header("x-rustrest-error", "true")
+    });
+    let middleware_counter = Arc::clone(&middleware_runs);
+    app.layer(move |req: Request, next: Next| {
+        middleware_counter.fetch_add(1, Ordering::SeqCst);
+        async move { next(req).await }
+    });
+    let handler_counter = Arc::clone(&handler_runs);
+    let _ = app.post("/upload", move |_req: Request| {
+        handler_counter.fetch_add(1, Ordering::SeqCst);
+        Response::send("ok")
+    });
+
+    let (addr, shutdown, server) = spawn_app(app).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "{leading_lines}POST /upload HTTP/1.1\r\nHost: localhost\r\n{framing_headers}Connection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let response = read_response(&mut stream).await.unwrap();
+    shutdown_server(shutdown, server).await;
+
+    let lower_response = response.to_ascii_lowercase();
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(
+        !lower_response.contains("x-rustrest-error: true"),
+        "{response}"
+    );
+    assert!(
+        lower_response.contains("application/problem+json"),
+        "{response}"
+    );
+    assert!(
+        response.contains(r#""code":"ambiguous_message_framing""#),
+        "{response}"
+    );
+    assert_eq!(middleware_runs.load(Ordering::SeqCst), 0);
+    assert_eq!(handler_runs.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn http1_invalid_content_length_is_rejected_by_hyper() {
     assert_http1_content_length_parse_error("Content-Length: invalid\r\n").await;
@@ -401,6 +469,91 @@ async fn http1_conflicting_content_length_is_rejected_by_hyper() {
 #[tokio::test]
 async fn http1_ambiguous_content_length_list_is_rejected_by_hyper() {
     assert_http1_content_length_parse_error("Content-Length: 5, 6\r\n").await;
+}
+
+#[tokio::test]
+async fn http1_transfer_encoding_with_content_length_is_rejected_before_dispatch() {
+    for headers in [
+        "Transfer-Encoding: chunked\r\nContent-Length: 5\r\n",
+        "Content-Length: 5\r\nTransfer-Encoding: chunked\r\n",
+    ] {
+        assert_http1_ambiguous_framing_rejected_at_transport("", headers).await;
+    }
+}
+
+#[tokio::test]
+async fn http1_leading_empty_lines_cannot_hide_ambiguous_framing() {
+    for leading_lines in ["\r\n\r\n", "\n\n", "\r\n\n"] {
+        assert_http1_ambiguous_framing_rejected_at_transport(
+            leading_lines,
+            "Transfer-Encoding: chunked\r\nContent-Length: 5\r\n",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn http1_connection_closes_before_a_pipelined_ambiguous_request() {
+    let second_handler_runs = Arc::new(AtomicUsize::new(0));
+    let mut app = App::new();
+    let _ = app.get("/first", |_req: Request| Response::send("primera"));
+    let runs = Arc::clone(&second_handler_runs);
+    let _ = app.post("/second", move |_req: Request| {
+        runs.fetch_add(1, Ordering::SeqCst);
+        Response::send("segunda")
+    });
+
+    let (addr, shutdown, server) = spawn_app(app).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"GET /first HTTP/1.1\r\nHost: localhost\r\n\r\nPOST /second HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n0\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    let response = read_response(&mut stream).await.unwrap();
+    shutdown_server(shutdown, server).await;
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.to_ascii_lowercase().contains("connection: close"));
+    assert_eq!(response.matches("HTTP/1.1").count(), 1, "{response}");
+    assert!(!response.contains("segunda"), "{response}");
+    assert_eq!(second_handler_runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn unsuccessful_upgrade_closes_before_a_pipelined_request() {
+    let second_handler_runs = Arc::new(AtomicUsize::new(0));
+    let mut app = App::new();
+    let _ = app.get("/plain", |_req: Request| Response::send("no upgrade"));
+    let runs = Arc::clone(&second_handler_runs);
+    let _ = app.post("/second", move |_req: Request| {
+        runs.fetch_add(1, Ordering::SeqCst);
+        Response::send("segunda")
+    });
+
+    let (addr, shutdown, server) = spawn_app(app).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"GET /plain HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\nPOST /second HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n0\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    let response = read_response(&mut stream).await.unwrap();
+    shutdown_server(shutdown, server).await;
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.to_ascii_lowercase().contains("connection: close"));
+    assert_eq!(response.matches("HTTP/1.1").count(), 1, "{response}");
+    assert_eq!(second_handler_runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn http1_transfer_encoding_with_chunked_before_final_coding_is_rejected_by_hyper() {
+    assert_http1_content_length_parse_error("Transfer-Encoding: chunked, gzip\r\n").await;
 }
 
 #[tokio::test]
@@ -619,6 +772,23 @@ async fn taken_body_stream_preserves_the_raw_error() {
 
     assert_eq!(error.to_string(), "socket contained raw diagnostics");
     assert!(error.downcast_ref::<io::Error>().is_some());
+}
+
+#[tokio::test]
+async fn taken_body_stream_enforces_its_configured_limit() {
+    let chunks: Vec<Result<Bytes, io::Error>> = vec![
+        Ok(Bytes::from_static(b"ab")),
+        Ok(Bytes::from_static(b"cde")),
+        Ok(Bytes::from_static(b"ignored")),
+    ];
+    let mut body = RequestBody::from_stream(stream::iter(chunks), 4);
+    let mut stream = body.take_stream().unwrap();
+
+    assert_eq!(stream.next().await.unwrap().unwrap(), "ab");
+    let error = HttpError::body_read(stream.next().await.unwrap().unwrap_err());
+    assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(error.code(), "payload_too_large");
+    assert!(stream.next().await.is_none());
 }
 
 #[tokio::test]

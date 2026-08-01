@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
 use hyper::body::Bytes;
-use hyper::header::{SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION};
+use hyper::header::{HeaderName, HeaderValue, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION};
 use hyper::upgrade::OnUpgrade;
 use serde::de::DeserializeOwned;
 
@@ -24,8 +24,13 @@ pub struct Request {
     pub raw_query: Option<String>,
     /// Parsed query string. Repeated params keep all values in arrival order.
     pub query: HashMap<String, Vec<String>>,
-    pub headers: HashMap<String, String>,
-    pub cookies: HashMap<String, String>,
+    // Kept private so middleware cannot mutate the collapsed map without also
+    // updating `header_pairs`, which backs security-sensitive typed and
+    // duplicate-preserving header access.
+    pub(crate) headers: HashMap<String, String>,
+    // Derived from Cookie fields; private for the same synchronization reason
+    // as the header views.
+    pub(crate) cookies: HashMap<String, String>,
     pub(crate) body: RequestBody,
     pub(crate) body_limit: usize,
     /// Captured path parameters, e.g. `/users/:id` matching `/users/42`
@@ -77,6 +82,30 @@ impl Request {
         self.cookies.get(name).map(String::as_str)
     }
 
+    /// Returns the parsed request cookies as a read-only map.
+    pub fn cookies(&self) -> &HashMap<String, String> {
+        &self.cookies
+    }
+
+    /// Inserts or replaces one parsed request cookie and synchronizes the
+    /// `Cookie` header seen by raw and typed header accessors.
+    pub fn set_cookie(&mut self, name: &str, value: &str) -> Result<(), HttpError> {
+        if !valid_request_cookie_name(name) || !valid_request_cookie_value(value) {
+            return Err(HttpError::bad_request(
+                "El nombre o valor de la cookie de solicitud no es valido",
+            ));
+        }
+        self.cookies.insert(name.to_string(), value.to_string());
+        self.rewrite_cookie_header();
+        Ok(())
+    }
+
+    /// Removes a parsed request cookie and synchronizes the `Cookie` header.
+    pub fn remove_cookie(&mut self, name: &str) {
+        self.cookies.remove(name);
+        self.rewrite_cookie_header();
+    }
+
     /// Returns a request header by name, case-insensitively.
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
@@ -88,6 +117,94 @@ impl Request {
             .map(String::as_str)
     }
 
+    /// Replaces every occurrence of a request header with one validated value.
+    ///
+    /// This keeps [`Request::header`], [`Request::headers_all`] and typed
+    /// header extractors synchronized. It is the safe way for middleware to
+    /// rewrite inbound headers.
+    pub fn set_header(&mut self, name: &str, value: &str) -> Result<(), HttpError> {
+        let name = parse_header_name(name)?;
+        validate_header_value(value)?;
+        let normalized = name.as_str().to_string();
+
+        self.headers.insert(normalized.clone(), value.to_string());
+        self.header_pairs
+            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(&normalized));
+        self.header_pairs.push((normalized, value.to_string()));
+        if name == hyper::header::COOKIE {
+            self.rebuild_cookie_view();
+        }
+        Ok(())
+    }
+
+    /// Appends a validated request-header value while retaining earlier
+    /// occurrences for duplicate-aware and typed accessors.
+    ///
+    /// The convenience [`Request::header`] view returns the most recently
+    /// appended value.
+    pub fn append_header(&mut self, name: &str, value: &str) -> Result<(), HttpError> {
+        let name = parse_header_name(name)?;
+        validate_header_value(value)?;
+        let normalized = name.as_str().to_string();
+
+        self.headers.insert(normalized.clone(), value.to_string());
+        self.header_pairs.push((normalized, value.to_string()));
+        if name == hyper::header::COOKIE {
+            self.rebuild_cookie_view();
+        }
+        Ok(())
+    }
+
+    /// Removes every occurrence of a request header from all header views.
+    pub fn remove_header(&mut self, name: &str) {
+        self.headers
+            .retain(|existing, _| !existing.eq_ignore_ascii_case(name));
+        self.header_pairs
+            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+        if name.eq_ignore_ascii_case(hyper::header::COOKIE.as_str()) {
+            self.cookies.clear();
+        }
+    }
+
+    /// Returns the collapsed, lowercased request-header map.
+    ///
+    /// Repeated values are available through [`Request::headers_all`].
+    pub fn headers(&self) -> &HashMap<String, String> {
+        &self.headers
+    }
+
+    fn rebuild_cookie_view(&mut self) {
+        self.cookies.clear();
+        for (_, value) in self
+            .header_pairs
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(hyper::header::COOKIE.as_str()))
+        {
+            self.cookies.extend(parse_cookies(value));
+        }
+    }
+
+    fn rewrite_cookie_header(&mut self) {
+        self.headers.remove(hyper::header::COOKIE.as_str());
+        self.header_pairs
+            .retain(|(name, _)| !name.eq_ignore_ascii_case(hyper::header::COOKIE.as_str()));
+        if self.cookies.is_empty() {
+            return;
+        }
+
+        let mut cookies = self.cookies.iter().collect::<Vec<_>>();
+        cookies.sort_unstable_by_key(|(name, _)| *name);
+        let value = cookies
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        self.headers
+            .insert(hyper::header::COOKIE.as_str().to_string(), value.clone());
+        self.header_pairs
+            .push((hyper::header::COOKIE.as_str().to_string(), value));
+    }
+
     /// Returns all values for a request header, case-insensitively, in arrival
     /// order. Preserves duplicates (e.g. multiple `X-Forwarded-For`) that the
     /// `header()`/`headers` convenience view collapses to a single value.
@@ -97,6 +214,17 @@ impl Request {
             .filter(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
             .collect()
+    }
+
+    /// Returns a field that must occur at most once, rejecting ambiguous
+    /// duplicates instead of silently choosing the first or last value.
+    pub fn singleton_header(&self, name: &str) -> Result<Option<&str>, HttpError> {
+        let values = self.headers_all(name);
+        match values.as_slice() {
+            [] => Ok(self.header(name)),
+            [value] => Ok(Some(*value)),
+            _ => Err(HttpError::duplicate_header(name)),
+        }
     }
 
     /// The `Last-Event-ID` header an SSE client sends when reconnecting, so
@@ -131,8 +259,22 @@ impl Request {
 
     pub(crate) fn validate_content_length(&self) -> Result<(), HttpError> {
         let mut content_length: Option<u64> = None;
+        let values = self.headers_all("content-length");
+        let values = if values.is_empty() {
+            self.header("content-length").into_iter().collect()
+        } else {
+            values
+        };
 
-        for raw_value in self.headers_all("content-length") {
+        if !values.is_empty() && self.header("transfer-encoding").is_some() {
+            return Err(HttpError::new(
+                hyper::StatusCode::BAD_REQUEST,
+                "ambiguous_message_framing",
+                "Transfer-Encoding y Content-Length no pueden combinarse",
+            ));
+        }
+
+        for raw_value in values {
             for raw_part in raw_value.split(',') {
                 let value = raw_part.trim();
                 if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -155,8 +297,21 @@ impl Request {
         // Hyper's HTTP/1 parser rejects malformed and conflicting values before
         // service_fn. This validation covers TestClient and transports that
         // preserve repeated fields or comma lists for framework-level handling.
-        if content_length.is_some_and(|length| length > self.body_limit as u64) {
-            return Err(HttpError::payload_too_large_limit(self.body_limit));
+        if let Some(content_length) = content_length {
+            if content_length > self.body_limit as u64 {
+                return Err(HttpError::payload_too_large_limit(self.body_limit));
+            }
+            // An in-process buffered request is already complete. Accepting a
+            // declared length that differs from those bytes would let
+            // TestClient exercise a request a real HTTP transport cannot
+            // dispatch as a complete framed message.
+            if self
+                .body
+                .buffered_len()
+                .is_some_and(|actual| content_length != actual as u64)
+            {
+                return Err(HttpError::invalid_content_length());
+            }
         }
 
         Ok(())
@@ -237,7 +392,8 @@ impl Request {
         &mut self.body
     }
 
-    /// Takes the one-shot request body stream.
+    /// Takes the one-shot request body stream. The effective application or
+    /// route body limit is enforced incrementally across its chunks.
     pub fn take_body_stream(&mut self) -> Result<BodyStream, HttpError> {
         self.body.take_stream()
     }
@@ -263,10 +419,50 @@ impl Request {
         serde_json::from_slice(&self.bytes().await?)
             .map_err(|error| HttpError::invalid_json().with_source(error))
     }
+}
 
-    pub(crate) fn buffered_bytes(&self) -> Result<&Bytes, HttpError> {
-        self.body.buffered_bytes()
-    }
+fn parse_header_name(name: &str) -> Result<HeaderName, HttpError> {
+    HeaderName::try_from(name).map_err(|error| {
+        HttpError::bad_request("El nombre del encabezado de solicitud no es valido")
+            .with_source(error)
+    })
+}
+
+fn validate_header_value(value: &str) -> Result<(), HttpError> {
+    HeaderValue::try_from(value).map(|_| ()).map_err(|error| {
+        HttpError::bad_request("El valor del encabezado de solicitud no es valido")
+            .with_source(error)
+    })
+}
+
+fn valid_request_cookie_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn valid_request_cookie_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e))
 }
 
 pub struct RequestParts<'a> {
@@ -398,7 +594,10 @@ impl RequestBuilder {
                 self.path = path.to_string();
                 self.raw_query = Some(query.to_string());
             }
-            None => self.path = path.to_string(),
+            None => {
+                self.path = path.to_string();
+                self.raw_query = None;
+            }
         }
         self
     }
@@ -465,9 +664,19 @@ impl RequestBuilder {
     }
 
     /// Serializes `value` as the JSON body and sets the content type.
+    ///
+    /// Panics if serialization fails, which keeps hand-built tests from
+    /// silently sending a different empty payload. Use [`Self::try_json`] for
+    /// fallible construction.
     pub fn json<T: serde::Serialize>(self, value: &T) -> Self {
-        let body = serde_json::to_vec(value).unwrap_or_default();
-        self.header("content-type", "application/json").body(body)
+        self.try_json(value)
+            .expect("request JSON serialization failed")
+    }
+
+    /// Fallible variant of [`Self::json`].
+    pub fn try_json<T: serde::Serialize>(self, value: &T) -> Result<Self, serde_json::Error> {
+        let body = serde_json::to_vec(value)?;
+        Ok(self.header("content-type", "application/json").body(body))
     }
 
     pub fn remote_addr(mut self, addr: SocketAddr) -> Self {
@@ -486,12 +695,40 @@ impl RequestBuilder {
             .as_deref()
             .map(parse_query)
             .unwrap_or_default();
-        let mut headers = HashMap::new();
-        let mut cookies = self.cookies;
+        let mut explicit_cookie_names = HashSet::new();
         for (name, value) in &self.headers {
-            if name == "cookie" {
+            if name == hyper::header::COOKIE.as_str() {
+                explicit_cookie_names.extend(parse_cookies(value).into_keys());
+            }
+        }
+        let mut synthetic_cookies = self
+            .cookies
+            .into_iter()
+            .filter(|(name, _)| !explicit_cookie_names.contains(name))
+            .collect::<Vec<_>>();
+        synthetic_cookies.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+
+        let mut header_pairs = self.headers;
+        if !synthetic_cookies.is_empty() {
+            let value = synthetic_cookies
+                .into_iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            // Place synthesized cookies before explicit Cookie fields so every
+            // explicit name retains last-value-wins precedence and duplicate
+            // explicit field lines remain untouched.
+            header_pairs.insert(0, (hyper::header::COOKIE.as_str().to_string(), value));
+        }
+
+        let mut headers = HashMap::new();
+        let mut cookies = HashMap::new();
+        for (name, value) in &header_pairs {
+            if name == hyper::header::COOKIE.as_str() {
                 for (cookie_name, cookie_value) in parse_cookies(value) {
-                    cookies.entry(cookie_name).or_insert(cookie_value);
+                    // RFC Cookie fields are processed in arrival order. Match
+                    // the network path by letting the last duplicate name win.
+                    cookies.insert(cookie_name, cookie_value);
                 }
             }
             headers.insert(name.clone(), value.clone());
@@ -516,7 +753,7 @@ impl RequestBuilder {
             upgrade: None,
             remote_addr: self.remote_addr,
             secure_transport: self.secure_transport,
-            header_pairs: self.headers,
+            header_pairs,
         }
     }
 }

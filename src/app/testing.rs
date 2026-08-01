@@ -88,10 +88,17 @@ impl TestRequest<'_> {
         self
     }
 
-    /// Serializes `value` as the JSON body and sets the content type.
+    /// Serializes `value` as the JSON body and sets the content type. Panics
+    /// on serialization failure; use [`Self::try_json`] to handle it.
     pub fn json<T: Serialize>(mut self, value: &T) -> Self {
         self.builder = self.builder.json(value);
         self
+    }
+
+    /// Fallible variant of [`Self::json`].
+    pub fn try_json<T: Serialize>(mut self, value: &T) -> Result<Self, serde_json::Error> {
+        self.builder = self.builder.try_json(value)?;
+        Ok(self)
     }
 
     /// Runs the request through the app (global middleware, routing, scoped
@@ -100,6 +107,6 @@ impl TestRequest<'_> {
     pub async fn send(self) -> Response {
         let body_limit = self.client.app.config.max_body_size;
         let request = self.builder.body_limit(body_limit).build();
-        self.client.app.run_request(request).await
+        self.client.app.run_request(request).await.finalize()
     }
 }

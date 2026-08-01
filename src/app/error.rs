@@ -6,6 +6,7 @@ use hyper::StatusCode;
 use hyper::header::{HeaderMap, HeaderName, HeaderValue};
 
 use super::Response;
+use super::body::BodyLimitExceeded;
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -83,13 +84,24 @@ impl HttpError {
         )
     }
 
-    pub fn body_read(source: BoxError) -> Self {
+    pub fn duplicate_header(name: &str) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
-            "body_read",
-            "No se pudo leer el cuerpo de la solicitud",
+            "duplicate_header",
+            format!("El encabezado {name} debe aparecer como maximo una vez"),
         )
-        .with_source(source)
+    }
+
+    pub fn body_read(source: BoxError) -> Self {
+        match source.downcast::<BodyLimitExceeded>() {
+            Ok(error) => Self::payload_too_large_limit(error.limit()).with_source(error),
+            Err(source) => Self::new(
+                StatusCode::BAD_REQUEST,
+                "body_read",
+                "No se pudo leer el cuerpo de la solicitud",
+            )
+            .with_source(source),
+        }
     }
 
     pub fn body_already_consumed() -> Self {
@@ -219,6 +231,22 @@ pub trait IntoHttpError {
     fn into_http_error(self) -> HttpError;
 }
 
+#[derive(Debug)]
+struct HandlerMessageError(String);
+
+impl Display for HandlerMessageError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Error for HandlerMessageError {}
+
+fn private_handler_error(message: String) -> HttpError {
+    HttpError::internal_server_error("Error interno del servidor")
+        .with_source(HandlerMessageError(message))
+}
+
 impl IntoHttpError for HttpError {
     fn into_http_error(self) -> HttpError {
         self
@@ -227,13 +255,13 @@ impl IntoHttpError for HttpError {
 
 impl IntoHttpError for &'static str {
     fn into_http_error(self) -> HttpError {
-        HttpError::internal_server_error(self)
+        private_handler_error(self.to_string())
     }
 }
 
 impl IntoHttpError for String {
     fn into_http_error(self) -> HttpError {
-        HttpError::internal_server_error(self)
+        private_handler_error(self)
     }
 }
 

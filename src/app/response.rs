@@ -8,13 +8,14 @@ use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::body::{Bytes, Frame};
 use hyper::header::{
-    CACHE_CONTROL, CONNECTION, CONTENT_TYPE, HeaderName, HeaderValue, SEC_WEBSOCKET_ACCEPT,
-    SEC_WEBSOCKET_KEY, SET_COOKIE, UPGRADE,
+    CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue,
+    SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
 use hyper::{HeaderMap, StatusCode};
 use serde::Serialize;
 use sha1::{Digest, Sha1};
 
+use super::cookie::Cookie;
 use super::websocket::{ResolvedWebSocketConfig, validate_handshake};
 use super::{BoxError, HttpError, IntoHttpError, Request, SseEvent, WebSocketConfig};
 
@@ -35,6 +36,7 @@ pub struct Response {
     trailers: Option<HeaderMap>,
     error: Option<HttpError>,
     build_error: Option<ResponseBuildError>,
+    websocket_upgrade_authorized: bool,
 }
 
 impl Response {
@@ -51,6 +53,7 @@ impl Response {
             trailers: None,
             error: None,
             build_error: None,
+            websocket_upgrade_authorized: false,
         }
     }
 
@@ -75,6 +78,7 @@ impl Response {
             trailers: None,
             error: None,
             build_error: None,
+            websocket_upgrade_authorized: false,
         }
     }
 
@@ -86,7 +90,6 @@ impl Response {
         Self::stream(chunks)
             .content_type("text/event-stream")
             .header(CACHE_CONTROL.as_str(), "no-cache")
-            .header(CONNECTION.as_str(), "keep-alive")
     }
 
     /// Like [`Response::sse`], but whenever `events` stays quiet for
@@ -96,6 +99,9 @@ impl Response {
     where
         S: Stream<Item = SseEvent> + Send + 'static,
     {
+        if heartbeat.is_zero() {
+            return Self::sse(events);
+        }
         let merged = futures_util::stream::unfold(Box::pin(events), move |mut events| async move {
             match tokio::time::timeout(heartbeat, events.next()).await {
                 Ok(Some(event)) => Some((event, events)),
@@ -236,26 +242,27 @@ impl Response {
     }
 
     pub fn cookie(self, name: &str, value: &str) -> Self {
-        let name = sanitize_cookie_part(name);
-        let value = sanitize_cookie_part(value);
-        self.append_header(
-            SET_COOKIE.as_str(),
-            &format!("{}={}; Path=/; HttpOnly", name, value),
-        )
+        self.set_cookie(Cookie::new(name, value).http_only(true))
     }
 
+    #[deprecated(
+        since = "0.4.0",
+        note = "this helper cannot own Hyper's upgraded stream; use App::websocket, Router::websocket, or Request::websocket"
+    )]
     pub fn websocket(req: &Request) -> Result<Self, HttpError> {
         let defaults = WebSocketConfig::default();
         let config = ResolvedWebSocketConfig::from_layers(&defaults, &defaults);
         validate_handshake(req, &config).map_err(|rejection| rejection.into_http_error())?;
+        if req.upgrade.is_some() {
+            return Err(HttpError::internal_server_error(
+                "Response::websocket no puede poseer el transporte actualizado; use una ruta WebSocket",
+            ));
+        }
 
         let key = req
             .header(SEC_WEBSOCKET_KEY.as_str())
             .ok_or_else(|| HttpError::bad_request("Falta Sec-WebSocket-Key"))?;
-        let mut hasher = Sha1::new();
-        hasher.update(key.as_bytes());
-        hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-        let accept = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        let accept = websocket_accept(key);
 
         Ok(Self::send("")
             .status(101)
@@ -309,23 +316,226 @@ impl Response {
         self.body_kind = BodyKind::Empty;
     }
 
-    pub(crate) fn map_body_bytes<F>(&mut self, mapper: F) -> Result<(), HttpError>
-    where
-        F: FnOnce(&[u8]) -> Result<Vec<u8>, HttpError>,
-    {
-        if let BodyKind::Bytes(bytes) = &self.body_kind {
-            let mapped = Bytes::from(mapper(bytes)?);
-            self.body_kind = BodyKind::Bytes(mapped);
+    pub(crate) fn clear_body_and_trailers(&mut self) {
+        self.clear_body();
+        self.trailers = None;
+        self.headers.remove(TRAILER);
+    }
+
+    pub(crate) fn has_trailers(&self) -> bool {
+        self.trailers.is_some()
+    }
+
+    /// Removes connection-specific response fields before HTTP/2 emission.
+    /// A trailer nominated by `Connection` is rejected instead of becoming an
+    /// end-to-end field after the nominating header is stripped.
+    pub(crate) fn strip_http2_connection_headers(&mut self) {
+        let nominated = connection_nominated_headers(&self.headers);
+        if let Some(trailers) = &self.trailers {
+            if let Some(name) = nominated.iter().find(|name| trailers.contains_key(*name)) {
+                self.record_build_error(ResponseBuildError::invalid_trailer_name(name.as_str()));
+            }
         }
-        Ok(())
+
+        self.headers.remove(CONNECTION);
+        self.headers.remove(UPGRADE);
+        self.headers.remove(TE);
+        self.headers.remove("keep-alive");
+        self.headers.remove("proxy-connection");
+        for name in nominated {
+            self.headers.remove(name);
+        }
+    }
+
+    /// Removes a `HEAD` response body while retaining the representation
+    /// length a corresponding `GET` would have sent. Explicit lengths are
+    /// validated against buffered bodies before the bytes are discarded.
+    pub(crate) fn prepare_for_head(&mut self) {
+        // A HEAD response never carries a content section, including trailer
+        // fields that would otherwise follow the body stream.
+        self.trailers = None;
+        self.headers.remove(TRAILER);
+        let Ok(status) = StatusCode::from_u16(self.status) else {
+            self.clear_body();
+            return;
+        };
+        if status_has_no_content(status) {
+            self.clear_body();
+            return;
+        }
+
+        self.preserve_buffered_representation_length();
+        self.clear_body();
+    }
+
+    /// Converts a selected buffered representation into a `304` response
+    /// without losing the bytes needed to validate or derive Content-Length.
+    pub(crate) fn prepare_for_not_modified(&mut self) {
+        self.validate_selected_representation_before_discard();
+        self.clear_body_and_trailers();
+    }
+
+    fn validate_selected_representation_before_discard(&mut self) {
+        if let Some(trailers) = &self.trailers {
+            if let Err(error) = validate_response_trailers(&self.headers, trailers) {
+                self.record_build_error(error);
+            }
+        } else if self.headers.contains_key(TRAILER) {
+            self.record_build_error(ResponseBuildError::trailer_without_fields());
+        }
+
+        if self.headers.contains_key(TRANSFER_ENCODING) {
+            self.record_build_error(ResponseBuildError::explicit_transfer_encoding());
+        }
+
+        let content_length = match parse_content_length(&mut self.headers) {
+            Ok(content_length) => content_length,
+            Err(error) => {
+                self.record_build_error(error);
+                None
+            }
+        };
+        if content_length.is_some() && self.trailers.is_some() {
+            self.record_build_error(ResponseBuildError::content_length_with_trailers());
+        }
+
+        if let BodyKind::Bytes(bytes) = &self.body_kind {
+            let actual = bytes.len() as u64;
+            match content_length {
+                Some(declared) if declared != actual => {
+                    self.record_build_error(ResponseBuildError::content_length_mismatch(
+                        declared, actual,
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    self.headers.insert(
+                        CONTENT_LENGTH,
+                        HeaderValue::from_str(&actual.to_string())
+                            .expect("a decimal content length is a valid header value"),
+                    );
+                }
+            }
+        }
+
+        if !self.headers.contains_key(CONTENT_TYPE) {
+            if let Err(error) = HeaderValue::from_str(&self.content_type) {
+                self.record_build_error(ResponseBuildError::invalid_header_value(error));
+            }
+        }
+    }
+
+    fn preserve_buffered_representation_length(&mut self) {
+        let BodyKind::Bytes(bytes) = &self.body_kind else {
+            return;
+        };
+        let actual = bytes.len() as u64;
+        match parse_content_length(&mut self.headers) {
+            Ok(Some(declared)) if declared != actual => {
+                self.record_build_error(ResponseBuildError::content_length_mismatch(
+                    declared, actual,
+                ));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                self.headers.insert(
+                    CONTENT_LENGTH,
+                    HeaderValue::from_str(&actual.to_string())
+                        .expect("a decimal content length is a valid header value"),
+                );
+            }
+            Err(error) => self.record_build_error(error),
+        }
+    }
+
+    /// Replaces an existing buffered body and returns `false` for streamed or
+    /// empty responses. This lets middleware transform bytes without exposing
+    /// the internal body representation.
+    pub(crate) fn replace_body_bytes(&mut self, bytes: Bytes) -> bool {
+        if !matches!(self.body_kind, BodyKind::Bytes(_)) {
+            return false;
+        }
+        self.body_kind = BodyKind::Bytes(bytes);
+        true
     }
 
     pub(crate) fn take_error(&mut self) -> Option<HttpError> {
         self.error.take()
     }
 
+    pub(crate) fn authorize_websocket_upgrade(&mut self) {
+        self.websocket_upgrade_authorized = true;
+    }
+
+    pub(crate) fn websocket_upgrade_authorized(&self) -> bool {
+        self.websocket_upgrade_authorized
+    }
+
+    /// Applies the same status/body/framing validation used at the network
+    /// boundary while retaining the framework-native response type.
+    pub(crate) fn finalize(mut self) -> Self {
+        if let Some(error) = self.build_error.take() {
+            return invalid_response_value(error);
+        }
+        let status = match StatusCode::from_u16(self.status) {
+            Ok(status) => status,
+            Err(error) => {
+                return invalid_response_value(ResponseBuildError::invalid_status(error));
+            }
+        };
+        if status.is_informational() && status != StatusCode::SWITCHING_PROTOCOLS {
+            return invalid_response_value(ResponseBuildError::interim_status(status));
+        }
+        if status == StatusCode::SWITCHING_PROTOCOLS
+            && !valid_websocket_switching_protocols(&self.headers)
+        {
+            return invalid_response_value(ResponseBuildError::invalid_switching_protocols());
+        }
+        if let Some(trailers) = &self.trailers {
+            if let Err(error) = validate_response_trailers(&self.headers, trailers) {
+                return invalid_response_value(error);
+            }
+            let trailer_names = trailers
+                .keys()
+                .map(HeaderName::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let trailer_names = HeaderValue::from_str(&trailer_names)
+                .expect("validated trailer names form a valid header value");
+            self.headers.insert(TRAILER, trailer_names);
+        } else if self.headers.contains_key(TRAILER) {
+            return invalid_response_value(ResponseBuildError::trailer_without_fields());
+        }
+        if let Err(error) = finalize_framing(&mut self, status) {
+            return invalid_response_value(error);
+        }
+        if !status_has_no_content(status) && !self.headers.contains_key(CONTENT_TYPE) {
+            let content_type = match HeaderValue::from_str(&self.content_type) {
+                Ok(content_type) => content_type,
+                Err(error) => {
+                    return invalid_response_value(ResponseBuildError::invalid_header_value(error));
+                }
+            };
+            self.headers.insert(CONTENT_TYPE, content_type);
+        }
+        if !status_has_no_content(status)
+            && !self.headers.contains_key(CONTENT_LENGTH)
+            && self.trailers.is_none()
+        {
+            if let BodyKind::Bytes(bytes) = &self.body_kind {
+                self.headers.insert(
+                    CONTENT_LENGTH,
+                    HeaderValue::from_str(&bytes.len().to_string())
+                        .expect("a decimal content length is a valid header value"),
+                );
+            }
+        }
+        self
+    }
+
     /// Converts our framework response into a hyper response.
     pub(crate) fn into_hyper(self) -> hyper::Response<ResponseBody> {
+        let response = self.finalize();
         let Response {
             status,
             content_type,
@@ -333,25 +543,11 @@ impl Response {
             body_kind,
             trailers,
             error: _,
-            build_error,
-        } = self;
-
-        if let Some(error) = build_error {
-            return invalid_response(error);
-        }
-        let status = match StatusCode::from_u16(status) {
-            Ok(status) => status,
-            Err(error) => return invalid_response(ResponseBuildError::invalid_status(error)),
-        };
-        let content_type = match HeaderValue::from_str(&content_type) {
-            Ok(content_type) => content_type,
-            Err(error) => return invalid_response(ResponseBuildError::invalid_header_value(error)),
-        };
-        if let Some(trailers) = &trailers {
-            if let Err(error) = validate_trailers(trailers) {
-                return invalid_response(error);
-            }
-        }
+            build_error: _,
+            websocket_upgrade_authorized: _,
+        } = response;
+        let status =
+            StatusCode::from_u16(status).expect("a finalized response always has a valid status");
 
         let hyper_body = match (body_kind, trailers) {
             (BodyKind::Bytes(bytes), None) => Full::new(bytes)
@@ -375,8 +571,12 @@ impl Response {
         };
 
         let mut builder = hyper::Response::builder().status(status);
-        if !headers.contains_key(CONTENT_TYPE) {
-            builder = builder.header(CONTENT_TYPE, content_type);
+        if !status_has_no_content(status) && !headers.contains_key(CONTENT_TYPE) {
+            builder = builder.header(
+                CONTENT_TYPE,
+                HeaderValue::from_str(&content_type)
+                    .expect("a finalized response always has a valid content type"),
+            );
         }
         for (name, value) in &headers {
             builder = builder.header(name, value);
@@ -389,6 +589,13 @@ impl Response {
     }
 }
 
+pub(crate) fn websocket_accept(key: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+}
+
 fn body_with_trailers(stream: ResponseStream, trailers: Option<HeaderMap>) -> ResponseBody {
     let Some(trailers) = trailers else {
         return StreamBody::new(stream).boxed_unsync();
@@ -399,18 +606,219 @@ fn body_with_trailers(stream: ResponseStream, trailers: Option<HeaderMap>) -> Re
 
 fn validate_trailers(trailers: &HeaderMap) -> Result<(), ResponseBuildError> {
     for name in trailers.keys() {
-        if name.as_str().starts_with(':') {
+        if is_forbidden_trailer(name) {
             return Err(ResponseBuildError::invalid_trailer_name(name.as_str()));
         }
     }
     Ok(())
 }
 
+fn validate_response_trailers(
+    headers: &HeaderMap,
+    trailers: &HeaderMap,
+) -> Result<(), ResponseBuildError> {
+    validate_trailers(trailers)?;
+    for name in connection_nominated_headers(headers) {
+        if trailers.contains_key(&name) {
+            return Err(ResponseBuildError::invalid_trailer_name(name.as_str()));
+        }
+    }
+    Ok(())
+}
+
+fn connection_nominated_headers(headers: &HeaderMap) -> Vec<HeaderName> {
+    headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|name| HeaderName::from_bytes(name.trim().as_bytes()).ok())
+        .collect()
+}
+
+fn is_forbidden_trailer(name: &HeaderName) -> bool {
+    let name = name.as_str();
+    if name.starts_with("access-control-")
+        || name.starts_with("cross-origin-")
+        || name.starts_with("proxy-")
+        || name.starts_with("sec-websocket-")
+    {
+        return true;
+    }
+    matches!(
+        name,
+        "accept-ranges"
+            | "age"
+            | "allow"
+            | "alt-svc"
+            | "authorization"
+            | "cache-control"
+            | "connection"
+            | "content-disposition"
+            | "content-encoding"
+            | "content-language"
+            | "content-length"
+            | "content-location"
+            | "content-range"
+            | "content-security-policy"
+            | "content-type"
+            | "cookie"
+            | "date"
+            | "expect"
+            | "expires"
+            | "host"
+            | "if-match"
+            | "if-modified-since"
+            | "if-none-match"
+            | "if-range"
+            | "if-unmodified-since"
+            | "keep-alive"
+            | "last-modified"
+            | "link"
+            | "location"
+            | "max-forwards"
+            | "permissions-policy"
+            | "pragma"
+            | "range"
+            | "referrer-policy"
+            | "refresh"
+            | "retry-after"
+            | "server"
+            | "set-cookie"
+            | "strict-transport-security"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "vary"
+            | "warning"
+            | "www-authenticate"
+            | "x-content-type-options"
+            | "x-frame-options"
+    )
+}
+
+fn valid_websocket_switching_protocols(headers: &HeaderMap) -> bool {
+    response_header_contains_token(headers, CONNECTION, "upgrade")
+        && response_header_contains_token(headers, UPGRADE, "websocket")
+        && headers.get_all(SEC_WEBSOCKET_ACCEPT).iter().count() == 1
+        && headers
+            .get(SEC_WEBSOCKET_ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(value.trim())
+                    .ok()
+            })
+            .is_some_and(|accept| accept.len() == 20)
+}
+
+fn response_header_contains_token(
+    headers: &HeaderMap,
+    name: hyper::header::HeaderName,
+    expected: &str,
+) -> bool {
+    headers.get_all(name).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case(expected))
+        })
+    })
+}
+
+fn finalize_framing(response: &mut Response, status: StatusCode) -> Result<(), ResponseBuildError> {
+    let content_length = parse_content_length(&mut response.headers)?;
+    if response.headers.contains_key(TRANSFER_ENCODING) {
+        return Err(ResponseBuildError::explicit_transfer_encoding());
+    }
+    if content_length.is_some() && response.trailers.is_some() {
+        return Err(ResponseBuildError::content_length_with_trailers());
+    }
+
+    // A 304 may carry the length of the selected representation even though
+    // it carries no content. When buffered bytes are available, validate that
+    // metadata before discarding them.
+    if status == StatusCode::NOT_MODIFIED {
+        if let (Some(expected), BodyKind::Bytes(bytes)) = (content_length, &response.body_kind) {
+            if expected != bytes.len() as u64 {
+                return Err(ResponseBuildError::content_length_mismatch(
+                    expected,
+                    bytes.len() as u64,
+                ));
+            }
+        }
+    }
+
+    if status_has_no_content(status) {
+        response.clear_body();
+        response.trailers = None;
+        response.headers.remove(TRAILER);
+        response.headers.remove(TRANSFER_ENCODING);
+        if status != StatusCode::NOT_MODIFIED {
+            response.headers.remove(CONTENT_LENGTH);
+        }
+        return Ok(());
+    }
+
+    if let (Some(expected), BodyKind::Bytes(bytes)) = (content_length, &response.body_kind) {
+        if expected != bytes.len() as u64 {
+            return Err(ResponseBuildError::content_length_mismatch(
+                expected,
+                bytes.len() as u64,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_content_length(headers: &mut HeaderMap) -> Result<Option<u64>, ResponseBuildError> {
+    let mut parsed = None;
+    for value in headers.get_all(CONTENT_LENGTH).iter() {
+        let value = value
+            .to_str()
+            .map_err(ResponseBuildError::invalid_content_length)?;
+        for candidate in value.split(',') {
+            let candidate = candidate.trim();
+            if candidate.is_empty() || !candidate.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(ResponseBuildError::invalid_content_length_value(candidate));
+            }
+            let length = candidate
+                .parse::<u64>()
+                .map_err(ResponseBuildError::invalid_content_length)?;
+            if parsed.is_some_and(|current| current != length) {
+                return Err(ResponseBuildError::conflicting_content_length());
+            }
+            parsed = Some(length);
+        }
+    }
+    if let Some(length) = parsed {
+        headers.insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&length.to_string())
+                .expect("a decimal content length is a valid header value"),
+        );
+    }
+    Ok(parsed)
+}
+
+fn status_has_no_content(status: StatusCode) -> bool {
+    status.is_informational()
+        || matches!(
+            status,
+            StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT | StatusCode::NOT_MODIFIED
+        )
+}
+
 fn invalid_response(error: ResponseBuildError) -> hyper::Response<ResponseBody> {
+    invalid_response_value(error).into_hyper()
+}
+
+fn invalid_response_value(error: ResponseBuildError) -> Response {
     Response::from_error(
         HttpError::internal_server_error("No se pudo construir la respuesta").with_source(error),
     )
-    .into_hyper()
+    .finalize()
 }
 
 #[derive(Debug)]
@@ -466,8 +874,56 @@ impl ResponseBuildError {
 
     pub fn invalid_trailer_name(name: &str) -> Self {
         Self::new(format!(
-            "El nombre de trailer de la respuesta no es valido: {name}"
+            "El trailer de la respuesta no esta permitido: {name}"
         ))
+    }
+
+    pub fn invalid_content_length<E>(source: E) -> Self
+    where
+        E: Into<BoxError>,
+    {
+        Self::with_source("Content-Length de la respuesta no es valido", source)
+    }
+
+    pub fn invalid_content_length_value(value: &str) -> Self {
+        Self::new(format!(
+            "Content-Length de la respuesta no es valido: {value}"
+        ))
+    }
+
+    pub fn conflicting_content_length() -> Self {
+        Self::new("La respuesta contiene valores Content-Length en conflicto")
+    }
+
+    pub fn content_length_mismatch(declared: u64, actual: u64) -> Self {
+        Self::new(format!(
+            "Content-Length ({declared}) no coincide con el cuerpo ({actual})"
+        ))
+    }
+
+    pub fn explicit_transfer_encoding() -> Self {
+        Self::new(
+            "Transfer-Encoding de la respuesta lo debe seleccionar automaticamente el servidor",
+        )
+    }
+
+    pub fn content_length_with_trailers() -> Self {
+        Self::new("Content-Length no se puede combinar con trailers de respuesta")
+    }
+
+    pub fn interim_status(status: StatusCode) -> Self {
+        Self::new(format!(
+            "El estado provisional {} no puede ser la respuesta final de un manejador",
+            status.as_u16()
+        ))
+    }
+
+    pub fn invalid_switching_protocols() -> Self {
+        Self::new("La respuesta 101 no contiene un handshake WebSocket valido")
+    }
+
+    pub fn trailer_without_fields() -> Self {
+        Self::new("El encabezado Trailer requiere campos trailer en la respuesta")
     }
 
     pub fn builder<E>(source: E) -> Self
@@ -490,13 +946,6 @@ impl Error for ResponseBuildError {
             .as_deref()
             .map(|source| source as &(dyn Error + 'static))
     }
-}
-
-fn sanitize_cookie_part(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| !matches!(ch, ';' | ',' | '\r' | '\n'))
-        .collect()
 }
 
 pub trait IntoResponse {

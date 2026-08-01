@@ -1,18 +1,28 @@
-use std::time::Duration;
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use hyper::Uri;
 use hyper::http::uri::Authority;
 
-use super::{Request, WsError};
+#[cfg(test)]
+use super::Request;
+use super::WsError;
 
-const DEFAULT_MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
-const DEFAULT_MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
+const DEFAULT_MAX_MESSAGE_SIZE: usize = 1024 * 1024;
+const DEFAULT_MAX_FRAME_SIZE: usize = 256 * 1024;
 const DEFAULT_WRITE_BUFFER_SIZE: usize = 128 * 1024;
 const DEFAULT_MAX_WRITE_BUFFER_SIZE: usize = 1024 * 1024;
-const DEFAULT_CHANNEL_CAPACITY: usize = 64;
+const DEFAULT_CHANNEL_CAPACITY: usize = 16;
 const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_PONG_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_MAX_CONNECTIONS: usize = 2_000;
+const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 20;
+const DEFAULT_MAX_MESSAGES_PER_INTERVAL: u32 = 100;
+const DEFAULT_MESSAGE_RATE_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_ROOMS: usize = 32;
 const DEFAULT_MAX_ROOM_NAME_BYTES: usize = 128;
 
@@ -100,6 +110,9 @@ impl OriginPolicy {
             return false;
         };
 
+        if matches!(self, Self::SameHost { .. }) && origin.scheme.is_secure() != secure_transport {
+            return false;
+        }
         let host_default_port = if secure_transport { 443 } else { 80 };
         self.allows_normalized(origin, host, host_default_port)
     }
@@ -169,6 +182,10 @@ impl OriginScheme {
             Self::Http | Self::Ws => 80,
             Self::Https | Self::Wss => 443,
         }
+    }
+
+    fn is_secure(self) -> bool {
+        matches!(self, Self::Https | Self::Wss)
     }
 }
 
@@ -252,8 +269,8 @@ pub struct MessageRateLimit {
 pub struct WebSocketConfig {
     pub(crate) protocols: Option<Vec<String>>,
     pub(crate) require_protocol: Option<bool>,
-    pub(crate) max_message_size: Option<usize>,
-    pub(crate) max_frame_size: Option<usize>,
+    pub(crate) max_message_size: Option<Option<usize>>,
+    pub(crate) max_frame_size: Option<Option<usize>>,
     pub(crate) write_buffer_size: Option<usize>,
     pub(crate) max_write_buffer_size: Option<usize>,
     pub(crate) inbound_capacity: Option<usize>,
@@ -266,7 +283,7 @@ pub struct WebSocketConfig {
     pub(crate) max_connection_lifetime: Option<Option<Duration>>,
     pub(crate) close_timeout: Option<Duration>,
     pub(crate) origin_policy: Option<OriginPolicy>,
-    pub(crate) max_connections: Option<usize>,
+    pub(crate) max_connections: Option<Option<usize>>,
     pub(crate) max_connections_per_ip: Option<Option<usize>>,
     pub(crate) message_rate_limit: Option<Option<MessageRateLimit>>,
     pub(crate) max_rooms_per_connection: Option<usize>,
@@ -298,12 +315,26 @@ impl WebSocketConfig {
 
     /// Caps the size of incoming messages; larger ones error the connection.
     pub fn max_message_size(mut self, bytes: usize) -> Self {
-        self.max_message_size = Some(bytes);
+        self.max_message_size = Some(Some(bytes));
+        self
+    }
+
+    /// Removes the incoming message-size ceiling. Prefer a finite limit for
+    /// internet-facing endpoints.
+    pub fn disable_max_message_size(mut self) -> Self {
+        self.max_message_size = Some(None);
         self
     }
 
     pub fn max_frame_size(mut self, bytes: usize) -> Self {
-        self.max_frame_size = Some(bytes);
+        self.max_frame_size = Some(Some(bytes));
+        self
+    }
+
+    /// Removes the incoming frame-size ceiling. Prefer a finite limit for
+    /// internet-facing endpoints.
+    pub fn disable_max_frame_size(mut self) -> Self {
+        self.max_frame_size = Some(None);
         self
     }
 
@@ -385,7 +416,14 @@ impl WebSocketConfig {
     }
 
     pub fn max_connections(mut self, max_connections: usize) -> Self {
-        self.max_connections = Some(max_connections);
+        self.max_connections = Some(Some(max_connections));
+        self
+    }
+
+    /// Disables the process-wide limit when used as an App default, or the
+    /// route-specific limit when used on a route.
+    pub fn disable_max_connections(mut self) -> Self {
+        self.max_connections = Some(None);
         self
     }
 
@@ -428,9 +466,10 @@ impl WebSocketConfig {
     }
 
     /// Picks the first client-offered subprotocol the server supports.
+    #[cfg(test)]
     pub(super) fn negotiate(&self, req: &Request) -> Option<String> {
         let protocols = self.protocols.as_deref().unwrap_or_default();
-        super::negotiate_protocol(req, protocols)
+        super::negotiate_protocol(req, protocols).ok().flatten()
     }
 }
 
@@ -438,8 +477,8 @@ impl WebSocketConfig {
 pub(crate) struct ResolvedWebSocketConfig {
     pub protocols: Vec<String>,
     pub require_protocol: bool,
-    pub max_message_size: usize,
-    pub max_frame_size: usize,
+    pub max_message_size: Option<usize>,
+    pub max_frame_size: Option<usize>,
     pub write_buffer_size: usize,
     pub max_write_buffer_size: usize,
     pub inbound_capacity: usize,
@@ -475,11 +514,11 @@ impl ResolvedWebSocketConfig {
             max_message_size: route
                 .max_message_size
                 .or(app.max_message_size)
-                .unwrap_or(DEFAULT_MAX_MESSAGE_SIZE),
+                .unwrap_or(Some(DEFAULT_MAX_MESSAGE_SIZE)),
             max_frame_size: route
                 .max_frame_size
                 .or(app.max_frame_size)
-                .unwrap_or(DEFAULT_MAX_FRAME_SIZE),
+                .unwrap_or(Some(DEFAULT_MAX_FRAME_SIZE)),
             write_buffer_size: route
                 .write_buffer_size
                 .or(app.write_buffer_size)
@@ -504,16 +543,22 @@ impl ResolvedWebSocketConfig {
                 .send_timeout
                 .or(app.send_timeout)
                 .unwrap_or(DEFAULT_SEND_TIMEOUT),
-            ping_interval: route.ping_interval.or(app.ping_interval).unwrap_or(None),
+            ping_interval: route
+                .ping_interval
+                .or(app.ping_interval)
+                .unwrap_or(Some(DEFAULT_PING_INTERVAL)),
             pong_timeout: route
                 .pong_timeout
                 .or(app.pong_timeout)
                 .unwrap_or(DEFAULT_PONG_TIMEOUT),
-            idle_timeout: route.idle_timeout.or(app.idle_timeout).unwrap_or(None),
+            idle_timeout: route
+                .idle_timeout
+                .or(app.idle_timeout)
+                .unwrap_or(Some(DEFAULT_IDLE_TIMEOUT)),
             max_connection_lifetime: route
                 .max_connection_lifetime
                 .or(app.max_connection_lifetime)
-                .unwrap_or(None),
+                .unwrap_or(Some(DEFAULT_MAX_CONNECTION_LIFETIME)),
             close_timeout: route
                 .close_timeout
                 .or(app.close_timeout)
@@ -522,18 +567,23 @@ impl ResolvedWebSocketConfig {
                 .origin_policy
                 .clone()
                 .or_else(|| app.origin_policy.clone())
-                .unwrap_or_else(OriginPolicy::any),
-            process_max_connections: app.max_connections,
-            route_max_connections: route.max_connections,
+                .unwrap_or_else(|| OriginPolicy::same_host().allow_missing(false)),
+            process_max_connections: app.max_connections.unwrap_or(Some(DEFAULT_MAX_CONNECTIONS)),
+            route_max_connections: route.max_connections.unwrap_or(None),
             max_connections_per_ip: route
                 .max_connections_per_ip
                 .or(app.max_connections_per_ip)
-                .unwrap_or(None),
+                .unwrap_or(Some(DEFAULT_MAX_CONNECTIONS_PER_IP)),
             message_rate_limit: route
                 .message_rate_limit
                 .clone()
                 .or_else(|| app.message_rate_limit.clone())
-                .unwrap_or(None),
+                .unwrap_or({
+                    Some(MessageRateLimit {
+                        max_messages: DEFAULT_MAX_MESSAGES_PER_INTERVAL,
+                        interval: DEFAULT_MESSAGE_RATE_INTERVAL,
+                    })
+                }),
             max_rooms_per_connection: route
                 .max_rooms_per_connection
                 .or(app.max_rooms_per_connection)
@@ -546,7 +596,25 @@ impl ResolvedWebSocketConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<(), WsError> {
-        if self.max_message_size == 0 || self.max_frame_size == 0 {
+        let mut protocols = HashSet::with_capacity(self.protocols.len());
+        for protocol in &self.protocols {
+            if !super::is_valid_protocol_token(protocol) {
+                return Err(WsError::InvalidConfiguration(
+                    "los subprotocolos WebSocket deben ser tokens HTTP validos".into(),
+                ));
+            }
+            if !protocols.insert(protocol.as_str()) {
+                return Err(WsError::InvalidConfiguration(
+                    "los subprotocolos WebSocket no pueden estar duplicados".into(),
+                ));
+            }
+        }
+        if self.require_protocol && self.protocols.is_empty() {
+            return Err(WsError::InvalidConfiguration(
+                "require_protocol necesita al menos un subprotocolo WebSocket".into(),
+            ));
+        }
+        if self.max_message_size == Some(0) || self.max_frame_size == Some(0) {
             return Err(WsError::InvalidConfiguration(
                 "los limites de mensaje y frame WebSocket deben ser mayores que cero".into(),
             ));
@@ -569,9 +637,22 @@ impl ResolvedWebSocketConfig {
                 "ping_interval debe ser mayor que pong_timeout".into(),
             ));
         }
-        if self.send_timeout.is_zero() || self.close_timeout.is_zero() {
+        let now = Instant::now();
+        let deadlines = [
+            self.ping_interval,
+            Some(self.pong_timeout),
+            self.idle_timeout,
+            self.max_connection_lifetime,
+            Some(self.close_timeout),
+        ];
+        if self.send_timeout.is_zero()
+            || deadlines
+                .into_iter()
+                .flatten()
+                .any(|timeout| timeout.is_zero() || now.checked_add(timeout).is_none())
+        {
             return Err(WsError::InvalidConfiguration(
-                "los tiempos limite de envio y cierre WebSocket deben ser mayores que cero".into(),
+                "los tiempos limite WebSocket deben ser positivos y representables".into(),
             ));
         }
         if self.max_rooms_per_connection == 0 || self.max_room_name_bytes == 0 {
@@ -609,7 +690,7 @@ impl ResolvedWebSocketConfig {
         tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
             .write_buffer_size(self.write_buffer_size)
             .max_write_buffer_size(self.max_write_buffer_size)
-            .max_message_size(Some(self.max_message_size))
-            .max_frame_size(Some(self.max_frame_size))
+            .max_message_size(self.max_message_size)
+            .max_frame_size(self.max_frame_size)
     }
 }

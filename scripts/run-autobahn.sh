@@ -8,11 +8,18 @@ mkdir -p target/autobahn
 
 endpoint_url="${AUTOBAHN_ENDPOINT_URL:-http://127.0.0.1:3000/autobahn}"
 config_dir="${PWD}/autobahn"
+server_url="${AUTOBAHN_SERVER_URL:-}"
+docker_network_args=(--network host)
 
-if [[ -n "${AUTOBAHN_SERVER_URL:-}" ]]; then
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  docker_network_args=(--network bridge)
+  server_url="${server_url:-ws://host.docker.internal:3000/autobahn}"
+fi
+
+if [[ -n "${server_url}" ]]; then
   config_dir="${PWD}/target/autobahn/config"
   mkdir -p "${config_dir}"
-  python3 - "${AUTOBAHN_SERVER_URL}" <<'PY'
+  python3 - "${server_url}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -47,7 +54,7 @@ esac
 
 rm -rf target/autobahn/server
 
-docker run --rm --network host \
+docker run --rm "${docker_network_args[@]}" \
   -v "${config_dir}:/config:ro" \
   -v "${PWD}/target/autobahn:/reports" \
   crossbario/autobahn-testsuite:25.10.1 \

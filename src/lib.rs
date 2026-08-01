@@ -18,7 +18,7 @@
 //! ```
 //!
 //! The [`app`] module is also available with the framework's public core types.
-//! See `docs/migrations/0.2-to-0.3.md` in the repository for the 0.3 migration guide.
+//! See `docs/migrations/0.3-to-0.4.md` in the repository for the latest migration guide.
 #![forbid(unsafe_code)]
 
 pub mod app;
@@ -26,20 +26,22 @@ pub mod app;
 #[cfg(feature = "tls")]
 pub use app::tls;
 pub use app::{
-    App, BackpressurePolicy, BodyStream, BoxError, ConnectInfo, Cookie, Cookies, ErrorHandler,
-    Extension, Form, FromRequest, FromRequestParts, Handler, Headers, HostPattern, HttpError,
-    InMemoryWsBroker, IntoHandler, IntoHttpError, IntoMiddleware, IntoResponse,
-    IntoWebSocketHandler, IntoWebSocketOutput, Json, MatchedPath, Middleware, MultipartPart, Next,
-    OriginPolicy, OriginalUri, Path, Query, Request, RequestBody, RequestBuilder, RequestParts,
-    Response, ResponseBuildError, RouteError, RouteErrorKind, RouteHandle, RouteInfo,
-    RouteMatchError, RouteMatchErrorKind, RoutePattern, Router, SameSite, Sessions, SseError,
-    SseEvent, State, StateStore, TestClient, TestRequest, TrailingSlash, TypedHeader, WebSocket,
-    WebSocketCapacityError, WebSocketCloseInfo, WebSocketCloseInitiator, WebSocketConfig,
-    WebSocketConnectionSnapshot, WebSocketError, WebSocketErrorCategory, WebSocketEvent,
-    WebSocketHandler, WebSocketId, WebSocketLifecycleState, WebSocketMessage, WebSocketObservation,
-    WebSocketObserver, WebSocketReceiver, WebSocketRuntimeHandle, WebSocketSender, WebSocketStats,
-    WebSocketTimeout, WsBroadcast, WsBroadcastError, WsBroadcastReport, WsBroker, WsBrokerError,
-    WsBrokerErrorCategory, WsBrokerPayload, WsBrokerPublication, WsBrokerStream, WsBrokerTarget,
-    WsError, WsHub, WsHubBuilder, WsLocalSocket, WsNodeId, WsPublicationId, WsRemotePublish,
-    WsRoute, WsTarget, middleware, sign_value, verify_value,
+    App, BackpressurePolicy, BodyStream, BoxError, ConnectInfo, Cookie, Cookies, Dotfiles,
+    ErrorHandler, Extension, Form, FromRequest, FromRequestParts, Handler, Headers, HostPattern,
+    HttpError, InMemoryWsBroker, IntoHandler, IntoHttpError, IntoMiddleware, IntoResponse,
+    IntoWebSocketHandler, IntoWebSocketOutput, Json, MatchedPath, Middleware, MultipartLimits,
+    MultipartPart, Next, OptionalRejection, OriginPolicy, OriginalUri, Path, Query, Request,
+    RequestBody, RequestBuilder, RequestParts, Response, ResponseBuildError, RouteError,
+    RouteErrorKind, RouteHandle, RouteInfo, RouteMatchError, RouteMatchErrorKind, RoutePattern,
+    Router, SameSite, SessionConfigError, SessionDataError, SessionDataErrorKind, Sessions,
+    SseError, SseEvent, State, StateStore, StaticFilesOptions, TestClient, TestRequest,
+    TrailingSlash, TypedHeader, WebSocket, WebSocketCapacityError, WebSocketCloseInfo,
+    WebSocketCloseInitiator, WebSocketConfig, WebSocketConnectionSnapshot, WebSocketError,
+    WebSocketErrorCategory, WebSocketEvent, WebSocketHandler, WebSocketId, WebSocketLifecycleState,
+    WebSocketMessage, WebSocketObservation, WebSocketObserver, WebSocketReceiver,
+    WebSocketRuntimeHandle, WebSocketSender, WebSocketStats, WebSocketTimeout, WsBroadcast,
+    WsBroadcastError, WsBroadcastReport, WsBroker, WsBrokerError, WsBrokerErrorCategory,
+    WsBrokerPayload, WsBrokerPublication, WsBrokerStream, WsBrokerTarget, WsError, WsHub,
+    WsHubBuilder, WsLocalSocket, WsNodeId, WsPublicationId, WsRemotePublish, WsRoute, WsTarget,
+    middleware, sign_value, verify_value,
 };

@@ -3,6 +3,8 @@ name: CI
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "23 4 * * 1"
 
 permissions:
   contents: read
@@ -10,6 +12,7 @@ permissions:
 jobs:
   rust-matrix:
     name: Rust (${{ matrix.features || 'default' }})
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -20,6 +23,7 @@ jobs:
           - "tracing"
           - "brotli"
           - "tls tracing brotli"
+          - "full"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -33,11 +37,12 @@ jobs:
           if [[ -n "${FEATURES}" ]]; then
             feature_args=(--features "${FEATURES}")
           fi
-          cargo check --all-targets "${feature_args[@]}"
-          cargo test "${feature_args[@]}"
-          cargo doc --no-deps "${feature_args[@]}"
+          cargo check --locked --all-targets "${feature_args[@]}"
+          cargo test --locked "${feature_args[@]}"
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps "${feature_args[@]}"
 
   format:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,6 +53,7 @@ jobs:
         run: cargo fmt --check
 
   msrv:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,9 +62,10 @@ jobs:
         with:
           key: msrv
       - name: Check declared minimum Rust version
-        run: cargo check --all-targets --all-features
+        run: cargo check --locked --all-targets --all-features
 
   clippy:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -67,9 +74,28 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Lint all targets and features
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit application dependencies
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Audit fuzz-workspace dependencies
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: fuzz
 
   fuzz-build:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -79,6 +105,8 @@ jobs:
           workspaces: |
             . -> target
             fuzz -> fuzz/target
+      - name: Check locked fuzz workspace
+        run: RUSTFLAGS="-D warnings" cargo check --manifest-path fuzz/Cargo.toml --locked --bins
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: Build fuzz targets
@@ -87,15 +115,17 @@ jobs:
           cargo fuzz build event_json
           cargo fuzz build room_target
           cargo fuzz build broker_publication
+          cargo fuzz build router
 
   websocket-load-smoke:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release examples
-        run: cargo build --release --example websocket --example websocket_load
+        run: cargo build --locked --release --example websocket --example websocket_load
       - name: Start WebSocket server
         run: |
           RUSTREST_WS_OBSERVER=off target/release/examples/websocket \
@@ -137,13 +167,14 @@ jobs:
           fi
 
   autobahn:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release WebSocket example
-        run: cargo build --release --example websocket
+        run: cargo build --locked --release --example websocket
       - name: Start WebSocket server
         run: |
           RUSTREST_WS_OBSERVER=off target/release/examples/websocket \

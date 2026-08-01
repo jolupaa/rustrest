@@ -46,8 +46,8 @@ pub struct Cookie {
 impl Cookie {
     pub fn new(name: &str, value: &str) -> Self {
         Self {
-            name: sanitize_cookie_part(name),
-            value: sanitize_cookie_part(value),
+            name: sanitize_cookie_name(name),
+            value: sanitize_cookie_value(value),
             path: "/".to_string(),
             domain: None,
             max_age_secs: None,
@@ -58,12 +58,18 @@ impl Cookie {
     }
 
     pub fn path(mut self, path: &str) -> Self {
-        self.path = path.to_string();
+        let path = sanitize_cookie_path(path);
+        self.path = if path.is_empty() {
+            "/".to_string()
+        } else {
+            path
+        };
         self
     }
 
     pub fn domain(mut self, domain: &str) -> Self {
-        self.domain = Some(domain.to_string());
+        let domain = sanitize_cookie_domain(domain);
+        self.domain = (!domain.is_empty()).then_some(domain);
         self
     }
 
@@ -90,8 +96,19 @@ impl Cookie {
 
     /// Renders the `Set-Cookie` header value.
     pub fn to_header_value(&self) -> String {
-        let mut out = format!("{}={}; Path={}", self.name, self.value, self.path);
-        if let Some(domain) = &self.domain {
+        let host_prefix = self.name.starts_with("__Host-");
+        let secure_prefix = self.name.starts_with("__Secure-");
+        let secure =
+            self.secure || self.same_site == Some(SameSite::None) || host_prefix || secure_prefix;
+        let path = if host_prefix { "/" } else { &self.path };
+        let domain = if host_prefix {
+            None
+        } else {
+            self.domain.as_deref()
+        };
+
+        let mut out = format!("{}={}; Path={path}", self.name, self.value);
+        if let Some(domain) = domain {
             out.push_str("; Domain=");
             out.push_str(domain);
         }
@@ -99,7 +116,7 @@ impl Cookie {
             out.push_str("; Max-Age=");
             out.push_str(&max_age.to_string());
         }
-        if self.secure {
+        if secure {
             out.push_str("; Secure");
         }
         if self.http_only {
@@ -121,14 +138,70 @@ impl Response {
 
     /// Tells the client to delete a cookie (`Max-Age=0`).
     pub fn clear_cookie(self, name: &str) -> Self {
-        self.set_cookie(Cookie::new(name, "").max_age_secs(0))
+        self.clear_cookie_with(Cookie::new(name, ""))
+    }
+
+    /// Deletes a cookie while preserving the supplied scope and security
+    /// attributes. The cookie value is discarded and `Max-Age=0` is forced.
+    ///
+    /// Use the same `Path` and `Domain` values that were used when the cookie
+    /// was created; deleting a root-path cookie does not remove a narrower one.
+    pub fn clear_cookie_with(self, mut cookie: Cookie) -> Self {
+        cookie.value.clear();
+        cookie.max_age_secs = Some(0);
+        self.set_cookie(cookie)
     }
 }
 
-fn sanitize_cookie_part(value: &str) -> String {
+fn sanitize_cookie_name(value: &str) -> String {
+    value
+        .bytes()
+        .filter(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+        .map(char::from)
+        .collect()
+}
+
+fn sanitize_cookie_value(value: &str) -> String {
+    value
+        .bytes()
+        .filter(|byte| matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e))
+        .map(char::from)
+        .collect()
+}
+
+fn sanitize_cookie_path(value: &str) -> String {
     value
         .chars()
-        .filter(|ch| !matches!(ch, ';' | ',' | '\r' | '\n'))
+        .filter(|character| *character != ';' && !character.is_control())
+        .collect()
+}
+
+fn sanitize_cookie_domain(value: &str) -> String {
+    value
+        .bytes()
+        .filter(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':' | b'[' | b']')
+        })
+        .map(char::from)
         .collect()
 }
 

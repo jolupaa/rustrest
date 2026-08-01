@@ -82,9 +82,12 @@ fn existing_websocket_surface_still_compiles() {
         .max_room_name_bytes(128);
     production_config.validate().unwrap();
     let relaxed_route = WebSocketConfig::new()
+        .disable_max_message_size()
+        .disable_max_frame_size()
         .disable_ping()
         .disable_idle_timeout()
         .disable_max_connection_lifetime()
+        .disable_max_connections()
         .disable_max_connections_per_ip()
         .disable_message_rate_limit();
     relaxed_route.validate().unwrap();

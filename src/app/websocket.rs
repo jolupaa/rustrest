@@ -6,8 +6,11 @@ mod hub;
 mod runtime;
 mod socket;
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests;
 mod types;
+
+use std::collections::HashSet;
 
 use super::{HttpError, Request, Response};
 use base64::Engine;
@@ -107,28 +110,79 @@ pub(crate) fn singleton_header<'a>(req: &'a Request, name: &str) -> Option<&'a s
     }
 }
 
-fn negotiate_protocol(req: &Request, protocols: &[String]) -> Option<String> {
-    for raw in req.headers_all("sec-websocket-protocol") {
+pub(super) fn is_valid_protocol_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn negotiate_protocol(
+    req: &Request,
+    protocols: &[String],
+) -> Result<Option<String>, HandshakeRejection> {
+    let values = req.headers_all("sec-websocket-protocol");
+    let values = if values.is_empty() {
+        req.header("sec-websocket-protocol")
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        values
+    };
+    let header_present = !values.is_empty();
+    let mut selected = None;
+    let mut saw_protocol = false;
+    let mut seen = HashSet::new();
+    for raw in values {
         for candidate in raw.split(',') {
             let candidate = candidate.trim();
-            if protocols
-                .iter()
-                .any(|supported| supported.eq_ignore_ascii_case(candidate))
-            {
-                return Some(candidate.to_string());
+            // RFC's inherited #rule asks recipients to tolerate a reasonable
+            // number of null list elements around/between real tokens.
+            if candidate.is_empty() {
+                continue;
+            }
+            if !is_valid_protocol_token(candidate) {
+                return Err(HandshakeRejection::new(
+                    400,
+                    "Sec-WebSocket-Protocol contiene un token no valido",
+                ));
+            }
+            saw_protocol = true;
+            if !seen.insert(candidate) {
+                return Err(HandshakeRejection::new(
+                    400,
+                    "Sec-WebSocket-Protocol contiene un token duplicado",
+                ));
+            }
+            if selected.is_none() && protocols.iter().any(|supported| supported == candidate) {
+                selected = Some(candidate.to_string());
             }
         }
     }
-
-    req.header("sec-websocket-protocol").and_then(|raw| {
-        raw.split(',').find_map(|candidate| {
-            let candidate = candidate.trim();
-            protocols
-                .iter()
-                .any(|supported| supported.eq_ignore_ascii_case(candidate))
-                .then(|| candidate.to_string())
-        })
-    })
+    if header_present && !saw_protocol {
+        return Err(HandshakeRejection::new(
+            400,
+            "Sec-WebSocket-Protocol debe contener al menos un token",
+        ));
+    }
+    Ok(selected)
 }
 
 pub(crate) fn validate_handshake(
@@ -213,7 +267,7 @@ pub(crate) fn validate_handshake(
         ));
     }
 
-    let protocol = negotiate_protocol(req, &config.protocols);
+    let protocol = negotiate_protocol(req, &config.protocols)?;
     if config.require_protocol && protocol.is_none() {
         return Err(HandshakeRejection::new(
             400,
@@ -249,6 +303,12 @@ impl Request {
         let config = self.resolved_websocket_config.clone().unwrap_or_else(|| {
             ResolvedWebSocketConfig::from_layers(&WebSocketConfig::default(), &config)
         });
+        if let Err(error) = config.validate() {
+            return Response::from_error(
+                HttpError::internal_server_error("Configuracion WebSocket no valida")
+                    .with_source(error),
+            );
+        }
         let protocol = match validate_handshake(&self, &config) {
             Ok(protocol) => protocol,
             Err(rejection) => return Response::from_error(rejection.into_http_error()),
@@ -273,7 +333,7 @@ impl Request {
             Ok(permit) => permit,
             Err(error) => return Response::from_error(error.into_http_error()),
         };
-        let mut response = match Response::websocket(&self) {
+        let mut response = match websocket_upgrade_response(&self) {
             Ok(response) => response,
             Err(error) => return Response::from_error(error),
         };
@@ -294,8 +354,21 @@ impl Request {
             route,
             self.remote_addr,
         );
+        response.authorize_websocket_upgrade();
         response
     }
+}
+
+fn websocket_upgrade_response(req: &Request) -> Result<Response, HttpError> {
+    let key = singleton_header(req, "sec-websocket-key")
+        .ok_or_else(|| HttpError::bad_request("Falta Sec-WebSocket-Key"))?;
+    let accept = super::response::websocket_accept(key);
+
+    Ok(Response::send("")
+        .status(101)
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-accept", &accept))
 }
 
 impl AdmissionError {
@@ -335,7 +408,9 @@ fn spawn_websocket(
     route: String,
     remote_addr: Option<std::net::SocketAddr>,
 ) {
-    tokio::spawn(async move {
+    let runtime = permit.runtime();
+    let id = permit.id();
+    let upgrade_task = tokio::spawn(async move {
         match upgrade.await {
             Ok(upgraded) => {
                 let runtime = permit.runtime();
@@ -360,6 +435,7 @@ fn spawn_websocket(
             }
         }
     });
+    let _ = runtime.register_upgrade_task(id, upgrade_task.abort_handle());
 }
 
 /// A raw process-local Tokio broadcast channel for WebSocket messages.
@@ -376,8 +452,11 @@ pub struct WsBroadcast {
 
 impl WsBroadcast {
     /// Creates a channel buffering up to `capacity` in-flight messages.
+    ///
+    /// A zero capacity is normalized to one so configuration input cannot
+    /// trigger Tokio's zero-capacity panic.
     pub fn new(capacity: usize) -> Self {
-        let (sender, _) = tokio::sync::broadcast::channel(capacity);
+        let (sender, _) = tokio::sync::broadcast::channel(capacity.max(1));
         Self { sender }
     }
 

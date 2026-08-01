@@ -1,7 +1,8 @@
 use std::error::Error;
+use std::fmt::{Display, Formatter};
 use std::pin::Pin;
 
-use futures_util::{Stream, StreamExt};
+use futures_util::{Stream, StreamExt, future};
 use http_body_util::BodyExt;
 use hyper::body::{Body as _, Bytes, Incoming, SizeHint};
 
@@ -27,6 +28,29 @@ enum BodyState {
     Stream(BodyStream),
     Taken,
 }
+
+#[derive(Debug)]
+pub(crate) struct BodyLimitExceeded {
+    limit: usize,
+}
+
+impl BodyLimitExceeded {
+    pub(crate) fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Display for BodyLimitExceeded {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "el cuerpo de la solicitud supero su limite configurado de {} bytes",
+            self.limit
+        )
+    }
+}
+
+impl Error for BodyLimitExceeded {}
 
 impl RequestBody {
     pub(crate) fn incoming(body: Incoming, default_limit: usize) -> Self {
@@ -66,12 +90,24 @@ impl RequestBody {
         }
     }
 
+    pub(crate) fn buffered_len(&self) -> Option<usize> {
+        match &self.state {
+            BodyState::Buffered(bytes) => Some(bytes.len()),
+            BodyState::Incoming(_) | BodyState::Stream(_) | BodyState::Taken => None,
+        }
+    }
+
     pub(crate) fn set_default_limit(&mut self, limit: usize) {
         self.default_limit = limit;
     }
 
-    /// Collects the body while enforcing `limit` exactly across all chunks.
+    /// Collects the body while enforcing the smaller of `limit` and the hard
+    /// application/route limit configured on this body.
+    ///
+    /// Callers may choose a stricter local limit, but cannot use this method
+    /// to bypass the server's configured maximum.
     pub async fn collect(&mut self, limit: usize) -> Result<Bytes, HttpError> {
+        let limit = limit.min(self.default_limit);
         if let BodyState::Buffered(bytes) = &self.state {
             if bytes.len() > limit {
                 return Err(HttpError::payload_too_large_limit(limit));
@@ -79,7 +115,7 @@ impl RequestBody {
             return Ok(bytes.clone());
         }
 
-        let mut stream = self.take_stream()?;
+        let mut stream = self.take_raw_stream()?;
         let mut output = Vec::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(HttpError::body_read)?;
@@ -102,8 +138,17 @@ impl RequestBody {
         self.collect(self.default_limit).await
     }
 
-    /// Takes the one-shot body stream.
+    /// Takes the one-shot body stream, enforcing its configured limit across
+    /// chunks. Exceeding the limit yields an error which
+    /// [`HttpError::body_read`] maps to `payload_too_large`, then terminates
+    /// the stream.
     pub fn take_stream(&mut self) -> Result<BodyStream, HttpError> {
+        let limit = self.default_limit;
+        let stream = self.take_raw_stream()?;
+        Ok(limit_stream(stream, limit))
+    }
+
+    fn take_raw_stream(&mut self) -> Result<BodyStream, HttpError> {
         let state = std::mem::replace(&mut self.state, BodyState::Taken);
         match state {
             BodyState::Incoming(body) => {
@@ -120,12 +165,32 @@ impl RequestBody {
             BodyState::Taken => Err(HttpError::body_already_consumed()),
         }
     }
+}
 
-    pub(crate) fn buffered_bytes(&self) -> Result<&Bytes, HttpError> {
-        match &self.state {
-            BodyState::Buffered(bytes) => Ok(bytes),
-            BodyState::Taken => Err(HttpError::body_already_consumed()),
-            BodyState::Incoming(_) | BodyState::Stream(_) => Err(HttpError::body_not_buffered()),
-        }
-    }
+fn limit_stream(stream: BodyStream, limit: usize) -> BodyStream {
+    Box::pin(
+        stream.scan((0_usize, false), move |(seen, finished), chunk| {
+            let result = if *finished {
+                None
+            } else {
+                match chunk {
+                    Ok(chunk) => match seen
+                        .checked_add(chunk.len())
+                        .filter(|length| *length <= limit)
+                    {
+                        Some(length) => {
+                            *seen = length;
+                            Some(Ok(chunk))
+                        }
+                        None => {
+                            *finished = true;
+                            Some(Err(Box::new(BodyLimitExceeded { limit }) as BoxError))
+                        }
+                    },
+                    Err(error) => Some(Err(error)),
+                }
+            };
+            future::ready(result)
+        }),
+    )
 }

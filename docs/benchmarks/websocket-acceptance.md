@@ -19,7 +19,7 @@ WebSocket design to executable or published evidence.
 | Route-scoped rooms have idempotency, exclusion, dedupe, cleanup, and partial reports | Atomic cleanup/limit unit tests plus route-scope, sender-exclusion, multi-room dedupe, administration, and broadcast-report TCP tests. |
 | Two broker nodes deliver once without route leakage | `websocket_broker_two_nodes_delivers_once_and_preserves_route_scope`, origin-publication dedupe, and broker validation/health tests. |
 | External brokers require no framework modification | `WsBroker` is object-safe and boxed; the compatibility fixture installs `Arc<dyn WsBroker>`. Failure, recovery, lag, and invalid-publication tests exercise the contract. |
-| Unit, TCP, TLS, concurrency, and robustness coverage exists | Unit tests under `src/app/websocket`, real TCP and WSS suites, four cargo-fuzz targets, Miri configuration/room runs, and Autobahn RFC coverage. |
+| Unit, TCP, TLS, concurrency, and robustness coverage exists | Unit tests under `src/app/websocket`, real TCP and WSS suites, five cargo-fuzz targets (including routing), Miri configuration/room runs, and Autobahn RFC coverage. |
 | The 10,000 idle / 1,000 active profile is stable and lossless | `scripts/run-websocket-reference-profile.sh` enforces connection counts, exact echo counts, zero failures/panics, post-300-second RSS limits, and graceful shutdown. Results are in `docs/benchmarks/websocket-reference.md`. |
 
 ## Public API and semver audit

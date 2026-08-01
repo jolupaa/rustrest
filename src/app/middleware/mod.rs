@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,9 @@ pub use conditional::etag;
 pub(crate) use conditional::{PreconditionResult, evaluate_preconditions};
 
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+const MAX_REQUEST_ID_BYTES: usize = 128;
+const DEFAULT_RATE_LIMIT_CLIENTS: usize = 10_000;
+const MAX_RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 pub fn cors() -> Middleware {
     Arc::new(|req: Request, next: Next| {
@@ -39,16 +43,30 @@ pub fn cors() -> Middleware {
 pub fn request_id() -> Middleware {
     Arc::new(|mut req: Request, next: Next| {
         Box::pin(async move {
-            let id = req
-                .header("x-request-id")
-                .map(str::to_string)
-                .unwrap_or_else(generate_request_id);
-            req.headers.insert("x-request-id".to_string(), id.clone());
+            let supplied = req.headers_all("x-request-id");
+            let id = match supplied.as_slice() {
+                [value] if valid_request_id(value) => (*value).to_string(),
+                [] => req
+                    .header("x-request-id")
+                    .filter(|value| valid_request_id(value))
+                    .map(str::to_string)
+                    .unwrap_or_else(generate_request_id),
+                _ => generate_request_id(),
+            };
+            // The generated value is always a visible ASCII token.
+            req.set_header("x-request-id", &id)
+                .expect("the generated request id is a valid header value");
             let mut res = next(req).await;
             res = res.header("x-request-id", &id);
             res
         })
     })
+}
+
+fn valid_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_REQUEST_ID_BYTES
+        && value.bytes().all(|byte| matches!(byte, b'!'..=b'~'))
 }
 
 pub fn tracing() -> Middleware {
@@ -104,45 +122,251 @@ pub fn timeout(duration: Duration) -> Middleware {
     })
 }
 
-/// Fixed-window, per-client-IP rate limiting: at most `max_requests` per
-/// `window` from one IP (requests without a peer address — e.g. from the test
-/// client — share a single bucket). Over the limit the middleware
-/// short-circuits with `429 Too Many Requests` and a `Retry-After` header in
-/// seconds. The structured error still flows through a registered global
-/// error handler, while its `Retry-After` header is preserved.
+/// Fixed-window rate limiting with the default bound of 10,000 tracked client
+/// IPs. Use [`RateLimit`] when a different storage bound is required.
 pub fn rate_limit(max_requests: u32, window: Duration) -> Middleware {
-    /// Per-client window state: window start and requests seen in it. The
-    /// `None` key holds clients with no known peer address.
-    type RateBuckets = HashMap<Option<IpAddr>, (Instant, u32)>;
-    let buckets: Arc<Mutex<RateBuckets>> = Arc::new(Mutex::new(HashMap::new()));
-    Arc::new(move |req: Request, next: Next| {
-        let buckets = Arc::clone(&buckets);
-        Box::pin(async move {
-            let key = req.remote_addr().map(|addr| addr.ip());
-            let now = Instant::now();
-            let over_limit = {
-                let mut buckets = buckets.lock().expect("rate limit lock");
-                // Expired windows are dropped wholesale so the map only ever
-                // holds clients seen within the current window.
-                buckets.retain(|_, (start, _)| now.duration_since(*start) < window);
-                let (start, count) = buckets.entry(key).or_insert((now, 0));
-                *count += 1;
-                (*count > max_requests).then(|| window.saturating_sub(now.duration_since(*start)))
-            };
-            match over_limit {
-                Some(remaining) => {
-                    let retry_after = remaining.as_secs().max(1).to_string();
-                    let retry_after =
-                        HeaderValue::from_str(&retry_after).expect("retry seconds are valid");
-                    Response::from_error(
-                        HttpError::too_many_requests("Too Many Requests")
-                            .header(RETRY_AFTER, retry_after),
+    RateLimit::new(max_requests, window).into_middleware()
+}
+
+#[derive(Clone, Copy)]
+struct RateBucket {
+    start: Instant,
+    count: u32,
+}
+
+struct RateState {
+    buckets: HashMap<Option<IpAddr>, RateBucket>,
+    overflow: Option<RateBucket>,
+    next_cleanup: Instant,
+    #[cfg(test)]
+    cleanup_sweeps: usize,
+}
+
+/// Bounded fixed-window, per-client-IP rate limiter.
+///
+/// Unknown clients share one overflow bucket after `max_clients` distinct
+/// clients are tracked. Expired buckets are swept periodically; between
+/// sweeps, new identities use the overflow bucket without scanning the map.
+pub struct RateLimit {
+    max_requests: u32,
+    window: Duration,
+    max_clients: usize,
+}
+
+impl RateLimit {
+    pub fn new(max_requests: u32, window: Duration) -> Self {
+        assert!(!window.is_zero(), "rate-limit window must be positive");
+        Self {
+            max_requests,
+            window,
+            max_clients: DEFAULT_RATE_LIMIT_CLIENTS,
+        }
+    }
+
+    pub fn max_clients(mut self, max_clients: usize) -> Self {
+        assert!(
+            max_clients > 0,
+            "rate-limit client capacity must be greater than zero"
+        );
+        self.max_clients = max_clients;
+        self
+    }
+}
+
+impl IntoMiddleware for RateLimit {
+    fn into_middleware(self) -> Middleware {
+        let cleanup_interval = self.window.min(MAX_RATE_LIMIT_CLEANUP_INTERVAL);
+        let now = Instant::now();
+        let state = Arc::new(Mutex::new(RateState {
+            buckets: HashMap::new(),
+            overflow: None,
+            next_cleanup: now.checked_add(cleanup_interval).unwrap_or(now),
+            #[cfg(test)]
+            cleanup_sweeps: 0,
+        }));
+        let max_requests = self.max_requests;
+        let window = self.window;
+        let max_clients = self.max_clients;
+
+        Arc::new(move |req: Request, next: Next| {
+            let state = Arc::clone(&state);
+            Box::pin(async move {
+                let key = req.remote_addr().map(|addr| addr.ip());
+                let now = Instant::now();
+                let over_limit = {
+                    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+                    check_rate_limit_state(
+                        &mut state,
+                        key,
+                        now,
+                        cleanup_interval,
+                        window,
+                        max_clients,
+                        max_requests,
                     )
+                };
+
+                match over_limit {
+                    Some(remaining) => {
+                        let retry_after = retry_after_seconds(remaining).to_string();
+                        let retry_after =
+                            HeaderValue::from_str(&retry_after).expect("retry seconds are valid");
+                        Response::from_error(
+                            HttpError::too_many_requests("Too Many Requests")
+                                .header(RETRY_AFTER, retry_after),
+                        )
+                    }
+                    None => next(req).await,
                 }
-                None => next(req).await,
-            }
+            })
         })
+    }
+}
+
+fn check_rate_limit_state(
+    state: &mut RateState,
+    key: Option<IpAddr>,
+    now: Instant,
+    cleanup_interval: Duration,
+    window: Duration,
+    max_clients: usize,
+    max_requests: u32,
+) -> Option<Duration> {
+    if now >= state.next_cleanup {
+        remove_expired_rate_buckets(state, now, window);
+        state.next_cleanup = now.checked_add(cleanup_interval).unwrap_or(now);
+    }
+
+    let has_capacity = state.buckets.len() < max_clients;
+    let bucket = match state.buckets.entry(key) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) if has_capacity => entry.insert(RateBucket {
+            start: now,
+            count: 0,
+        }),
+        Entry::Vacant(_) => state.overflow.get_or_insert(RateBucket {
+            start: now,
+            count: 0,
+        }),
+    };
+    check_rate_bucket(bucket, now, window, max_requests)
+}
+
+fn remove_expired_rate_buckets(state: &mut RateState, now: Instant, window: Duration) {
+    #[cfg(test)]
+    {
+        state.cleanup_sweeps += 1;
+    }
+    state
+        .buckets
+        .retain(|_, bucket| now.duration_since(bucket.start) < window);
+    if state
+        .overflow
+        .is_some_and(|bucket| now.duration_since(bucket.start) >= window)
+    {
+        state.overflow = None;
+    }
+}
+
+fn check_rate_bucket(
+    bucket: &mut RateBucket,
+    now: Instant,
+    window: Duration,
+    max_requests: u32,
+) -> Option<Duration> {
+    let elapsed = now.duration_since(bucket.start);
+    if elapsed >= window {
+        bucket.start = now;
+        bucket.count = 0;
+    }
+    bucket.count = bucket.count.saturating_add(1);
+    (bucket.count > max_requests).then(|| {
+        let elapsed = now.duration_since(bucket.start);
+        window.saturating_sub(elapsed)
     })
+}
+
+fn retry_after_seconds(remaining: Duration) -> u64 {
+    remaining
+        .as_secs()
+        .saturating_add(u64::from(remaining.subsec_nanos() != 0))
+        .max(1)
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::*;
+
+    #[test]
+    fn capacity_churn_only_sweeps_on_the_cleanup_interval() {
+        let start = Instant::now();
+        let window = Duration::from_secs(60);
+        let cleanup_interval = window;
+        let mut state = RateState {
+            buckets: HashMap::new(),
+            overflow: None,
+            next_cleanup: start + cleanup_interval,
+            cleanup_sweeps: 0,
+        };
+
+        let tracked = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(
+            check_rate_limit_state(
+                &mut state,
+                tracked,
+                start,
+                cleanup_interval,
+                window,
+                1,
+                u32::MAX,
+            ),
+            None
+        );
+
+        // An attacker can present arbitrarily many identities, but between
+        // cleanup ticks each lookup remains bounded and shares one overflow
+        // bucket instead of sweeping every tracked client.
+        for identity in 2..=10_000_u32 {
+            let key = Some(IpAddr::V4(Ipv4Addr::from(identity)));
+            assert_eq!(
+                check_rate_limit_state(
+                    &mut state,
+                    key,
+                    start + Duration::from_secs(1),
+                    cleanup_interval,
+                    window,
+                    1,
+                    u32::MAX,
+                ),
+                None
+            );
+        }
+        assert_eq!(state.buckets.len(), 1);
+        assert!(state.overflow.is_some());
+        assert_eq!(state.cleanup_sweeps, 0);
+
+        // The scheduled pass reclaims both expired tracked and overflow
+        // buckets, after which the triggering identity can be tracked.
+        let replacement = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        assert_eq!(
+            check_rate_limit_state(
+                &mut state,
+                replacement,
+                start + window + Duration::from_secs(1),
+                cleanup_interval,
+                window,
+                1,
+                u32::MAX,
+            ),
+            None
+        );
+        assert_eq!(state.cleanup_sweeps, 1);
+        assert_eq!(state.buckets.len(), 1);
+        assert!(state.buckets.contains_key(&replacement));
+        assert!(state.overflow.is_none());
+    }
 }
 
 /// Configurable CORS: origin allowlist (or any origin), credentials, methods,
@@ -228,10 +452,11 @@ impl Cors {
         if self.credentials {
             res = res.header("access-control-allow-credentials", "true");
         }
-        if allowed != "*" {
-            res = res.append_header("vary", "Origin");
-        }
         res
+    }
+
+    fn varies_by_origin(&self) -> bool {
+        !self.any_origin || self.credentials
     }
 }
 
@@ -247,20 +472,36 @@ impl IntoMiddleware for Cors {
         Arc::new(move |req: Request, next: Next| {
             let cors = Arc::clone(&cors);
             Box::pin(async move {
-                let Some(origin) = req.header("origin").map(str::to_string) else {
-                    return next(req).await;
+                let origin = match req.singleton_header("origin") {
+                    Ok(Some(origin)) => origin.to_string(),
+                    Ok(None) => return next(req).await,
+                    Err(error) => return Response::from_error(error),
+                };
+                let requested_method = match req.singleton_header("access-control-request-method") {
+                    Ok(method) => method,
+                    Err(error) => return Response::from_error(error),
                 };
                 let grant = cors.grant_for(&origin);
 
-                let is_preflight = req.method == "OPTIONS"
-                    && req.header("access-control-request-method").is_some();
+                let is_preflight = req.method == "OPTIONS" && requested_method.is_some();
                 if is_preflight {
-                    let mut res = Response::send("").status(204);
-                    if let Some(allowed) = &grant {
-                        let headers = cors.headers.clone().or_else(|| {
+                    let requested_headers = {
+                        let values = req.headers_all("access-control-request-headers");
+                        if values.is_empty() {
                             req.header("access-control-request-headers")
                                 .map(str::to_string)
-                        });
+                        } else {
+                            Some(values.join(", "))
+                        }
+                    };
+                    // Preflight output depends on the origin and requested
+                    // method/headers, including when an origin is denied.
+                    let mut res = Response::send("").status(204).header(
+                        "vary",
+                        "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+                    );
+                    if let Some(allowed) = &grant {
+                        let headers = cors.headers.clone().or(requested_headers);
                         res = res.header("access-control-allow-methods", &cors.methods);
                         if let Some(headers) = headers {
                             res = res.header("access-control-allow-headers", &headers);
@@ -271,9 +512,12 @@ impl IntoMiddleware for Cors {
                         res = cors.apply_grant(res, allowed);
                     }
                     return res;
-                }
+                };
 
-                let res = next(req).await;
+                let mut res = next(req).await;
+                if cors.varies_by_origin() {
+                    res = res.append_header("vary", "Origin");
+                }
                 match grant {
                     Some(allowed) => cors.apply_grant(res, &allowed),
                     None => res,
@@ -290,4 +534,17 @@ fn generate_request_id() -> String {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     format!("req-{}-{}", nanos, count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_after_seconds;
+    use std::time::Duration;
+
+    #[test]
+    fn retry_after_rounds_fractional_seconds_up() {
+        assert_eq!(retry_after_seconds(Duration::from_millis(1)), 1);
+        assert_eq!(retry_after_seconds(Duration::from_millis(1_001)), 2);
+        assert_eq!(retry_after_seconds(Duration::from_secs(2)), 2);
+    }
 }
