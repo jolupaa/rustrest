@@ -52,6 +52,14 @@ pub type ErrorHandler = Arc<dyn Fn(HttpError) -> Response + Send + Sync>;
 /// let mut app = App::new();
 /// app.post("/users/:id", bad).unwrap();
 /// ```
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` no es un manejador de RustRest valido",
+    label = "este valor no puede registrarse como manejador de ruta",
+    note = "un manejador recibe `Request` (anote `|req: Request|`) o hasta 8 extractores tipados, \
+            con el extractor de cuerpo al final",
+    note = "y devuelve `Response`, `Result<Response, E>` con `E: IntoHttpError`, \
+            u otro tipo `IntoResponse`, de forma sincrona o `async`"
+)]
 pub trait IntoHandler<Marker> {
     fn into_handler(self) -> Handler;
 }
@@ -358,11 +366,17 @@ impl_parts_body_handler!(
 );
 
 pub(crate) fn panic_response() -> Response {
-    eprintln!("A handler or middleware panicked; returning 500.");
+    super::log::log_error!("Un manejador o middleware hizo panic; devolviendo 500");
     Response::internal_server_error()
 }
 
 /// Converts a user middleware closure into the internal [`Middleware`] shape.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` no es un middleware de RustRest valido",
+    label = "se esperaba `Fn(Request, Next) -> impl Future<Output = Response>`",
+    note = "anote los parametros del closure (`|req: Request, next: Next|`) \
+            o use `middleware::from_fn(|req, next| async move {{ .. }})`"
+)]
 pub trait IntoMiddleware {
     fn into_middleware(self) -> Middleware;
 }

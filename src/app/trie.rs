@@ -113,6 +113,16 @@ fn push_matching(entries: &[(String, usize)], method: &str, found: &mut Vec<usiz
             found.push(*index);
         }
     }
+    // A GET route answers HEAD at its own specificity (RFC 9110 §9.3.2):
+    // after an explicit HEAD route, but before `all()` and before any less
+    // specific branch such as a fallback wildcard.
+    if method == "HEAD" {
+        for (entry_method, index) in entries {
+            if entry_method == "GET" {
+                found.push(*index);
+            }
+        }
+    }
     for (entry_method, index) in entries {
         if entry_method == METHOD_ALL {
             found.push(*index);

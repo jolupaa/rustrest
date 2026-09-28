@@ -12,19 +12,20 @@ use std::time::Duration;
 use futures_util::FutureExt;
 use hyper::body::Incoming;
 use hyper::header::{
-    CONNECTION, CONTENT_LENGTH, COOKIE, HOST, HeaderValue, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY,
-    SEC_WEBSOCKET_VERSION, TRANSFER_ENCODING, UPGRADE,
+    CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, HeaderValue, SEC_WEBSOCKET_ACCEPT,
+    SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, TRANSFER_ENCODING, UPGRADE,
 };
 use hyper::service::service_fn;
 use hyper::{HeaderMap, Method, StatusCode, Uri, Version};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
-use hyper_util::server::graceful::GracefulShutdown;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use hyper_util::server::graceful::{GracefulShutdown, Watcher};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinError, JoinSet};
 
+use super::http1::{HeadVerdict, Http1InspectedIo, Http1Verdicts};
 use super::router::{MatchedRoute, RouteKind};
 use super::websocket::{header_value_contains_token, is_valid_websocket_key};
 use super::{
@@ -78,7 +79,9 @@ pub(crate) async fn drain_server_connections(
     tokio::select! {
         _ = async { tokio::join!(http_shutdown, websocket_shutdown); } => true,
         _ = tokio::time::sleep(timeout) => {
-            eprintln!("Timed out waiting for in-flight connections to drain");
+            super::log::log_error!(
+                "Se agoto el tiempo de apagado ordenado; abortando conexiones restantes"
+            );
             runtime.abort_remaining();
             false
         }
@@ -155,33 +158,27 @@ pub(crate) enum DetectedProtocol {
     Http2,
 }
 
-/// Replays bytes consumed by the request-head preflight before delegating all
+/// Replays bytes consumed by the protocol preflight before delegating all
 /// subsequent I/O to Hyper.
 pub(crate) struct PrefixedIo<T> {
     inner: T,
     prefix: Vec<u8>,
     position: usize,
     protocol: DetectedProtocol,
-    websocket_upgrade: bool,
 }
 
 impl<T> PrefixedIo<T> {
-    fn new(inner: T, prefix: Vec<u8>, protocol: DetectedProtocol, websocket_upgrade: bool) -> Self {
+    fn new(inner: T, prefix: Vec<u8>, protocol: DetectedProtocol) -> Self {
         Self {
             inner,
             prefix,
             position: 0,
             protocol,
-            websocket_upgrade,
         }
     }
 
     pub(crate) fn protocol(&self) -> DetectedProtocol {
         self.protocol
-    }
-
-    pub(crate) fn is_websocket_upgrade(&self) -> bool {
-        self.websocket_upgrade
     }
 }
 
@@ -232,20 +229,20 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for PrefixedIo<T> {
     }
 }
 
-/// Inspects the first connection preface under one deadline. HTTP/1 requests
-/// are checked for ambiguous TE+CL framing before Hyper normalizes the fields;
-/// HTTP/2 clients must deliver the complete connection preface and initial
-/// SETTINGS frame before the same deadline expires.
+/// Detects the connection protocol under one deadline. HTTP/2 clients must
+/// deliver the complete connection preface and initial SETTINGS frame before
+/// the deadline expires; any other first bytes select HTTP/1, whose request
+/// heads are then validated one by one by [`Http1InspectedIo`] and bounded by
+/// Hyper's header-read timeout.
 pub(crate) async fn preflight_connection<T>(
     io: T,
-    max_head_bytes: usize,
     timeout: Option<Duration>,
     expected_protocol: ExpectedProtocol,
-) -> io::Result<Option<PrefixedIo<T>>>
+) -> io::Result<PrefixedIo<T>>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let inspect = inspect_connection(io, max_head_bytes, expected_protocol);
+    let inspect = inspect_connection(io, expected_protocol);
     match timeout {
         Some(timeout) => tokio::time::timeout(timeout, inspect).await.map_err(|_| {
             io::Error::new(
@@ -259,35 +256,26 @@ where
 
 async fn inspect_connection<T>(
     mut io: T,
-    max_head_bytes: usize,
     expected_protocol: ExpectedProtocol,
-) -> io::Result<Option<PrefixedIo<T>>>
+) -> io::Result<PrefixedIo<T>>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let max_head_bytes = max_head_bytes.max(MIN_HTTP1_BUFFER_BYTES);
-    let mut prefix = Vec::with_capacity(max_head_bytes.min(MIN_HTTP1_BUFFER_BYTES));
+    const MAX_PREFACE_BYTES: usize =
+        HTTP2_PREFACE.len() + HTTP2_FRAME_HEADER_BYTES + HTTP2_MAX_INITIAL_SETTINGS_BYTES;
+    let mut prefix = Vec::new();
     let mut chunk = [0_u8; 4096];
 
     loop {
-        let preface_state = inspect_http2_client_preface(&prefix)?;
-        match preface_state {
+        match inspect_http2_client_preface(&prefix)? {
             Http2PrefaceState::Complete => {
                 if expected_protocol == ExpectedProtocol::Http1 {
                     return Err(protocol_mismatch("HTTP/2", "HTTP/1.1"));
                 }
-                return Ok(Some(PrefixedIo::new(
-                    io,
-                    prefix,
-                    DetectedProtocol::Http2,
-                    false,
-                )));
+                return Ok(PrefixedIo::new(io, prefix, DetectedProtocol::Http2));
             }
             Http2PrefaceState::Pending => {
-                let max_preface_bytes = HTTP2_PREFACE.len()
-                    + HTTP2_FRAME_HEADER_BYTES
-                    + HTTP2_MAX_INITIAL_SETTINGS_BYTES;
-                if prefix.len() >= max_preface_bytes {
+                if prefix.len() >= MAX_PREFACE_BYTES {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "el frame SETTINGS inicial de HTTP/2 es demasiado grande",
@@ -298,48 +286,11 @@ where
                 if expected_protocol == ExpectedProtocol::Http2 {
                     return Err(protocol_mismatch("HTTP/1.1", "HTTP/2"));
                 }
-
-                if let Some((start, end)) = find_http1_head_bounds(&prefix) {
-                    let head = &prefix[start..end];
-                    if has_ambiguous_http1_framing(head) {
-                        write_ambiguous_framing_response(&mut io).await?;
-                        return Ok(None);
-                    }
-                    let websocket_upgrade = raw_head_is_websocket_upgrade(head);
-                    return Ok(Some(PrefixedIo::new(
-                        io,
-                        prefix,
-                        DetectedProtocol::Http1,
-                        websocket_upgrade,
-                    )));
-                }
-
-                if prefix.len() >= max_head_bytes {
-                    // Hyper owns the authoritative syntax/header-size error.
-                    // Replaying the capped prefix lets its parser generate 431.
-                    return Ok(Some(PrefixedIo::new(
-                        io,
-                        prefix,
-                        DetectedProtocol::Http1,
-                        false,
-                    )));
-                }
+                return Ok(PrefixedIo::new(io, prefix, DetectedProtocol::Http1));
             }
         }
 
-        let active_limit = if matches!(preface_state, Http2PrefaceState::Pending) {
-            HTTP2_PREFACE.len() + HTTP2_FRAME_HEADER_BYTES + HTTP2_MAX_INITIAL_SETTINGS_BYTES
-        } else {
-            max_head_bytes
-        };
-        let remaining = active_limit.saturating_sub(prefix.len());
-        let chunk_length = remaining.min(chunk.len());
-        if chunk_length == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "el prefacio de la conexion supera el limite configurado",
-            ));
-        }
+        let chunk_length = (MAX_PREFACE_BYTES - prefix.len()).min(chunk.len());
         let read = io.read(&mut chunk[..chunk_length]).await?;
         if read == 0 {
             if expected_protocol == ExpectedProtocol::Http2
@@ -350,12 +301,7 @@ where
                     "el prefacio HTTP/2 del cliente esta incompleto",
                 ));
             }
-            return Ok(Some(PrefixedIo::new(
-                io,
-                prefix,
-                DetectedProtocol::Http1,
-                false,
-            )));
+            return Ok(PrefixedIo::new(io, prefix, DetectedProtocol::Http1));
         }
         prefix.extend_from_slice(&chunk[..read]);
     }
@@ -419,127 +365,98 @@ fn protocol_mismatch(received: &str, negotiated: &str) -> io::Error {
     )
 }
 
-/// Locates the first HTTP/1 request head using httparse/Hyper's newline
-/// policy: leading empty CRLF or LF lines are ignored and either newline form
-/// terminates request/header lines. Returning the actual request-line start is
-/// important because otherwise leading blank lines can hide framing fields
-/// from the raw TE+CL check while Hyper still accepts the request.
-fn find_http1_head_bounds(bytes: &[u8]) -> Option<(usize, usize)> {
-    let mut start = 0;
-    loop {
-        match bytes.get(start..) {
-            Some(remaining) if remaining.starts_with(b"\r\n") => start += 2,
-            Some(remaining) if remaining.starts_with(b"\n") => start += 1,
-            _ => break,
-        }
-    }
-
-    // The first non-empty line is the request line.
-    let mut cursor = next_http1_line(bytes, start)?.1;
-    loop {
-        let (line_start, next) = next_http1_line(bytes, cursor)?;
-        let mut line_end = next - 1;
-        if line_end > line_start && bytes[line_end - 1] == b'\r' {
-            line_end -= 1;
-        }
-        if line_end == line_start {
-            return Some((start, next));
-        }
-        cursor = next;
-    }
-}
-
-fn next_http1_line(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
-    let relative_end = bytes.get(start..)?.iter().position(|byte| *byte == b'\n')?;
-    Some((start, start + relative_end + 1))
-}
-
-fn has_ambiguous_http1_framing(head: &[u8]) -> bool {
-    let mut lines = head.split(|byte| *byte == b'\n');
-    let _request_line = lines.next();
-    let mut transfer_encoding = false;
-    let mut content_length = false;
-
-    for line in lines {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.is_empty() {
-            break;
-        }
-        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
-            continue;
-        };
-        let name = &line[..colon];
-        transfer_encoding |= name.eq_ignore_ascii_case(TRANSFER_ENCODING.as_str().as_bytes());
-        content_length |= name.eq_ignore_ascii_case(CONTENT_LENGTH.as_str().as_bytes());
-    }
-
-    transfer_encoding && content_length
-}
-
-fn raw_head_is_websocket_upgrade(head: &[u8]) -> bool {
-    let mut lines = head.split(|byte| *byte == b'\n');
-    let Some(request_line) = lines.next() else {
-        return false;
-    };
-    if !request_line.starts_with(b"GET ") {
-        return false;
-    }
-
-    let mut connection_upgrade = false;
-    let mut websocket_upgrade = false;
-    for line in lines {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.is_empty() {
-            break;
-        }
-        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
-            continue;
-        };
-        let name = &line[..colon];
-        let value = trim_ascii_whitespace(&line[colon + 1..]);
-        if name.eq_ignore_ascii_case(CONNECTION.as_str().as_bytes()) {
-            connection_upgrade |= value
-                .split(|byte| *byte == b',')
-                .map(trim_ascii_whitespace)
-                .any(|token| token.eq_ignore_ascii_case(b"upgrade"));
-        } else if name.eq_ignore_ascii_case(UPGRADE.as_str().as_bytes()) {
-            websocket_upgrade |= value
-                .split(|byte| *byte == b',')
-                .map(trim_ascii_whitespace)
-                .any(|token| token.eq_ignore_ascii_case(b"websocket"));
-        }
-    }
-    connection_upgrade && websocket_upgrade
-}
-
-fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
-    while value
-        .first()
-        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
-    {
-        value = &value[1..];
-    }
-    while value
-        .last()
-        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
-    {
-        value = &value[..value.len() - 1];
-    }
-    value
-}
-
-async fn write_ambiguous_framing_response<T>(io: &mut T) -> io::Result<()>
-where
-    T: AsyncWrite + Unpin,
+/// Serves one admitted, protocol-detected connection. Plaintext and TLS
+/// listeners share this path so transport rules cannot diverge.
+pub(crate) async fn serve_detected_connection<T>(
+    app: Arc<App>,
+    io: PrefixedIo<T>,
+    peer: SocketAddr,
+    transport_security: TransportSecurity,
+    builders: Arc<ConnectionBuilders>,
+    watcher: Watcher,
+) where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    const BODY: &str = r#"{"type":"about:blank#ambiguous_message_framing","title":"Bad Request","status":400,"detail":"Transfer-Encoding y Content-Length no pueden combinarse","code":"ambiguous_message_framing"}"#;
-    let response = format!(
-        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/problem+json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{BODY}",
-        BODY.len()
-    );
-    io.write_all(response.as_bytes()).await?;
-    io.flush().await?;
-    io.shutdown().await
+    let result = match io.protocol() {
+        DetectedProtocol::Http1 => {
+            let verdicts = Arc::new(Http1Verdicts::default());
+            let io = Http1InspectedIo::new(
+                io,
+                Arc::clone(&verdicts),
+                app.max_http1_head_bytes(),
+                app.config.max_request_header_count,
+            );
+            let connection = builders
+                .http1
+                .serve_connection_with_upgrades(
+                    TokioIo::new(io),
+                    service_fn(move |req: hyper::Request<Incoming>| {
+                        // Hyper dispatches HTTP/1 requests strictly in order,
+                        // one at a time, so the next verdict belongs to `req`.
+                        let verdict = verdicts.next();
+                        let app = Arc::clone(&app);
+                        async move {
+                            Ok::<_, Infallible>(
+                                app.handle_http1(req, verdict, peer, transport_security)
+                                    .await,
+                            )
+                        }
+                    }),
+                )
+                .into_owned();
+            watcher.watch(connection).await
+        }
+        DetectedProtocol::Http2 => {
+            let connection = builders.http2.serve_connection(
+                TokioIo::new(io),
+                service_fn(move |req: hyper::Request<Incoming>| {
+                    let app = Arc::clone(&app);
+                    async move {
+                        Ok::<_, Infallible>(app.handle(req, Some(peer), transport_security).await)
+                    }
+                }),
+            );
+            watcher.watch(connection).await
+        }
+    };
+    if let Err(err) = result {
+        if super::log::is_routine_connection_error(&*err) {
+            super::log::log_debug!("Conexion terminada: {err}");
+        } else {
+            super::log::log_error!("Error sirviendo la conexion: {err:?}");
+        }
+    }
+}
+
+/// The problem response for a request head the transport refuses (for
+/// example `Transfer-Encoding` together with `Content-Length`). Like Hyper's
+/// own parse errors it is produced before middleware and the application
+/// error handler; the caller always closes the connection (RFC 9112 §6.1).
+fn rejected_head_response(
+    code: &'static str,
+    message: &'static str,
+    is_head: bool,
+) -> hyper::Response<ResponseBody> {
+    let mut response =
+        Response::from_error(HttpError::new(StatusCode::BAD_REQUEST, code, message)).finalize();
+    if is_head {
+        response.prepare_for_head();
+        response = response.finalize();
+    }
+    response.into_hyper()
+}
+
+/// Ends the HTTP/1 connection after `response`. For an HTTP/1.0 request the
+/// response must itself be HTTP/1.0: otherwise Hyper's keep-alive fix-up
+/// replaces `Connection: close` with `keep-alive` when the client asked for a
+/// persistent HTTP/1.0 connection.
+fn force_connection_close(response: &mut hyper::Response<ResponseBody>, request: Version) {
+    response
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("close"));
+    if request == Version::HTTP_10 {
+        *response.version_mut() = Version::HTTP_10;
+    }
 }
 
 pub(crate) fn try_admit_connection(
@@ -557,7 +474,7 @@ pub(crate) fn try_admit_connection(
 fn report_connection_task(result: Result<(), JoinError>) {
     if let Err(error) = result {
         if !error.is_cancelled() {
-            eprintln!("La tarea de conexion termino de forma inesperada: {error}");
+            super::log::log_error!("La tarea de conexion termino de forma inesperada: {error}");
         }
     }
 }
@@ -594,7 +511,7 @@ pub enum TrailingSlash {
 
 /// Server-wide limits and timeouts, configured via builder methods on [`App`].
 #[derive(Clone, Copy)]
-pub struct ServerConfig {
+pub(crate) struct ServerConfig {
     pub(crate) max_body_size: usize,
     pub(crate) request_timeout: Option<Duration>,
     pub(crate) header_read_timeout: Option<Duration>,
@@ -651,6 +568,14 @@ fn request_target_len(method: &hyper::Method, uri: &Uri) -> usize {
             .saturating_add(path_and_query),
         _ => path_and_query,
     }
+}
+
+/// The framework's string view of a request field value. Hyper already
+/// rejects control characters; RFC 9110 §5.5 obs-text is accepted when it is
+/// UTF-8 (for example a cookie set by a sibling application), while other
+/// bytes are rejected rather than lossily rewritten.
+fn request_header_text(value: &HeaderValue) -> Option<&str> {
+    std::str::from_utf8(value.as_bytes()).ok()
 }
 
 fn request_head_error(status: StatusCode, code: &'static str, message: &'static str) -> HttpError {
@@ -792,7 +717,10 @@ fn validate_request_head(
             "Los encabezados de la solicitud superan el limite configurado",
         ));
     }
-    if headers.iter().any(|(_, value)| value.to_str().is_err()) {
+    if headers
+        .iter()
+        .any(|(_, value)| request_header_text(value).is_none())
+    {
         return Err(request_head_error(
             StatusCode::BAD_REQUEST,
             "invalid_header_value",
@@ -908,6 +836,12 @@ fn is_websocket_upgrade_request(req: &hyper::Request<Incoming>) -> bool {
             == Some("13")
 }
 
+/// Hyper connection servers built once per listener from the app's limits.
+pub(crate) struct ConnectionBuilders {
+    http1: auto::Builder<TokioExecutor>,
+    http2: auto::Builder<TokioExecutor>,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum TransportSecurity {
     Plain,
@@ -979,7 +913,15 @@ impl App {
         self
     }
 
+    /// Validates configuration that can only be checked as a whole before
+    /// serving: WebSocket routes and server limits.
     pub(crate) fn validate_websockets(&self) -> io::Result<()> {
+        if self.config.max_connections == Some(0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "max_connections(0) no admitiria ninguna conexion; use disable_connection_limit() para quitar el limite",
+            ));
+        }
         self.router
             .validate_websockets(&self.websocket_defaults)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
@@ -1372,37 +1314,30 @@ impl App {
             .await
     }
 
-    /// Builds the Hyper connection server shared by plaintext and TLS
+    /// Builds the Hyper connection servers shared by plaintext and TLS
     /// transports so transport-independent limits cannot diverge.
-    pub(crate) fn connection_builder(&self) -> auto::Builder<TokioExecutor> {
-        self.connection_builder_with_http1_keep_alive(false)
+    pub(crate) fn connection_builders(&self) -> ConnectionBuilders {
+        ConnectionBuilders {
+            http1: self.connection_builder(),
+            http2: self.connection_builder().http2_only(),
+        }
     }
 
-    pub(crate) fn websocket_connection_builder(&self) -> auto::Builder<TokioExecutor> {
-        self.connection_builder_with_http1_keep_alive(true)
-    }
-
-    pub(crate) fn http2_connection_builder(&self) -> auto::Builder<TokioExecutor> {
-        self.connection_builder_with_http1_keep_alive(false)
-            .http2_only()
-    }
-
-    fn connection_builder_with_http1_keep_alive(
-        &self,
-        http1_keep_alive: bool,
-    ) -> auto::Builder<TokioExecutor> {
+    fn connection_builder(&self) -> auto::Builder<TokioExecutor> {
         let mut builder = auto::Builder::new(TokioExecutor::new());
         builder
             .http1()
+            // `Http1InspectedIo` parses each head with these same limits and
+            // Hyper's default `httparse` configuration; keep them in sync.
             .max_headers(self.config.max_request_header_count)
             .max_buf_size(self.max_http1_head_bytes())
-            // Hyper normalizes TE+CL before the service and exposes no hook
-            // for rejecting the ambiguity on every request in a persistent
-            // connection. One request per HTTP/1 connection lets the raw
-            // preflight enforce the invariant without reimplementing HTTP
-            // body framing. HTTP/2 multiplexing and upgrades are unaffected.
-            .keep_alive(http1_keep_alive);
+            // Persistent connections are safe because every request head is
+            // classified before Hyper reads it, and requests whose successor
+            // is not tracked close the connection (see `http1.rs`).
+            .keep_alive(true);
         if let Some(timeout) = self.config.header_read_timeout {
+            // Hyper restarts this timer whenever a persistent connection goes
+            // idle, so it also bounds keep-alive idle time.
             builder
                 .http1()
                 .timer(TokioTimer::new())
@@ -1445,8 +1380,10 @@ impl App {
 
     /// Serves connections on `listener` until `shutdown` resolves. A transient
     /// accept error is logged and retried — it never tears down the server.
-    /// Once `shutdown` fires, the listener is closed and outstanding
-    /// connections are drained (bounded by a 10s timeout).
+    /// Once `shutdown` fires, the listener is closed, idle keep-alive
+    /// connections are closed, and in-flight requests are drained for up to
+    /// [`App::graceful_shutdown_timeout`] (10 s by default) before the
+    /// remaining connection tasks are aborted.
     pub async fn serve_with_shutdown(
         self,
         listener: TcpListener,
@@ -1454,11 +1391,8 @@ impl App {
     ) -> io::Result<()> {
         self.validate_websockets()?;
         self.websocket_runtime.start_broker().await;
-        let builder = Arc::new(self.connection_builder());
-        let websocket_builder = Arc::new(self.websocket_connection_builder());
-        let http2_builder = Arc::new(self.http2_connection_builder());
+        let builders = Arc::new(self.connection_builders());
         let admission = self.connection_admission();
-        let max_head_bytes = self.max_http1_head_bytes();
         let header_read_timeout = self.config.header_read_timeout;
         let app = Arc::new(self);
         let graceful = GracefulShutdown::new();
@@ -1471,7 +1405,7 @@ impl App {
                 accepted = listener.accept() => match accepted {
                     Ok(pair) => pair,
                     Err(err) => {
-                        eprintln!("Error accepting connection: {}", err);
+                        super::log::log_error!("Error aceptando una conexion: {err}");
                         tokio::time::sleep(Duration::from_millis(5)).await;
                         continue;
                     }
@@ -1489,80 +1423,27 @@ impl App {
 
             let io = AdmittedIo::new(stream, permit);
             let app = Arc::clone(&app);
-            let builder = Arc::clone(&builder);
-            let websocket_builder = Arc::clone(&websocket_builder);
-            let http2_builder = Arc::clone(&http2_builder);
+            let builders = Arc::clone(&builders);
             let watcher = graceful.watcher();
             connection_tasks.spawn(async move {
-                let io = match preflight_connection(
-                    io,
-                    max_head_bytes,
-                    header_read_timeout,
-                    ExpectedProtocol::Auto,
-                )
-                .await
+                let io = match preflight_connection(io, header_read_timeout, ExpectedProtocol::Auto)
+                    .await
                 {
-                    Ok(Some(io)) => io,
-                    Ok(None) => return,
+                    Ok(io) => io,
                     Err(error) => {
-                        if error.kind() != io::ErrorKind::TimedOut {
-                            eprintln!("Error inspeccionando la conexion: {error}");
-                        }
+                        super::log::log_debug!("Error inspeccionando la conexion: {error}");
                         return;
                     }
                 };
-                let protocol = io.protocol();
-                let websocket_upgrade = io.is_websocket_upgrade();
-                let io = TokioIo::new(io);
-                let result = match protocol {
-                    DetectedProtocol::Http1 => {
-                        let builder = if websocket_upgrade {
-                            websocket_builder
-                        } else {
-                            builder
-                        };
-                        let connection = builder
-                            .serve_connection_with_upgrades(
-                                io,
-                                service_fn(move |req: hyper::Request<Incoming>| {
-                                    let app = Arc::clone(&app);
-                                    async move {
-                                        let mut response = app
-                                            .handle(req, Some(peer), TransportSecurity::Plain)
-                                            .await;
-                                        if websocket_upgrade
-                                            && response.status() != StatusCode::SWITCHING_PROTOCOLS
-                                        {
-                                            response.headers_mut().insert(
-                                                CONNECTION,
-                                                HeaderValue::from_static("close"),
-                                            );
-                                        }
-                                        Ok::<_, Infallible>(response)
-                                    }
-                                }),
-                            )
-                            .into_owned();
-                        watcher.watch(connection).await
-                    }
-                    DetectedProtocol::Http2 => {
-                        let connection = http2_builder.serve_connection(
-                            io,
-                            service_fn(move |req: hyper::Request<Incoming>| {
-                                let app = Arc::clone(&app);
-                                async move {
-                                    Ok::<_, Infallible>(
-                                        app.handle(req, Some(peer), TransportSecurity::Plain).await,
-                                    )
-                                }
-                            }),
-                        );
-                        watcher.watch(connection).await
-                    }
-                };
-                if let Err(err) = result {
-                    eprintln!("Error serving connection: {:?}", err);
-                }
+                serve_detected_connection(
+                    app,
+                    io,
+                    peer,
+                    TransportSecurity::Plain,
+                    builders,
+                    watcher,
+                )
+                .await;
             });
         }
 
@@ -1576,6 +1457,40 @@ impl App {
         .await;
         finish_connection_tasks(&mut connection_tasks, !drained).await;
         Ok(())
+    }
+
+    /// Applies the transport verdict for an HTTP/1 request before handing it
+    /// to [`App::handle`].
+    async fn handle_http1(
+        &self,
+        req: hyper::Request<Incoming>,
+        verdict: HeadVerdict,
+        peer: SocketAddr,
+        transport_security: TransportSecurity,
+    ) -> hyper::Response<ResponseBody> {
+        let request_version = req.version();
+        let is_head = req.method() == Method::HEAD;
+        let mut response = match verdict {
+            HeadVerdict::Ambiguous => rejected_head_response(
+                "ambiguous_message_framing",
+                "Transfer-Encoding y Content-Length no pueden combinarse",
+                is_head,
+            ),
+            HeadVerdict::Unclassified => rejected_head_response(
+                "unverified_message_framing",
+                "La solicitud no pudo verificarse en esta conexion",
+                is_head,
+            ),
+            HeadVerdict::Persistent | HeadVerdict::Terminal => {
+                self.handle(req, Some(peer), transport_security).await
+            }
+        };
+        if verdict != HeadVerdict::Persistent
+            && response.status() != StatusCode::SWITCHING_PROTOCOLS
+        {
+            force_connection_close(&mut response, request_version);
+        }
+        response
     }
 
     /// Translates a hyper request into a [`Request`] without consuming its
@@ -1613,11 +1528,11 @@ impl App {
         let mut header_pairs: Vec<(String, String)> = Vec::new();
         for (name, value) in &parts.headers {
             let name = name.as_str().to_string();
-            // `validate_request_head` rejected non-visible field values before
-            // this conversion, so the framework's string view is lossless.
-            let value = value
-                .to_str()
-                .expect("validated request header values are visible ASCII")
+            // `validate_request_head` rejected values that are not UTF-8
+            // before this conversion, so the framework's string view is
+            // lossless.
+            let value = request_header_text(value)
+                .expect("validated request header values are UTF-8")
                 .to_string();
             headers.insert(name.clone(), value.clone());
             header_pairs.push((name, value));
@@ -1630,7 +1545,7 @@ impl App {
         }
         let mut cookies = HashMap::new();
         for value in parts.headers.get_all(COOKIE) {
-            if let Ok(value) = value.to_str() {
+            if let Some(value) = request_header_text(value) {
                 // Multiple Cookie fields are equivalent to one field joined
                 // with `; `. Extending in arrival order gives later duplicate
                 // cookie names the same last-value-wins behavior.
@@ -1658,6 +1573,7 @@ impl App {
             remote_addr,
             secure_transport: transport_security.is_secure(),
             header_pairs,
+            session_id: None,
         };
 
         self.run_request(request).await.into_hyper()
@@ -1682,10 +1598,22 @@ impl App {
         })
         .flatten();
         let mut response = match self.config.request_timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, self.dispatch(request)).await {
-                Ok(response) => response,
-                Err(_) => self.error_response(HttpError::request_timeout("Request Timeout")),
-            },
+            Some(timeout) => {
+                // The handler is cut off at the deadline inside the onion so
+                // the 408 still flows out through every middleware (CORS,
+                // request ids, logging). The outer deadline is only a
+                // backstop for middleware that itself never completes.
+                let deadline = tokio::time::Instant::now() + timeout;
+                match tokio::time::timeout_at(
+                    deadline,
+                    self.dispatch_until(request, Some(deadline)),
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(_) => self.error_response(request_timeout_error()),
+                }
+            }
             None => self.dispatch(request).await,
         };
         if response.status == StatusCode::SWITCHING_PROTOCOLS.as_u16() {
@@ -1734,7 +1662,7 @@ impl App {
                 handler: not_found_handler(),
                 middlewares: Vec::new(),
                 params: HashMap::new(),
-                pattern: path.to_string(),
+                pattern: String::new(),
                 kind: RouteKind::Http,
                 body_limit: None,
             })
@@ -1743,9 +1671,9 @@ impl App {
         } else if method == "OPTIONS" {
             Ok(MatchedRoute {
                 handler: options_handler(allow_header_value(&allowed, has_implicit_head)),
-                middlewares: Vec::new(),
+                middlewares: self.router.scoped_middlewares(path, host)?,
                 params: HashMap::new(),
-                pattern: path.to_string(),
+                pattern: String::new(),
                 kind: RouteKind::Http,
                 body_limit: None,
             })
@@ -1755,9 +1683,9 @@ impl App {
                     &allowed,
                     has_implicit_head,
                 )),
-                middlewares: Vec::new(),
+                middlewares: self.router.scoped_middlewares(path, host)?,
                 params: HashMap::new(),
-                pattern: path.to_string(),
+                pattern: String::new(),
                 kind: RouteKind::Http,
                 body_limit: None,
             })
@@ -1803,7 +1731,18 @@ impl App {
         request: Request,
         mut next: Next,
         route_middlewares: &[Middleware],
+        deadline: Option<tokio::time::Instant>,
     ) -> Response {
+        if let Some(deadline) = deadline {
+            let inner = next;
+            next = Box::new(move |req| {
+                Box::pin(async move {
+                    tokio::time::timeout_at(deadline, inner(req))
+                        .await
+                        .unwrap_or_else(|_| Response::from_error(request_timeout_error()))
+                })
+            });
+        }
         // Render handler errors before unwinding through middleware so
         // outbound post-processing sees the final application error response.
         next = guarded_next(next, self.error_handler.clone());
@@ -1837,12 +1776,22 @@ impl App {
     async fn dispatch_error_through_global(&self, request: Request, error: HttpError) -> Response {
         let response = self.error_response(error);
         let next: Next = Box::new(move |_request| Box::pin(async move { response }));
-        self.execute_chain(request, next, &[]).await
+        self.execute_chain(request, next, &[], None).await
     }
 
     /// Routes the request (capturing path params), then runs it through the
     /// middleware onion ending at the matched handler (or a 404 handler).
-    pub(crate) async fn dispatch(&self, mut request: Request) -> Response {
+    pub(crate) async fn dispatch(&self, request: Request) -> Response {
+        self.dispatch_until(request, None).await
+    }
+
+    /// Like [`App::dispatch`], but the matched handler is cut off with `408`
+    /// at `deadline` while the surrounding middleware still runs.
+    async fn dispatch_until(
+        &self,
+        mut request: Request,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Response {
         request.state = self.state.clone();
         request.websocket_runtime = self.websocket_runtime.clone();
         if request
@@ -1863,12 +1812,19 @@ impl App {
             return response;
         }
         let host = request.header("host").map(str::to_string);
+        // Asterisk-form `OPTIONS *` (RFC 9110 §9.3.7) concerns the server as a
+        // whole, not a resource, so it is answered here instead of routed.
+        if request.path == "*" && request.method == "OPTIONS" {
+            let next: Next =
+                Box::new(|_request| Box::pin(async { Response::send("").status(204) }));
+            return self.execute_chain(request, next, &[], None).await;
+        }
         let matched = match self.trailing_slash_miss(&request) {
             Some(handler) => MatchedRoute {
                 handler,
                 middlewares: Vec::new(),
                 params: HashMap::new(),
-                pattern: request.path.clone(),
+                pattern: String::new(),
                 kind: RouteKind::Http,
                 body_limit: None,
             },
@@ -1909,7 +1865,10 @@ impl App {
             .min(self.config.max_body_size);
         request.set_body_limit(effective_body_limit);
         request.params = params;
-        request.route_pattern = Some(pattern);
+        // Synthesized 404/405/OPTIONS/trailing-slash handlers have no route
+        // pattern; exposing the raw path would give metrics unbounded
+        // cardinality.
+        request.route_pattern = (!pattern.is_empty()).then_some(pattern);
         request.resolved_websocket_config = match kind {
             RouteKind::Http => None,
             RouteKind::WebSocket(route_config) => {
@@ -1926,8 +1885,13 @@ impl App {
 
         // Innermost layer: the matched handler.
         let next: Next = Box::new(move |req| (*handler)(req));
-        self.execute_chain(request, next, &route_middlewares).await
+        self.execute_chain(request, next, &route_middlewares, deadline)
+            .await
     }
+}
+
+fn request_timeout_error() -> HttpError {
+    HttpError::request_timeout("Request Timeout")
 }
 
 fn enforce_connect_rejection_status(response: &mut Response, is_connect: bool) {
@@ -1970,7 +1934,29 @@ fn guarded_next(next: Next, error_handler: Option<ErrorHandler>) -> Next {
 
 fn render_response_error(mut response: Response, error_handler: Option<&ErrorHandler>) -> Response {
     match response.take_error() {
-        Some(error) if error_handler.is_some() => render_http_error(error, error_handler),
+        Some(error) if error_handler.is_some() => {
+            let error_status = error.status().as_u16();
+            let mut rendered = render_http_error(error, error_handler);
+            // The renderer only sees the `HttpError`. Fields the application
+            // attached to the error response afterwards (for example
+            // `WWW-Authenticate`, `Set-Cookie`, `Cache-Control`) and an
+            // explicit status override are part of that response and must
+            // survive formatting; the renderer owns the representation.
+            for name in response.headers.keys() {
+                if name != CONTENT_TYPE && name != CONTENT_LENGTH {
+                    rendered.headers.remove(name);
+                }
+            }
+            for (name, value) in &response.headers {
+                if name != CONTENT_TYPE && name != CONTENT_LENGTH {
+                    rendered.headers.append(name, value.clone());
+                }
+            }
+            if response.status != error_status {
+                rendered.status = response.status;
+            }
+            rendered
+        }
         Some(_) | None => response,
     }
 }
@@ -1984,7 +1970,7 @@ fn render_http_error(error: HttpError, error_handler: Option<&ErrorHandler>) -> 
     let mut response = match catch_unwind(AssertUnwindSafe(|| handler(error))) {
         Ok(response) => response,
         Err(_) => {
-            eprintln!("El manejador global de errores hizo panic; devolviendo 500.");
+            super::log::log_error!("El manejador global de errores hizo panic; devolviendo 500");
             let mut response = Response::internal_server_error();
             // The renderer itself failed. This generic fallback is final and
             // must not be fed recursively to the same panicking renderer.
@@ -2427,21 +2413,6 @@ mod lifecycle_tests {
 
         assert_eq!(error.status(), StatusCode::BAD_REQUEST);
         assert_eq!(error.code(), "invalid_header_value");
-    }
-
-    #[test]
-    fn raw_websocket_candidate_detection_uses_http_token_lists() {
-        let head = b"GET /ws HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive, Upgrade\r\nUpgrade: h2c, websocket\r\n\r\n";
-        assert!(raw_head_is_websocket_upgrade(head));
-
-        let ordinary_spacing = b"GET /ws HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
-        assert!(raw_head_is_websocket_upgrade(ordinary_spacing));
-
-        let empty_values =
-            b"GET /ws HTTP/1.1\r\nHost: example.test\r\nConnection: \r\nUpgrade:\t\r\n\r\n";
-        assert!(!raw_head_is_websocket_upgrade(empty_values));
-        assert_eq!(trim_ascii_whitespace(b" "), b"");
-        assert_eq!(trim_ascii_whitespace(b"\t"), b"");
     }
 
     #[test]

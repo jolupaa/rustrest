@@ -423,7 +423,12 @@ async fn compression_returns_406_when_identity_is_forbidden_and_transform_is_ski
             .send()
             .await;
         assert_eq!(response.status, status, "path={path}");
-        assert!(response.headers.get(VARY).is_none(), "path={path}");
+        // RFC 9110 §15.4.5: a 304 carries the Vary a 200 would have sent.
+        assert_eq!(
+            response.headers.get(VARY).is_some(),
+            status == 304,
+            "path={path}"
+        );
     }
 }
 

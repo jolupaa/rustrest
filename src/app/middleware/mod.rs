@@ -21,6 +21,27 @@ const MAX_REQUEST_ID_BYTES: usize = 128;
 const DEFAULT_RATE_LIMIT_CLIENTS: usize = 10_000;
 const MAX_RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Builds a [`Middleware`] from an async closure. Unlike a closure passed
+/// straight to `layer`, whose `next` parameter must be annotated as
+/// `next: Next`, the parameter types are inferred here:
+///
+/// ```rust
+/// use rustrest::{App, middleware};
+///
+/// let mut app = App::new();
+/// app.layer(middleware::from_fn(|req, next| async move {
+///     let response = next(req).await;
+///     response.header("x-powered-by", "rustrest")
+/// }));
+/// ```
+pub fn from_fn<F, Fut>(middleware: F) -> Middleware
+where
+    F: Fn(Request, Next) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Response> + Send + 'static,
+{
+    middleware.into_middleware()
+}
+
 pub fn cors() -> Middleware {
     Arc::new(|req: Request, next: Next| {
         Box::pin(async move {
@@ -398,7 +419,11 @@ impl Cors {
     }
 
     /// Allows any origin. With credentials enabled the request origin is
-    /// echoed back (the spec forbids `*` together with credentials).
+    /// echoed back (the spec forbids `*` together with credentials), which
+    /// lets *every* site make credentialed requests and read the responses.
+    /// Prefer an explicit [`Cors::allow_origin`] allowlist for credentialed
+    /// APIs. The opaque `null` origin (sandboxed iframes, `data:` documents)
+    /// is never granted in that mode.
     pub fn allow_any_origin(mut self) -> Self {
         self.any_origin = true;
         self
@@ -436,7 +461,9 @@ impl Cors {
     fn grant_for(&self, origin: &str) -> Option<String> {
         if self.any_origin {
             if self.credentials {
-                Some(origin.to_string())
+                // Reflecting `null` with credentials would hand credentialed
+                // access to any sandboxed document.
+                (origin != "null").then(|| origin.to_string())
             } else {
                 Some("*".to_string())
             }

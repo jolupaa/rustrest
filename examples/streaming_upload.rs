@@ -17,10 +17,12 @@ struct UploadResult {
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let mut app = App::new();
+    // `max_body_size` is the hard ceiling for every route; a route
+    // `body_limit` can only lower it. Raise the ceiling for uploads and keep
+    // ordinary routes small with their own `body_limit`.
+    app.max_body_size(MAX_UPLOAD_BYTES);
 
-    app.post("/upload", upload)
-        .unwrap()
-        .body_limit(MAX_UPLOAD_BYTES);
+    app.post("/upload", upload)?.body_limit(MAX_UPLOAD_BYTES);
 
     println!("Servidor escuchando en http://127.0.0.1:3000");
     println!("Prueba: curl -X POST --data-binary @archivo.bin http://127.0.0.1:3000/upload");

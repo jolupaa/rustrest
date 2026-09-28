@@ -14,6 +14,8 @@ pub type BoxError = Box<dyn Error + Send + Sync>;
 struct HttpErrorDetails {
     source: Option<BoxError>,
     headers: HeaderMap,
+    /// The rejected value was genuinely absent (see `OptionalRejection`).
+    missing: bool,
 }
 
 #[derive(Debug)]
@@ -176,6 +178,20 @@ impl HttpError {
     pub fn append_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
         self.details.headers.append(name, value);
         self
+    }
+
+    /// Marks this rejection as describing a value that is genuinely absent
+    /// (no header, no extension, no body), so an `Option<E>` extractor
+    /// yields `None` instead of propagating it. Malformed input must not be
+    /// marked.
+    pub fn missing(mut self) -> Self {
+        self.details.missing = true;
+        self
+    }
+
+    /// Whether [`HttpError::missing`] marked this rejection as an absence.
+    pub fn is_missing(&self) -> bool {
+        self.details.missing
     }
 
     pub fn with_source<E>(mut self, source: E) -> Self

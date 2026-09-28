@@ -431,7 +431,7 @@ fn spawn_websocket(
                 let _ = driver.start_tx.send(registered);
             }
             Err(err) => {
-                eprintln!("La actualizacion WebSocket fallo: {err}");
+                super::log::log_error!("La actualizacion WebSocket fallo: {err}");
             }
         }
     });

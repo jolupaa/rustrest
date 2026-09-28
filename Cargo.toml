@@ -64,6 +64,9 @@ hyper-util = { version = "0.1", features = [
     "tokio",
 ] }
 http-body-util = "0.1"
+# Hyper's own HTTP/1 parser; used to classify raw request heads with exactly
+# the grammar Hyper applies (see src/app/http1.rs).
+httparse = "1"
 futures-util = "0.3"
 base64 = "0.22"
 flate2 = "1"

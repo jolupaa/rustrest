@@ -5,7 +5,7 @@ use http_body_util::BodyExt;
 use hyper::body::Bytes;
 use hyper::header::{
     ALLOW, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue,
-    LOCATION, RETRY_AFTER, SEC_WEBSOCKET_VERSION, SET_COOKIE, TRAILER, TRANSFER_ENCODING,
+    LOCATION, RETRY_AFTER, SEC_WEBSOCKET_VERSION, SET_COOKIE, TRAILER, TRANSFER_ENCODING, VARY,
     WWW_AUTHENTICATE,
 };
 use hyper::{HeaderMap, Method, StatusCode};
@@ -2863,6 +2863,7 @@ fn query_params_are_parsed_and_url_decoded() {
         remote_addr: None,
         secure_transport: false,
         header_pairs: Vec::new(),
+        session_id: None,
     };
 
     assert_eq!(req.query("q"), Some("rust rest"));
@@ -4154,4 +4155,480 @@ async fn handle_strips_body_for_head_requests() {
 
     assert_eq!(res.status, 200);
     assert_eq!(res.body_text(), "");
+}
+
+// RFC 9110 §9.3.2: HEAD is GET without content. A shallower fallback,
+// `all()` or static root must not shadow the GET route for HEAD.
+#[tokio::test]
+async fn head_mirrors_get_even_when_a_fallback_or_wildcard_exists() {
+    let mut app = App::new();
+    app.get("/users", |_r: Request| Response::send("users"))
+        .unwrap();
+    app.all("/files/*rest", |_r: Request| Response::send("any"))
+        .unwrap();
+    app.get("/files/report", |_r: Request| Response::send("report"))
+        .unwrap();
+    app.fallback(|_r: Request| Response::send("Not found").status(404))
+        .unwrap();
+
+    let head = app.run_request(request_with_method("HEAD", "/users")).await;
+    assert_eq!(head.status, 200);
+    assert_eq!(head.body_text(), "");
+    assert_eq!(
+        head.headers
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some("5")
+    );
+
+    // Same-node exact GET beats all() for HEAD as well.
+    let head = app
+        .run_request(request_with_method("HEAD", "/files/report"))
+        .await;
+    assert_eq!(
+        head.headers
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some("6")
+    );
+
+    let missing = app.run_request(request_with_method("HEAD", "/nope")).await;
+    assert_eq!(missing.status, 404);
+}
+
+#[tokio::test]
+async fn explicit_head_route_still_beats_get_and_websocket_get_is_never_head() {
+    let mut app = App::new();
+    app.get("/x", |_r: Request| Response::send("get")).unwrap();
+    app.head("/x", |_r: Request| {
+        Response::send("h").header("x-head", "1")
+    })
+    .unwrap();
+    app.websocket("/ws", |_socket| async {}).unwrap();
+    app.fallback(|_r: Request| Response::send("fallback").status(404))
+        .unwrap();
+
+    let head = app.run_request(request_with_method("HEAD", "/x")).await;
+    assert_eq!(head.headers.get("x-head").unwrap(), "1");
+
+    let ws = app.run_request(request_with_method("HEAD", "/ws")).await;
+    assert_eq!(
+        ws.status, 404,
+        "the fallback answers, not the WebSocket route"
+    );
+}
+
+// RFC 9110 §15.5.2: a 401 MUST carry WWW-Authenticate. Headers and an
+// explicit status set on an error response must survive a custom renderer.
+#[tokio::test]
+async fn custom_error_handler_keeps_headers_and_status_set_on_error_responses() {
+    let mut app = App::new();
+    app.error_handler(|error| Response::send(error.code()).status(error.status().as_u16()));
+    app.get("/private", |_r: Request| {
+        Response::from_error(HttpError::unauthorized("Credenciales requeridas"))
+            .header("www-authenticate", "Bearer")
+            .header("cache-control", "no-store")
+    })
+    .unwrap();
+    app.get("/unprocessable", |_r: Request| {
+        Response::from_error(HttpError::bad_request("Datos no validos")).status(422)
+    })
+    .unwrap();
+
+    let res = app
+        .run_request(request_with_method("GET", "/private"))
+        .await;
+    assert_eq!(res.status, 401);
+    assert_eq!(res.headers.get(WWW_AUTHENTICATE).unwrap(), "Bearer");
+    assert_eq!(res.headers.get(CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(res.body_text(), "unauthorized");
+
+    let res = app
+        .run_request(request_with_method("GET", "/unprocessable"))
+        .await;
+    assert_eq!(res.status, 422);
+}
+
+// `Option<E>` turns a *genuinely absent* value into `None` (0.3 semantics);
+// malformed input still propagates.
+#[tokio::test]
+async fn optional_extractors_treat_genuine_absence_as_none() {
+    #[derive(Clone)]
+    struct User;
+    struct Db;
+    #[derive(Deserialize)]
+    struct Paging {
+        #[allow(dead_code)]
+        page: u32,
+    }
+    #[derive(Deserialize)]
+    struct Input {
+        #[allow(dead_code)]
+        name: String,
+    }
+
+    let mut app = App::new();
+    app.get("/ext", |user: Option<Extension<User>>| {
+        Response::send(if user.is_some() { "user" } else { "anon" })
+    })
+    .unwrap();
+    app.get("/state", |db: Option<State<Db>>| {
+        Response::send(if db.is_some() { "db" } else { "no-db" })
+    })
+    .unwrap();
+    app.get("/query", |paging: Option<Query<Paging>>| {
+        Response::send(if paging.is_some() { "paged" } else { "unpaged" })
+    })
+    .unwrap();
+    app.post("/json", |input: Option<Json<Input>>| async move {
+        Response::send(if input.is_some() { "body" } else { "no-body" })
+    })
+    .unwrap();
+
+    let client = TestClient::new(app);
+    assert_eq!(client.get("/ext").send().await.body_text(), "anon");
+    assert_eq!(client.get("/state").send().await.body_text(), "no-db");
+    assert_eq!(client.get("/query").send().await.body_text(), "unpaged");
+    assert_eq!(client.post("/json").send().await.body_text(), "no-body");
+
+    // Present but malformed values are still errors.
+    assert_eq!(client.get("/query?page=x").send().await.status, 400);
+    assert_eq!(
+        client
+            .post("/json")
+            .header("content-type", "text/plain")
+            .body("{}")
+            .send()
+            .await
+            .status,
+        415
+    );
+    assert_eq!(
+        client
+            .post("/json")
+            .header("content-type", "application/json")
+            .body("{bad")
+            .send()
+            .await
+            .status,
+        400
+    );
+}
+
+// A scalar path parameter is the decoded segment text, never a JSON document:
+// quotes are data and JSON escapes cannot smuggle control characters.
+#[tokio::test]
+async fn scalar_path_parameters_are_not_json_decoded() {
+    let mut app = App::new();
+    app.get("/tags/:tag", |Path(tag): Path<String>| Response::send(&tag))
+        .unwrap();
+    app.get("/ids/:id", |Path(id): Path<u64>| {
+        Response::send(&id.to_string())
+    })
+    .unwrap();
+    app.get("/flags/:flag", |Path(flag): Path<bool>| {
+        Response::send(&flag.to_string())
+    })
+    .unwrap();
+    let client = TestClient::new(app);
+
+    assert_eq!(
+        client.get("/tags/%22quoted%22").send().await.body_text(),
+        "\"quoted\""
+    );
+    let escaped = client
+        .get("/tags/%22a%5Cu0000b%5Cr%5Cnc%22")
+        .send()
+        .await
+        .body_text()
+        .to_string();
+    assert_eq!(escaped, r#""a\u0000b\r\nc""#);
+    assert!(!escaped.contains('\0') && !escaped.contains('\n'));
+    assert_eq!(client.get("/tags/plain").send().await.body_text(), "plain");
+    assert_eq!(client.get("/ids/007").send().await.body_text(), "7");
+    assert_eq!(client.get("/ids/-1").send().await.status, 400);
+    assert_eq!(client.get("/flags/true").send().await.body_text(), "true");
+}
+
+#[tokio::test]
+async fn session_id_is_never_taken_from_a_client_header_outside_the_middleware() {
+    let sessions = Sessions::new(TEST_SESSION_SECRET);
+    let mut app = App::new();
+    let mut scoped = Router::new();
+    scoped.layer(sessions.middleware());
+    scoped
+        .get("/id", |req: Request| {
+            Response::send(req.session_id().unwrap_or("none"))
+        })
+        .unwrap();
+    app.mount("/with", scoped).unwrap();
+    app.get("/without", |req: Request| {
+        Response::send(req.session_id().unwrap_or("none"))
+    })
+    .unwrap();
+    let client = TestClient::new(app);
+
+    let outside = client
+        .get("/without")
+        .header("x-session-id", "victim-session")
+        .send()
+        .await;
+    assert_eq!(outside.body_text(), "none");
+    let inside = client
+        .get("/with/id")
+        .header("x-session-id", "victim-session")
+        .send()
+        .await;
+    assert_ne!(inside.body_text(), "victim-session");
+    assert_ne!(inside.body_text(), "none");
+}
+
+#[tokio::test]
+async fn request_timeout_response_still_passes_through_global_middleware() {
+    let mut app = App::new();
+    app.request_timeout(Duration::from_millis(30));
+    app.layer(|req: Request, next: Next| async move { next(req).await.header("x-outer", "1") });
+    app.error_handler(|error| {
+        Response::send(error.code())
+            .status(error.status().as_u16())
+            .header("x-rendered", "1")
+    });
+    app.get("/slow", |_r: Request| async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Response::send("late")
+    })
+    .unwrap();
+
+    let res = app.run_request(request_with_method("GET", "/slow")).await;
+    assert_eq!(res.status, 408);
+    assert_eq!(res.headers.get("x-outer").unwrap(), "1");
+    assert_eq!(res.headers.get("x-rendered").unwrap(), "1");
+}
+
+#[tokio::test]
+async fn matched_path_is_absent_for_synthesized_misses() {
+    let mut app = App::new();
+    app.layer(|req: Request, next: Next| async move {
+        let matched = req.route_pattern().unwrap_or("none").to_string();
+        next(req).await.header("x-matched", &matched)
+    });
+    app.get("/users/:id", |_r: Request| Response::send("ok"))
+        .unwrap();
+    let client = TestClient::new(app);
+
+    let hit = client.get("/users/42").send().await;
+    assert_eq!(hit.headers.get("x-matched").unwrap(), "/users/:id");
+    for (method, path) in [
+        ("GET", "/nope/123"),
+        ("DELETE", "/users/42"),
+        ("OPTIONS", "/users/42"),
+    ] {
+        let res = client.request(method, path).send().await;
+        assert_eq!(
+            res.headers.get("x-matched").unwrap(),
+            "none",
+            "{method} {path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn compression_keeps_vary_on_not_modified_responses() {
+    let mut app = App::new();
+    app.layer(middleware::compression());
+    app.get("/cached", |_r: Request| Response::send("").status(304))
+        .unwrap();
+    let res = TestClient::new(app)
+        .get("/cached")
+        .header("accept-encoding", "gzip")
+        .send()
+        .await;
+    assert_eq!(res.status, 304);
+    assert!(
+        res.headers
+            .get(VARY)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .eq_ignore_ascii_case("accept-encoding")
+    );
+}
+
+#[tokio::test]
+async fn cors_any_origin_with_credentials_never_grants_the_null_origin() {
+    let mut app = App::new();
+    app.layer(
+        middleware::Cors::new()
+            .allow_any_origin()
+            .allow_credentials(true),
+    );
+    app.get("/me", |_r: Request| Response::send("secret"))
+        .unwrap();
+    let client = TestClient::new(app);
+
+    let real = client
+        .get("/me")
+        .header("origin", "https://app.example")
+        .send()
+        .await;
+    assert_eq!(
+        real.headers.get("access-control-allow-origin").unwrap(),
+        "https://app.example"
+    );
+    let sandboxed = client.get("/me").header("origin", "null").send().await;
+    assert!(
+        sandboxed
+            .headers
+            .get("access-control-allow-origin")
+            .is_none()
+    );
+    assert!(
+        sandboxed
+            .headers
+            .get("access-control-allow-credentials")
+            .is_none()
+    );
+}
+
+#[test]
+fn url_for_never_builds_scheme_relative_or_shifted_urls() {
+    let mut app = App::new();
+    app.get("/*path", |_r: Request| Response::send("any"))
+        .unwrap()
+        .name("any")
+        .unwrap();
+    app.get("/users/:id", |_r: Request| Response::send("user"))
+        .unwrap()
+        .name("user")
+        .unwrap();
+
+    let url = app.url_for("any", [("path", "/evil.example/x")]).unwrap();
+    assert_eq!(url, "/evil.example/x");
+    assert!(!url.starts_with("//"));
+    let error = app.url_for("user", [("id", "")]).unwrap_err();
+    assert_eq!(error.kind(), RouteErrorKind::MissingUrlParameter);
+}
+
+#[test]
+fn redirects_emit_valid_uri_references_and_require_a_redirect_status() {
+    let res = Response::redirect("/café/b c?q=ñ&x=%20#frag");
+    assert_eq!(res.status, 302);
+    assert_eq!(
+        res.headers.get(LOCATION).unwrap(),
+        "/caf%C3%A9/b%20c?q=%C3%B1&x=%20#frag"
+    );
+    // A literal percent that is not an escape is encoded; valid escapes stay.
+    assert_eq!(
+        Response::redirect("/100%/ok%2F")
+            .headers
+            .get(LOCATION)
+            .unwrap(),
+        "/100%25/ok%2F"
+    );
+    assert_eq!(Response::redirect_with_status("/new", 308).status, 308);
+    // Only 3xx statuses are redirects; anything else is a construction error
+    // rendered as 500 at the HTTP boundary.
+    let invalid = Response::redirect_with_status("/new", 200).finalize();
+    assert_eq!(invalid.status, 500);
+}
+
+// Router-scoped middleware (CORS, guards) also applies to the OPTIONS and 405
+// responses synthesized for that router's own paths; route-level layers do not.
+#[tokio::test]
+async fn router_scoped_middleware_covers_synthesized_options_and_405() {
+    let mut api = Router::new();
+    api.layer(middleware::Cors::new().allow_origin("https://app.example"));
+    api.get("/items", |_r: Request| Response::send("items"))
+        .unwrap()
+        .layer(|_req: Request, _next: Next| async move {
+            Response::send("route layer must not run for other methods").status(418)
+        });
+    let mut admin = Router::new();
+    admin.guard(|_req: &Request| false);
+    admin
+        .get("/users", |_r: Request| Response::send("secret"))
+        .unwrap();
+    let mut app = App::new();
+    app.mount("/api", api).unwrap();
+    app.mount("/admin", admin).unwrap();
+    let client = TestClient::new(app);
+
+    let preflight = client
+        .request("OPTIONS", "/api/items")
+        .header("origin", "https://app.example")
+        .header("access-control-request-method", "GET")
+        .send()
+        .await;
+    assert_eq!(
+        preflight
+            .headers
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "https://app.example"
+    );
+    let not_allowed = client.request("DELETE", "/api/items").send().await;
+    assert_eq!(not_allowed.status, 405);
+
+    let probe = client.request("DELETE", "/admin/users").send().await;
+    assert_eq!(probe.status, 403, "a guard must not leak routes via 405");
+    assert!(probe.headers.get(ALLOW).is_none());
+}
+
+// OWASP session management: rotate the id when privilege changes (login) so
+// a fixated pre-login id is useless afterwards.
+#[tokio::test]
+async fn sessions_regenerate_rotates_the_id_and_keeps_the_data() {
+    fn cookie_pair(response: &Response) -> String {
+        response
+            .headers
+            .get(SET_COOKIE)
+            .expect("session cookie")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    let sessions = Sessions::new(TEST_SESSION_SECRET);
+    let mut app = App::new();
+    app.layer(sessions.middleware());
+    let writer = sessions.clone();
+    app.get("/cart", move |req: Request| {
+        writer
+            .set(req.session_id().unwrap(), "cart", "3 items")
+            .unwrap();
+        Response::send("ok")
+    })
+    .unwrap();
+    let login = sessions.clone();
+    app.get("/login", move |req: Request| {
+        let id = login.regenerate(req.session_id().unwrap()).unwrap();
+        login.set(&id, "user", "ada").unwrap();
+        Response::send("logged in")
+    })
+    .unwrap();
+    let reader = sessions.clone();
+    app.get("/whoami", move |req: Request| {
+        let id = req.session_id().unwrap();
+        Response::send(&format!(
+            "{}|{}",
+            reader.get(id, "user").unwrap_or_default(),
+            reader.get(id, "cart").unwrap_or_default()
+        ))
+    })
+    .unwrap();
+    let client = TestClient::new(app);
+
+    let before = cookie_pair(&client.get("/cart").send().await);
+    let login_response = client.get("/login").header("cookie", &before).send().await;
+    let after = cookie_pair(&login_response);
+    assert_ne!(before, after, "login must issue a new session id");
+
+    let current = client.get("/whoami").header("cookie", &after).send().await;
+    assert_eq!(current.body_text(), "ada|3 items");
+    let fixated = client.get("/whoami").header("cookie", &before).send().await;
+    assert_eq!(fixated.body_text(), "|", "the old id must no longer work");
+    assert_eq!(sessions.len(), 1);
 }

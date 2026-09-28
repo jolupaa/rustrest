@@ -47,6 +47,8 @@ pub struct Request {
     /// All inbound header (lowercased-name, value) pairs in arrival order,
     /// preserving duplicates that the convenience `headers` map collapses.
     pub(crate) header_pairs: Vec<(String, String)>,
+    /// Set only by the `Sessions` middleware; never derived from input.
+    pub(crate) session_id: Option<String>,
 }
 
 impl Request {
@@ -754,6 +756,7 @@ impl RequestBuilder {
             remote_addr: self.remote_addr,
             secure_transport: self.secure_transport,
             header_pairs,
+            session_id: None,
         }
     }
 }

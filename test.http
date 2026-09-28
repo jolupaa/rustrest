@@ -1,6 +1,13 @@
-GET  http://localhost:3000
+### Root
+GET http://localhost:3000/
+
+### Typed JSON body
+POST http://localhost:3000/saludo
 Content-Type: application/json
 
 {
-    "hola": "caca"
+    "nombre": "Ada"
 }
+
+### Router mounted under /api
+GET http://localhost:3000/api/users

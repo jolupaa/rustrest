@@ -80,23 +80,24 @@ RustRest uses Rust edition 2024 and requires Rust `1.85` or newer.
 
 ### Cargo features
 
-All optional, disabled by default. The feature names introduced in `0.3.0` are mostly compatibility
-markers for the upcoming modularization work; current default source compatibility is preserved.
+All optional, disabled by default. Only `tls`, `tracing`, and `brotli` change
+what is compiled today. The other names are **reserved** for the planned
+modularization: enabling or disabling them currently has no effect, and every
+surface they name is always available.
 
-| Feature        | Adds / marks                                                         |
+| Feature        | Effect                                                               |
 | -------------- | -------------------------------------------------------------------- |
 | `tls`          | HTTPS via rustls: `app.listen_tls(...)` + `rustrest::tls::config_from_pem` |
-| `tracing`      | `middleware::trace()` emitting structured spans/events per request   |
+| `tracing`      | `middleware::trace()` spans, and RustRest's own diagnostics go to `tracing` (target `rustrest`) instead of stderr |
 | `brotli`       | Brotli support in `middleware::compression()`                        |
-| `compression`  | Compression middleware surface                                       |
-| `multipart`    | Multipart request parsing surface                                    |
-| `static-files` | Static file serving surface                                          |
-| `sse`          | Server-Sent Events surface                                           |
-| `websocket`    | WebSocket surface                                                    |
-| `openapi`      | OpenAPI and docs routes surface                                      |
-| `sessions`     | Signed values and in-memory sessions surface                         |
-| `metrics`      | Reserved for upcoming metrics/observability work                     |
-| `full`         | Enables all named feature flags plus optional integrations           |
+| `compression`, `multipart`, `static-files`, `sse`, `websocket`, `openapi`, `sessions`, `metrics` | Reserved; no effect yet |
+| `full`         | Enables all of the above                                             |
+
+Without the `tracing` feature, server-side failures (5xx handler errors,
+panics, accept errors, unexpected connection errors) are written to stderr.
+Routine client behavior—4xx results, disconnects, failed TLS handshakes, and
+protocol mismatches—is not logged, so clients cannot flood the logs; enable
+`tracing` to see those events at `debug` level.
 
 ```toml
 rustrest = { version = "0.3", features = ["tls", "tracing"] }
@@ -163,8 +164,8 @@ use rustrest::{App, Router, Request, Response};
 Request flow:
 
 1. `App::listen` accepts TCP connections.
-2. RustRest performs the raw HTTP/1 framing preflight (HTTP/2 is replayed
-   transparently).
+2. RustRest detects HTTP/1 or HTTP/2 and, for HTTP/1, classifies every raw
+   request head before Hyper parses it.
 3. Hyper parses the HTTP request.
 4. RustRest validates the request head and builds a `Request`.
 5. `Router` finds the most specific matching route through a trie index.
@@ -176,7 +177,18 @@ Request flow:
 
 Route registration returns `Result<RouteHandle, RouteError>` so invalid patterns,
 duplicate/conflicting routes, duplicate names, and invalid host constraints fail
-at startup instead of becoming runtime surprises.
+at startup instead of becoming runtime surprises. `RouteError` converts into
+`std::io::Error` (`InvalidInput`), so `?` works in a `main` that returns
+`std::io::Result<()>`:
+
+```rust
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let mut app = App::new();
+    app.get("/", |_req: Request| Response::send("home"))?;
+    app.listen("127.0.0.1:3000").await
+}
+```
 
 ```rust
 let mut app = App::new();
@@ -215,9 +227,11 @@ Parameter and wildcard names must be non-empty ASCII letters, digits,
 underscores, or hyphens; duplicate parameter names are rejected, and a
 wildcard must be the final segment. Registration, mounting, and incoming
 matching are all capped at 256 path segments. Trie lookup is iterative, so a
-deep path within that bound cannot exhaust the call stack. Automatic `HEAD`
-fallback and `Allow` only consider ordinary HTTP `GET` routes, never a
-WebSocket-only route.
+deep path within that bound cannot exhaust the call stack. A `GET` route also
+answers `HEAD` at its own specificity (RFC 9110 §9.3.2): an explicit `HEAD`
+route wins, but a less specific wildcard, `all()` route, fallback, or static
+mount never shadows it. Automatic `HEAD` and `Allow` only consider ordinary
+HTTP `GET` routes, never a WebSocket-only route.
 
 ### Trailing Slashes
 
@@ -364,32 +378,45 @@ app.tls_handshake_timeout(Duration::from_secs(5));
 `disable_http2_keep_alive()`, and `disable_connection_limit()` are explicit
 escape hatches for endpoints or trusted deployments that assume those budgets
 elsewhere. The request deadline ends when the handler returns, so it does not
-cap the lifetime of a response stream. The connection limit includes TLS
+cap the lifetime of a response stream. When it expires, the handler is
+cancelled and a `408` travels back out through the route, router, and global
+middleware and the error handler, so CORS and request-id headers are still
+applied. Disabling the header-read timeout also removes the bound on idle
+HTTP/1 keep-alive connections. `max_connections(0)` is rejected when serving
+starts (use `disable_connection_limit()` for no limit); at the limit, new
+connections are closed immediately. The connection limit includes TLS
 handshakes and upgraded connections. When the graceful deadline expires,
 remaining plaintext, TLS-handshake, HTTP, pending-upgrade, and WebSocket tasks
 are aborted.
 
-For strict request-smuggling resistance, RustRest inspects the complete first
-raw HTTP/1 head (including Hyper-compatible leading empty lines) and rejects
-any request containing both `Transfer-Encoding` and `Content-Length`, in either
-field order, before Hyper or application code sees it. Ordinary HTTP/1
-connections intentionally serve exactly one request and then close, so this
-raw framing check protects every request without reimplementing Hyper's body
-parser. This is a compatibility and throughput tradeoff: use HTTP/2 when
-upstream connection multiplexing matters.
+HTTP/1.1 connections are persistent (RFC 9112 §9.3) and pipelined requests
+are answered in order. For strict request-smuggling resistance, RustRest parses
+every raw HTTP/1 request head on a connection with `httparse`, the parser Hyper
+uses, before Hyper reads it. Hyper silently discards a `Content-Length` that
+follows `Transfer-Encoding`, so this raw view is the only place the ambiguity
+is visible: any request containing both fields, in either order and on any
+request of the connection, is rejected with `400 ambiguous_message_framing`
+and the connection is closed (RFC 9112 §6.1). The inspector follows
+`Content-Length` framing to find the next head; a request whose successor it
+does not track—one carrying `Transfer-Encoding` (a chunked upload), `Upgrade`,
+or `CONNECT`, or a head it cannot parse—is answered with `Connection: close`,
+so Hyper never parses a head the inspector did not see. The header-read
+deadline also bounds how long a persistent connection may stay idle between
+requests.
 
 Prior-knowledge HTTP/2 must deliver the full client preface and initial
 `SETTINGS` frame within the same deadline. Under TLS, ALPN selects one strict
 protocol path: negotiated `h2` is never handed to an HTTP/1 parser, and
 `http/1.1` (or no ALPN) is never interpreted as HTTP/2.
 
-WebSocket candidates use a separate upgrade-capable HTTP/1 path. A successful
-`101 Switching Protocols` keeps the upgraded connection; a rejected or
-unsuccessful candidate is forced closed and cannot be used to pipeline another
-HTTP request. HTTP/2 multiplexing is unaffected.
+A successful WebSocket `101 Switching Protocols` keeps the upgraded
+connection; any other response to a request carrying `Upgrade` closes the
+connection, so it cannot be used to pipeline another HTTP request. HTTP/2
+multiplexing is unaffected.
 
-The raw framing preflight and Hyper parser errors occur before middleware; the
-framing preflight emits a fixed Spanish problem response. Once Hyper has parsed
+Framing rejections and Hyper parser errors occur before middleware and bypass
+the custom error handler; framing rejections use a fixed Spanish problem
+response. Once Hyper has parsed
 the request, request-target/query/logical-header/authority limits use the
 global error renderer but still do not enter middleware. Routing errors such
 as invalid percent encoding, and framework-level `Content-Length` validation
@@ -450,6 +477,12 @@ req.last_event_id();      // SSE reconnection header
 req.is_websocket_upgrade();
 req.websocket(|socket| async move { ... });
 ```
+
+`req.path` is the raw request path. Routing percent-decodes segments and
+ignores empty ones, so `/%61dmin/users` and `//admin/users` both reach
+`/admin/users`. Do not authorize with string checks such as
+`req.path.starts_with("/admin")`; scope the check with `Router::guard` or
+router middleware, or compare the matched route pattern.
 
 `header()` is a collapsed convenience view. Use `headers_all()` for
 list-valued or intentionally repeatable fields, and
@@ -537,8 +570,11 @@ app.post("/typed/users/:id", create_user).unwrap();
 It converts an error to `None` only when `E::Rejection` implements
 `OptionalRejection` and `is_missing()` returns `true`; malformed input,
 unsupported media types, and body-limit failures such as `413` propagate to
-the error handler. RustRest's `HttpError` implementation treats only
-`missing_header` as absence. Custom rejection types are conservative by
+the error handler. RustRest's built-in extractors mark only genuine absence:
+a missing header, extension, state value, or matched path; no query string at
+all for `Query<T>`; and, for `Json<T>`/`Form<T>`, a request with neither a
+`Content-Type` nor a body. Build such rejections with `HttpError::missing()`.
+Custom rejection types are conservative by
 default and should opt in only for a genuine, safe absence. Use `Result<E,
 E::Rejection>` when the handler intentionally needs to inspect every
 rejection.
@@ -691,6 +727,16 @@ past those bounds:
 sessions.set(session_id, "usuario", "42")?;
 ```
 
+Rotate the id whenever privilege changes, typically right after login, so an
+id planted before authentication (session fixation) becomes useless. Data is
+carried over, the old id stops working immediately, and the middleware sends
+the new cookie with the same response:
+
+```rust
+let id = sessions.regenerate(req.session_id().unwrap())?;
+sessions.set(&id, "usuario", "42")?;
+```
+
 Access extends the server-side idle deadline. Middleware revalidates and
 renews the session when the response is ready, then reissues the signed cookie
 with a matching, upward-rounded `Max-Age`. A presented session that expired or
@@ -723,6 +769,12 @@ routes should remain outside the session scope.
 Response::redirect("/login")
 Response::redirect_with_status("/new", 301)
 ```
+
+Like Express's `res.redirect`, the `Location` value is percent-encoded where
+it is not a valid URI reference (spaces, non-ASCII text), while existing
+`%XX` escapes are kept: `/café` becomes `/caf%C3%A9`. A status outside
+`300..=399` is a construction error rendered as `500`. The value is otherwise
+used as given, so never redirect to unvalidated user input (open redirect).
 
 ### Common Errors
 
@@ -819,7 +871,16 @@ error responses follow the same `HEAD` rule.
 
 ## Middleware
 
-Middleware receives `Request` and `Next`.
+Middleware receives `Request` and `Next`. A closure passed straight to
+`layer` must annotate `next: Next`; `middleware::from_fn` infers both types:
+
+```rust
+use rustrest::middleware;
+
+app.layer(middleware::from_fn(|req, next| async move {
+    next(req).await.header("x-powered-by", "rustrest")
+}));
+```
 
 ```rust
 use rustrest::{Next, Request, Response};
@@ -854,7 +915,11 @@ router.get("/health", |_req: Request| Response::send("ok")).unwrap();
 app.mount("/api", router).unwrap();
 ```
 
-That middleware only runs for routes under `/api`.
+That middleware only runs for routes under `/api`, including the automatic
+`OPTIONS` and `405 Method Not Allowed` responses for those routes' paths (so
+a router-level `Cors` handles preflights and a router guard cannot be probed
+through `405`). It does not run for `404`s under the prefix; register global
+middleware for behavior that must cover every request.
 
 ### Built-In Middleware
 
@@ -882,12 +947,17 @@ last. Register `etag()` before `compression()` so the validator is calculated
 from the final content-coded bytes; compression removes validators that describe
 the unencoded representation.
 
-- `tracing`: prints method, path, and status.
+- `tracing`: prints method, path, and status to stdout (a plain logger,
+  unrelated to the `tracing` crate); `trace()` (with the `tracing` feature)
+  emits structured spans instead.
 - `request_id`: propagates exactly one non-empty, printable-ASCII
   `x-request-id` up to 128 bytes; duplicate, control-containing, whitespace,
   non-ASCII, empty, or oversized input is replaced with a generated ID.
 - `cors`: adds permissive CORS headers (see the configurable `Cors` builder
-  for allowlists, credentials, and preflight). Configurable responses include
+  for allowlists, credentials, and preflight). `allow_any_origin()` together
+  with `allow_credentials(true)` echoes any requesting origin, which lets every
+  site make credentialed requests; prefer an allowlist. The opaque `null`
+  origin is never granted in that mode. Configurable responses include
   `Vary: Origin` whenever the result can depend on the origin—even when it is
   denied—and preflights also vary by
   `Access-Control-Request-Method`/`Access-Control-Request-Headers`. `Origin`
@@ -988,7 +1058,9 @@ capability-relative: `..`, absolute paths, symlink escapes, and path-swap races
 cannot leave that root. Dotfiles are denied with `404` by default; use
 `StaticFilesOptions` and `Dotfiles::Allow` only for an intentional public
 mount. Blocking filesystem open/metadata work runs outside Tokio's async
-workers under bounded admission. A supervised, one-chunk producer retains the
+workers under bounded admission: at most 256 static files are open or
+streaming across the process, and a request that cannot be admitted within
+two seconds receives `503` with `Retry-After` instead of waiting. A supervised, one-chunk producer retains the
 file descriptor and admission permit only while the transport is progressing:
 the body is lazy, an entirely unpolled body expires after one minute, and the
 safe defaults close an active producer after 15 seconds stalled or five
@@ -1043,7 +1115,10 @@ app.error_handler(|err: HttpError| {
 
 Deserializer and internal handler details are retained as private error
 sources rather than copied into public problem responses. If the custom error
-handler itself panics, RustRest falls back to a generic `500`.
+handler itself panics, RustRest falls back to a generic `500`. Headers added
+to an error response after `Response::from_error` (for example
+`WWW-Authenticate` on a `401`, `Set-Cookie`, or `Cache-Control`) and an
+explicit `.status(..)` override are kept when the error handler renders it.
 
 ## OpenAPI & Docs UI
 
@@ -1410,7 +1485,10 @@ The project includes:
   under `tests/`.
 - Five fuzz targets, including route-pattern and path matching.
 
-`Request::builder()` and `TestClient` mirror network normalization closely.
+`Request::builder()` and `TestClient` mirror network normalization closely,
+but they run in-process: transport checks (request-target, query, header
+count/size limits, `Host` validation, raw framing) only happen on real
+connections, so cover those with socket tests.
 `RequestBuilder::path("/items?page=2")` splits path and query, while a later
 `.path("/items")` clears the previous query. Repeated `Cookie` headers are
 processed in arrival order and the last duplicate cookie name wins, as on the
@@ -1499,8 +1577,10 @@ tests/
 
 - Request body helpers and body extractors buffer on demand under configurable limits; multipart
   parsing has per-part limits but does not stream individual parts.
-- Ordinary HTTP/1 connections close after one response by design; use HTTP/2
-  or an edge proxy when upstream multiplexing/reuse is required.
+- HTTP/1 requests with a chunked (`Transfer-Encoding`) body are served and then
+  close their connection, because the raw-head inspector does not decode
+  chunked framing to find the next request. `Content-Length` uploads keep the
+  connection persistent.
 - HTTP/2 keepalive closes unresponsive peers, but a responsive idle peer can
   retain a global connection permit. Keep the finite connection cap enabled
   and enforce per-IP/idle policy at the edge until the framework can add a

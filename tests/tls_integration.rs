@@ -275,6 +275,42 @@ async fn tls_raw_preflight_rejects_ambiguous_http1_framing() {
 }
 
 #[tokio::test]
+async fn tls_http1_connections_persist_and_still_reject_ambiguous_framing() {
+    let fixture = TlsFixture::new("persistent-http1");
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let mut app = App::new();
+    app.get("/secure", |_req: Request| Response::send("seguro"))
+        .unwrap();
+    let dispatches_for_handler = Arc::clone(&dispatches);
+    app.post("/upload", move |_req: Request| {
+        dispatches_for_handler.fetch_add(1, Ordering::SeqCst);
+        Response::send("unexpected")
+    })
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(app.serve_tls(listener, fixture.server_config()));
+    let mut tls = fixture.tls_stream(addr).await;
+
+    // Hidden Content-Length (after Transfer-Encoding) on the third request of
+    // a persistent connection.
+    tls.write_all(
+        b"GET /secure HTTP/1.1\r\nHost: localhost\r\n\r\nGET /secure HTTP/1.1\r\nHost: localhost\r\n\r\nPOST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n0\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let response = String::from_utf8(read_tls_until_closed(&mut tls).await).unwrap();
+    server.abort();
+
+    assert_eq!(response.matches("HTTP/1.1 200").count(), 2, "{response}");
+    assert_eq!(response.matches("seguro").count(), 2, "{response}");
+    let rejected = &response[response.rfind("HTTP/1.1").unwrap()..];
+    assert!(rejected.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(rejected.contains("ambiguous_message_framing"), "{response}");
+    assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn tls_honors_http1_header_read_timeout() {
     let fixture = TlsFixture::new("header-timeout");
     let mut app = App::new();
