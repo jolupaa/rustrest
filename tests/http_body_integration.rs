@@ -493,7 +493,7 @@ async fn http1_leading_empty_lines_cannot_hide_ambiguous_framing() {
 }
 
 #[tokio::test]
-async fn http1_connection_closes_before_a_pipelined_ambiguous_request() {
+async fn http1_pipelined_ambiguous_request_is_rejected_and_closes_the_connection() {
     let second_handler_runs = Arc::new(AtomicUsize::new(0));
     let mut app = App::new();
     let _ = app.get("/first", |_req: Request| Response::send("primera"));
@@ -512,12 +512,20 @@ async fn http1_connection_closes_before_a_pipelined_ambiguous_request() {
         .await
         .unwrap();
 
+    // The first request keeps the connection persistent; the pipelined head is
+    // classified independently, rejected, and ends the connection.
     let response = read_response(&mut stream).await.unwrap();
     shutdown_server(shutdown, server).await;
 
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    assert!(response.to_ascii_lowercase().contains("connection: close"));
-    assert_eq!(response.matches("HTTP/1.1").count(), 1, "{response}");
+    assert_eq!(response.matches("HTTP/1.1").count(), 2, "{response}");
+    let rejected = &response[response.rfind("HTTP/1.1").unwrap()..];
+    assert!(rejected.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(
+        rejected.contains(r#""code":"ambiguous_message_framing""#),
+        "{response}"
+    );
+    assert!(rejected.to_ascii_lowercase().contains("connection: close"));
     assert!(!response.contains("segunda"), "{response}");
     assert_eq!(second_handler_runs.load(Ordering::SeqCst), 0);
 }

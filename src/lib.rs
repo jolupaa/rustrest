@@ -23,6 +23,15 @@
 
 pub mod app;
 
+/// The typed-header crate behind [`TypedHeader`].
+pub use headers;
+/// The byte buffer used for request and response bodies.
+pub use hyper::body::Bytes;
+/// The `http` crate version used by RustRest's public types (`Method`,
+/// `StatusCode`, `HeaderMap`, `HeaderName`, `HeaderValue`, `Uri`, ...).
+/// Importing it from here keeps application code on a matching version.
+pub use hyper::http;
+
 #[cfg(feature = "tls")]
 pub use app::tls;
 pub use app::{

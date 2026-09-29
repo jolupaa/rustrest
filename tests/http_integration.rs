@@ -699,3 +699,62 @@ async fn websocket_only_get_does_not_implicitly_serve_head() {
         .unwrap();
     assert_eq!(options_allow, "GET, OPTIONS");
 }
+
+// RFC 9110 §5.5: field values may carry obs-text. A UTF-8 cookie set by a
+// sibling application on the parent domain must not break every request.
+#[tokio::test]
+async fn utf8_header_values_are_accepted_and_preserved() {
+    let mut app = App::new();
+    app.get("/city", |req: Request| {
+        Response::send(&format!(
+            "{}|{}|{}",
+            req.cookie("city").unwrap_or("-"),
+            req.cookie("sid").unwrap_or("-"),
+            req.header("x-name").unwrap_or("-")
+        ))
+    })
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(app.serve(listener));
+
+    let response = raw_exchange(
+        addr,
+        "GET /city HTTP/1.1\r\nHost: localhost\r\nCookie: city=Zürich; sid=abc\r\nX-Name: José\r\nConnection: close\r\n\r\n"
+            .as_bytes(),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with("Zürich|abc|José"), "{response}");
+
+    // Bytes that are not UTF-8 are still rejected rather than silently erased.
+    let mut invalid = b"GET /city HTTP/1.1\r\nHost: localhost\r\nX-Name: ".to_vec();
+    invalid.extend_from_slice(&[0xE9]);
+    invalid.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
+    let response = raw_exchange(addr, &invalid).await;
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    server.abort();
+}
+
+// RFC 9110 §9.3.7: `OPTIONS *` asks about the server as a whole; it must not
+// be routed like a path (nor reach a fallback with `path = "*"`).
+#[tokio::test]
+async fn asterisk_options_is_answered_by_the_server() {
+    let mut app = App::new();
+    app.get("/", |_req: Request| Response::send("home"))
+        .unwrap();
+    app.fallback(|_req: Request| Response::send("fallback").status(404))
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(app.serve(listener));
+
+    let response = raw_exchange(
+        addr,
+        b"OPTIONS * HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 204"), "{response}");
+    assert!(!response.contains("fallback"), "{response}");
+    server.abort();
+}

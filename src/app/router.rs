@@ -13,6 +13,7 @@ use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use futures_util::Stream;
 use hyper::body::Bytes;
+use hyper::header::{HeaderValue, RETRY_AFTER};
 use hyper::{Method, StatusCode};
 use percent_encoding::percent_decode_str;
 use tokio::sync::{Semaphore, mpsc, oneshot};
@@ -26,7 +27,13 @@ use super::{
 
 pub(crate) const METHOD_ALL: &str = "*";
 const MAX_PATH_SEGMENTS: usize = 256;
-const STATIC_OPEN_CONCURRENCY: usize = 64;
+/// Process-wide cap on static files being opened or streamed. Each admitted
+/// response holds one permit until its body finishes or a stream deadline
+/// expires.
+const STATIC_OPEN_CONCURRENCY: usize = 256;
+/// How long a request waits for a static-file permit before `503`, so clients
+/// that stop reading cannot make every other static request hang.
+const STATIC_ADMISSION_WAIT: Duration = Duration::from_secs(2);
 const STATIC_STREAM_CHANNEL_CAPACITY: usize = 1;
 const DEFAULT_STATIC_STREAM_START_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_STATIC_STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -130,6 +137,14 @@ impl Display for RouteError {
 }
 
 impl Error for RouteError {}
+
+/// Lets `?` propagate registration errors from functions returning
+/// `std::io::Result`, such as a `main` that ends in `app.listen(..)`.
+impl From<RouteError> for std::io::Error {
+    fn from(error: RouteError) -> Self {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+    }
+}
 
 /// Stable classification for failures encountered while matching an incoming path.
 ///
@@ -384,6 +399,9 @@ struct Route {
     pattern: RoutePattern,
     handler: Handler,
     middlewares: Vec<Middleware>,
+    /// How many trailing entries of `middlewares` were added with
+    /// `RouteHandle::layer` (the rest come from mounted routers).
+    route_layers: usize,
     kind: RouteKind,
     meta: RouteMeta,
     name: Option<String>,
@@ -962,6 +980,7 @@ impl Router {
             pattern,
             handler: handler.into_handler(),
             middlewares: Vec::new(),
+            route_layers: 0,
             kind,
             meta: RouteMeta::default(),
             name: None,
@@ -1007,6 +1026,7 @@ impl Router {
                 pattern,
                 handler: route.handler,
                 middlewares,
+                route_layers: route.route_layers,
                 kind: route.kind,
                 meta: route.meta,
                 name: route.name,
@@ -1131,6 +1151,13 @@ impl Router {
             if !host_matches(route.host.as_ref(), host) {
                 continue;
             }
+            // HEAD may borrow a GET route, but never a WebSocket-only one.
+            if method == "HEAD"
+                && route.method != method
+                && matches!(route.kind, RouteKind::WebSocket(_))
+            {
+                continue;
+            }
             // The index only returns routes whose pattern matches these
             // segments structurally, so `None` here is defensive.
             let Some(params) = match_decoded_pattern(route.pattern.segments(), &segments) else {
@@ -1212,6 +1239,43 @@ impl Router {
     /// pattern matches `path` (ignoring the request method), in registration
     /// order. Used to build the `Allow` header for 405/OPTIONS responses.
     /// `*` (catch-all) is excluded.
+    /// The router-scoped middleware (without route-level layers) of the most
+    /// specific ordinary route matching `path`, used for the OPTIONS and 405
+    /// responses synthesized for that path so router CORS and guards apply.
+    pub(crate) fn scoped_middlewares(
+        &self,
+        path: &str,
+        host: Option<&str>,
+    ) -> Result<Vec<Middleware>, RouteMatchError> {
+        let segments = decode_path_segments(path)?;
+        let mut best: Option<(Vec<u8>, usize)> = None;
+        for (index, method) in self.index().matching_methods(&segments) {
+            let route = &self.routes[index];
+            if method == METHOD_ALL
+                || !host_matches(route.host.as_ref(), host)
+                || match_decoded_pattern(route.pattern.segments(), &segments).is_none()
+            {
+                continue;
+            }
+            let specificity = pattern_specificity(route.pattern.segments());
+            let better = match &best {
+                None => true,
+                Some((current, current_index)) => {
+                    specificity > *current || (specificity == *current && index < *current_index)
+                }
+            };
+            if better {
+                best = Some((specificity, index));
+            }
+        }
+        Ok(best
+            .map(|(_, index)| {
+                let route = &self.routes[index];
+                route.middlewares[..route.middlewares.len() - route.route_layers].to_vec()
+            })
+            .unwrap_or_default())
+    }
+
     pub(crate) fn allowed_methods(
         &self,
         path: &str,
@@ -1369,12 +1433,24 @@ where
             Segment::Static(value) => out.push_str(&encode_path_segment(value)),
             Segment::Param(name) => {
                 let value = params.get(name).expect("checked above");
+                // An empty segment disappears during routing, so the URL
+                // would silently target a different route.
+                if value.is_empty() {
+                    return Err(RouteError::new(
+                        RouteErrorKind::MissingUrlParameter,
+                        format!("El parametro de URL {name} no puede estar vacio"),
+                    ));
+                }
                 out.push_str(&encode_path_segment(value));
             }
             Segment::Wildcard(name) => {
                 let value = params.get(name).expect("checked above");
+                // Empty segments are ignored by routing; dropping them also
+                // keeps a leading `/` in the value from producing a
+                // scheme-relative `//host` URL.
                 let encoded = value
                     .split('/')
+                    .filter(|segment| !segment.is_empty())
                     .map(encode_path_segment)
                     .collect::<Vec<_>>()
                     .join("/");
@@ -1415,11 +1491,25 @@ fn static_route(
         pattern,
         handler,
         middlewares: Vec::new(),
+        route_layers: 0,
         kind: RouteKind::Http,
         meta: RouteMeta::default(),
         name: None,
         host: None,
     }
+}
+
+/// Orders patterns like routing does: static beats `:param` beats `*wildcard`
+/// segment by segment (lexicographic comparison of the returned keys).
+fn pattern_specificity(segments: &[Segment]) -> Vec<u8> {
+    segments
+        .iter()
+        .map(|segment| match segment {
+            Segment::Static(_) => 2,
+            Segment::Param(_) => 1,
+            Segment::Wildcard(_) => 0,
+        })
+        .collect()
 }
 
 /// Builds an `Allow` header value from the matched methods, implicitly adding
@@ -1497,14 +1587,16 @@ impl RouteHandle<'_> {
     /// Adds a middleware that wraps only this route. Repeated calls stack, with
     /// the first-added middleware outermost.
     pub fn layer<MW: IntoMiddleware>(self, middleware: MW) -> Self {
-        self.router.routes[self.index]
-            .middlewares
-            .push(middleware.into_middleware());
+        let route = &mut self.router.routes[self.index];
+        route.middlewares.push(middleware.into_middleware());
+        route.route_layers += 1;
         self
     }
 
     /// Sets the maximum request body size for this route. The application-level
-    /// maximum remains a hard ceiling.
+    /// [`App::max_body_size`](super::App::max_body_size) (64 KiB by default)
+    /// remains a hard ceiling: a larger value here is silently clamped to it,
+    /// so raise the application ceiling first for upload routes.
     pub fn body_limit(self, bytes: usize) -> Self {
         self.router.routes[self.index].meta.body_limit = Some(bytes);
         self
@@ -1582,6 +1674,24 @@ fn join_paths(prefix: &str, suffix: &str) -> String {
     }
 }
 
+async fn acquire_static_permit(
+    admission: Arc<Semaphore>,
+    wait: Duration,
+) -> Result<tokio::sync::OwnedSemaphorePermit, Box<Response>> {
+    match tokio::time::timeout(wait, admission.acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(Box::new(Response::internal_server_error())),
+        Err(_) => Err(Box::new(Response::from_error(
+            HttpError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "static_files_busy",
+                "El servidor de archivos estaticos esta ocupado",
+            )
+            .header(RETRY_AFTER, HeaderValue::from_static("1")),
+        ))),
+    }
+}
+
 async fn serve_static_file(root: Arc<Dir>, req: Request, options: StaticFilesOptions) -> Response {
     let relative = match safe_static_relative(req.param("path").unwrap_or(""), options.dotfiles) {
         Ok(relative) => relative,
@@ -1591,9 +1701,9 @@ async fn serve_static_file(root: Arc<Dir>, req: Request, options: StaticFilesOpt
     let admission = Arc::clone(
         STATIC_OPEN_ADMISSION.get_or_init(|| Arc::new(Semaphore::new(STATIC_OPEN_CONCURRENCY))),
     );
-    let permit = match admission.acquire_owned().await {
+    let permit = match acquire_static_permit(admission, STATIC_ADMISSION_WAIT).await {
         Ok(permit) => permit,
-        Err(_) => return Response::internal_server_error(),
+        Err(response) => return *response,
     };
     let opened =
         tokio::task::spawn_blocking(move || (open_static_file(&root, relative), permit)).await;
@@ -2168,6 +2278,31 @@ impl Default for Router {
 mod static_stream_deadline_tests {
     use super::*;
     use futures_util::StreamExt;
+
+    #[tokio::test]
+    async fn exhausted_static_admission_answers_503_instead_of_hanging() {
+        let admission = Arc::new(Semaphore::new(1));
+        let Ok(held) =
+            acquire_static_permit(Arc::clone(&admission), Duration::from_millis(20)).await
+        else {
+            panic!("first permit must be granted");
+        };
+        let started = std::time::Instant::now();
+        let Err(busy) =
+            acquire_static_permit(Arc::clone(&admission), Duration::from_millis(20)).await
+        else {
+            panic!("an exhausted admission must not grant a permit");
+        };
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(busy.status, 503);
+        assert_eq!(busy.headers.get(RETRY_AFTER).unwrap(), "1");
+        drop(held);
+        assert!(
+            acquire_static_permit(admission, Duration::from_millis(20))
+                .await
+                .is_ok()
+        );
+    }
 
     fn test_file(label: &str) -> (PathBuf, Vec<u8>) {
         let unique = std::time::SystemTime::now()

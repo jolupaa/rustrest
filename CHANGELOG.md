@@ -8,6 +8,25 @@ The format follows Keep a Changelog and the project uses Semantic Versioning.
 
 ### Added
 
+- `examples/http_load.rs` (dependency-free HTTP/1.1 keep-alive, per-request
+  connection, and HTTP/2 load generator) and `examples/bench_server.rs`, with
+  results in `docs/benchmarks/http-transport.md`.
+- `Sessions::regenerate`, which moves a session to a fresh id (for example at
+  login) and makes the middleware issue the new cookie, preventing session
+  fixation.
+- `rustrest::http`, `rustrest::Bytes`, and `rustrest::headers` re-exports of
+  the public-dependency types used in RustRest's API.
+- `middleware::from_fn`, which infers a middleware closure's parameter types
+  so `|req, next|` needs no `next: Next` annotation.
+- `impl From<RouteError> for std::io::Error`, so route registration can use
+  `?` inside `main() -> std::io::Result<()>`.
+- `HttpError::missing()`/`HttpError::is_missing()` to mark a rejection as a
+  genuine absence for `Option<E>` extractors.
+- Compiler diagnostics (`#[diagnostic::on_unimplemented]`) that explain valid
+  handler and middleware signatures.
+- `tests/http_persistence.rs` (keep-alive, pipelining, per-request smuggling
+  checks, idle/graceful shutdown, in-flight drain, disconnect cancellation)
+  and `tests/developer_experience.rs`.
 - Server configuration for HTTP/1 header and TLS-handshake deadlines,
   request deadlines, HTTP/2 keepalive, graceful-shutdown deadlines, connection
   admission, request-target/query budgets, and logical request-header
@@ -30,11 +49,36 @@ The format follows Keep a Changelog and the project uses Semantic Versioning.
 
 ### Changed
 
-- Ordinary HTTP/1 connections now serve one request and close so raw framing
-  validation protects every request. WebSocket candidates use a separate
-  upgrade-capable path; unsuccessful upgrades are forced closed. HTTP/2
-  remains multiplexed, with finite concurrent-stream/send-buffer defaults and
-  keepalive PING deadlines.
+- Accepted TCP connections (plaintext and TLS) set `TCP_NODELAY`, so small
+  responses are not delayed by Nagle's algorithm waiting for the peer's
+  delayed ACK (most visible on multiplexed HTTP/2).
+- Internal diagnostics go through `tracing` (target `rustrest`) when that
+  feature is enabled. Expected 4xx handler errors, client disconnects, TLS
+  handshake failures, and protocol mismatches are no longer written to stderr;
+  5xx handler errors now include their private source.
+- The request deadline now cancels the handler *inside* the middleware chain,
+  so the `408` passes through route, router, and global middleware (CORS,
+  request ids) and the error handler.
+- Static-file admission allows 256 concurrent files (was 64) and answers
+  `503` with `Retry-After` after a two-second wait instead of queueing
+  indefinitely behind clients that stop reading.
+- `Response::redirect*` percent-encodes invalid `Location` characters and
+  rejects non-3xx statuses as a construction error.
+- `max_connections(0)` fails at `serve`/`listen` instead of silently dropping
+  every connection.
+- The README's feature table now states that `compression`, `multipart`,
+  `static-files`, `sse`, `websocket`, `openapi`, `sessions`, and `metrics`
+  are reserved and currently have no effect. `AGENTS.md` now defers to
+  `CLAUDE.md`.
+- Every HTTP/1 request head, not only the first on a connection, is now
+  classified from the raw bytes with Hyper's own parser before Hyper reads it.
+  HTTP/1.1 connections stay persistent and pipelined requests are answered in
+  order; a request carrying `Transfer-Encoding`, `Upgrade`, or `CONNECT`, or a
+  head the inspector cannot parse, is answered with `Connection: close`. The
+  header-read deadline also bounds keep-alive idle time. (An intermediate
+  unreleased revision closed every HTTP/1 connection after one response; that
+  throughput regression is gone.) HTTP/2 remains multiplexed, with finite
+  concurrent-stream/send-buffer defaults and keepalive PING deadlines.
 - `App::new()` now applies a 30-second request/body/handler deadline by
   default; `disable_request_timeout()` is the explicit opt-out.
 - Session HMAC secrets now require at least 32 bytes; session cookies carry a
@@ -88,6 +132,37 @@ The format follows Keep a Changelog and the project uses Semantic Versioning.
 
 ### Fixed
 
+- Asterisk-form `OPTIONS *` is answered with `204` through global middleware
+  instead of being routed as the path `*` (404 or the fallback).
+- The demo server (`cargo run`) no longer silently ignores malformed JSON and
+  uses `from_fn` and `?` registration.
+- Router-scoped middleware (`Router::layer`, `Router::guard`) now also wraps
+  the automatic `OPTIONS` and `405` responses for that router's own paths, so
+  a router-level `Cors` answers preflights and a guarded router no longer
+  reveals its routes through `405` + `Allow`. Route-level layers still apply
+  only to their own route.
+- `HEAD` now mirrors `GET` when a less specific wildcard, `all()` route,
+  fallback, or root static mount also matches; previously those shadowed the
+  `GET` route and `HEAD` returned their response (often `404`).
+- A custom `error_handler` no longer drops headers (e.g. `WWW-Authenticate`,
+  `Set-Cookie`) or an explicit status set on a `Response::from_error`.
+- `Option<Extension<T>>`, `Option<State<T>>`, `Option<MatchedPath>`,
+  `Option<Query<T>>` without a query string, and `Option<Json<T>>`/
+  `Option<Form<T>>` without a body are `None` again instead of `500`/`400`/
+  `415` (a regression from the unreleased `OptionalRejection` change).
+- Scalar `Path<T>` parameters are no longer JSON-decoded: quotes stay literal,
+  JSON escapes cannot inject control characters, and `007` parses as `7`.
+- Request field values containing UTF-8 (RFC 9110 obs-text), such as a
+  `Cookie` set by a sibling application, are accepted instead of failing the
+  whole request with `400`; non-UTF-8 bytes are still rejected.
+- `url_for` rejects empty `:param` values and drops empty wildcard segments,
+  so it cannot build a scheme-relative `//host` URL or target another route.
+- `compression()` keeps `Vary: Accept-Encoding` on `304` responses
+  (RFC 9110 §15.4.5).
+- `MatchedPath` is absent for synthesized 404/405/OPTIONS/trailing-slash
+  responses instead of exposing the raw path (unbounded metric cardinality).
+- The `streaming_upload` example raises `max_body_size`; uploads above 64 KiB
+  previously failed with `413`.
 - Duplicate configured session cookies now fail with a structured `400`;
   invalid, expired, or cleared presented sessions are deleted client-side
   rather than reissued when no replacement was persisted.
@@ -214,6 +289,20 @@ The format follows Keep a Changelog and the project uses Semantic Versioning.
 
 ### Security
 
+- Lockfiles now use `h2` 0.4.19 (RUSTSEC-2026-0258, unbounded empty DATA
+  frames) and `rustls` 0.23.45 (RUSTSEC-2026-0285, TLS 1.3 handshake
+  messages across encryption levels).
+- HTTP/1 request smuggling: the `Transfer-Encoding`/`Content-Length` check now
+  covers every request on a persistent connection. A connection is closed
+  after any request whose successor the raw-head inspector does not track,
+  including HTTP/1.0 keep-alive requests (whose response is downgraded to
+  HTTP/1.0 so Hyper cannot re-enable keep-alive), and a head the inspector
+  never classified is refused with `400` rather than served.
+- `req.session_id()` only returns the id assigned by the `Sessions`
+  middleware; outside its scope a client-supplied `x-session-id` header is no
+  longer returned.
+- `Cors::allow_any_origin().allow_credentials(true)` no longer grants the
+  opaque `null` origin.
 - Percent-encoded static route segments and registered static pattern segments
   are decoded and validated before trie lookup, preventing encoded paths from
   bypassing static-over-parameter route precedence or producing duplicate

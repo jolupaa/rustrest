@@ -41,8 +41,16 @@ pub trait OptionalRejection: IntoResponse + Send {
 
 impl OptionalRejection for HttpError {
     fn is_missing(&self) -> bool {
-        self.code() == "missing_header"
+        // `missing_header` predates the typed marker and stays recognized for
+        // rejections built with `HttpError::new`.
+        HttpError::is_missing(self) || self.code() == "missing_header"
     }
+}
+
+/// A body extractor sees no body at all: no `Content-Type` and a transport
+/// size of exactly zero.
+fn body_is_absent(req: &Request) -> bool {
+    req.header("content-type").is_none() && req.body().size_hint().exact() == Some(0)
 }
 
 pub struct Json<T>(pub T);
@@ -65,11 +73,13 @@ where
     type Rejection = HttpError;
 
     async fn from_request(req: &mut Request) -> Result<Self, Self::Rejection> {
+        let absent = body_is_absent(req);
         require_content_type(
             req.singleton_header("content-type")?,
             is_json_content_type,
             "application/json",
-        )?;
+        )
+        .map_err(|error| if absent { error.missing() } else { error })?;
         serde_json::from_slice(&req.bytes().await?)
             .map(Json)
             .map_err(|err| HttpError::invalid_json().with_source(err))
@@ -83,11 +93,13 @@ where
     type Rejection = HttpError;
 
     async fn from_request(req: &mut Request) -> Result<Self, Self::Rejection> {
+        let absent = body_is_absent(req);
         require_content_type(
             req.singleton_header("content-type")?,
             |value| value.eq_ignore_ascii_case("application/x-www-form-urlencoded"),
             "application/x-www-form-urlencoded",
-        )?;
+        )
+        .map_err(|error| if absent { error.missing() } else { error })?;
         super::form::deserialize_form(&req.bytes().await?).map(Form)
     }
 }
@@ -126,15 +138,22 @@ where
     type Rejection = HttpError;
 
     async fn from_request_parts(parts: &mut RequestParts<'_>) -> Result<Self, Self::Rejection> {
-        serde_html_form::from_str(parts.raw_query().unwrap_or(""))
+        let raw_query = parts.raw_query().unwrap_or("");
+        serde_html_form::from_str(raw_query)
             .map(Query)
             .map_err(|err| {
-                HttpError::new(
+                let error = HttpError::new(
                     StatusCode::BAD_REQUEST,
                     "invalid_query",
                     "La cadena de consulta no es valida",
                 )
-                .with_source(err)
+                .with_source(err);
+                // No query string at all is an absence, not malformed input.
+                if raw_query.is_empty() {
+                    error.missing()
+                } else {
+                    error
+                }
             })
     }
 }
@@ -149,7 +168,7 @@ where
         parts
             .state::<T>()
             .map(State)
-            .ok_or_else(|| HttpError::internal_server_error("State not found"))
+            .ok_or_else(|| HttpError::internal_server_error("State not found").missing())
     }
 }
 
@@ -200,7 +219,7 @@ impl FromRequestParts for MatchedPath {
         parts
             .matched_path()
             .map(|path| MatchedPath(path.to_string()))
-            .ok_or_else(|| HttpError::internal_server_error("Matched path not available"))
+            .ok_or_else(|| HttpError::internal_server_error("Matched path not available").missing())
     }
 }
 
@@ -230,7 +249,7 @@ where
         parts
             .extension::<T>()
             .map(|value| Extension((*value).clone()))
-            .ok_or_else(|| HttpError::internal_server_error("Extension not found"))
+            .ok_or_else(|| HttpError::internal_server_error("Extension not found").missing())
     }
 }
 
@@ -248,7 +267,8 @@ where
                 StatusCode::BAD_REQUEST,
                 "missing_header",
                 format!("Falta el encabezado {}", name.as_str()),
-            ));
+            )
+            .missing());
         }
 
         let values = raw_values
@@ -379,10 +399,21 @@ where
     }
 }
 
+/// Deserializes one path parameter as a scalar through the same string-based
+/// deserializer used for struct parameters. The segment is data, never a JSON
+/// document: quotes stay literal and escapes cannot introduce control
+/// characters that routing rejected.
 fn deserialize_scalar<T: DeserializeOwned>(raw: &str) -> Option<T> {
-    serde_json::from_str(raw)
+    #[derive(serde::Deserialize)]
+    #[serde(bound = "T: DeserializeOwned")]
+    struct Scalar<T> {
+        value: T,
+    }
+
+    let encoded = serde_urlencoded::to_string([("value", raw)]).ok()?;
+    serde_urlencoded::from_str::<Scalar<T>>(&encoded)
         .ok()
-        .or_else(|| serde_json::from_value(serde_json::Value::String(raw.to_string())).ok())
+        .map(|scalar| scalar.value)
 }
 
 fn deserialize_string_map<T: DeserializeOwned>(

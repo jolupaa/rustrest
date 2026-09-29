@@ -25,6 +25,9 @@ const DEFAULT_MAX_SESSION_VALUE_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_SESSION_DATA_BYTES: usize = 64 * 1024;
 const SESSION_STORE_SHARDS: usize = 16;
 const STORE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+/// A rotation is consumed by the middleware of the same request; records the
+/// middleware never sees (rotation outside its scope) expire quickly.
+const ROTATION_RECORD_TTL: Duration = Duration::from_secs(60);
 const STORE_CLEANUP_BATCH: usize = 256;
 const CONFIGURATION_PANIC: &str =
     "session configuration failed; configure Sessions before cloning it or registering middleware";
@@ -152,6 +155,8 @@ struct SessionStore {
     shards: Vec<Mutex<SessionShard>>,
     entries: AtomicUsize,
     maintenance: Mutex<StoreMaintenance>,
+    /// Old id -> (new id, rotated at), for the middleware to reissue cookies.
+    rotations: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 impl SessionStore {
@@ -165,7 +170,51 @@ impl SessionStore {
                 next_cleanup: Instant::now() + STORE_CLEANUP_INTERVAL,
                 cleanup_shard: 0,
             }),
+            rotations: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Moves a live session's data from `old_id` to `new_id`. Returns `false`
+    /// if `old_id` holds no live session.
+    fn rotate(&self, old_id: &str, new_id: &str, idle_timeout: Duration) -> bool {
+        let now = Instant::now();
+        let entry = {
+            let mut shard = lock_unpoisoned(&self.shards[self.shard_index(old_id)]);
+            Self::remove_entry(&mut shard, old_id)
+        };
+        let Some(entry) = entry else {
+            return false;
+        };
+        if entry.expires_at <= now {
+            self.entries.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        let moved = SessionEntry {
+            data: entry.data,
+            expires_at: Self::expiry(now, idle_timeout),
+        };
+        let mut shard = lock_unpoisoned(&self.shards[self.shard_index(new_id)]);
+        if !Self::insert_entry(&mut shard, new_id, moved) {
+            // `new_id` is freshly generated, so this is defensive: two
+            // entries became one.
+            self.entries.fetch_sub(1, Ordering::Relaxed);
+        }
+        true
+    }
+
+    fn record_rotation(&self, old_id: &str, new_id: &str, max_records: usize) {
+        let now = Instant::now();
+        let mut rotations = lock_unpoisoned(&self.rotations);
+        rotations.retain(|_, (_, at)| now.duration_since(*at) < ROTATION_RECORD_TTL);
+        if rotations.len() < max_records {
+            rotations.insert(old_id.to_string(), (new_id.to_string(), now));
+        }
+    }
+
+    fn take_rotation(&self, old_id: &str) -> Option<String> {
+        lock_unpoisoned(&self.rotations)
+            .remove(old_id)
+            .map(|(new_id, _)| new_id)
     }
 
     fn shard_index(&self, session_id: &str) -> usize {
@@ -745,6 +794,34 @@ impl Sessions {
         self.store.remove(session_id, key, self.idle_timeout);
     }
 
+    /// Replaces `session_id` with a new, unguessable id and moves its data
+    /// there, returning the new id. Call it whenever privilege changes (for
+    /// example right after login) so an id planted before authentication
+    /// (session fixation) is useless afterwards. The old id stops working
+    /// immediately, and the middleware sends the new signed cookie with this
+    /// response. Use the returned id for further `set`/`get` calls in the
+    /// same request.
+    ///
+    /// Regenerating an anonymous (never persisted) id admits a new, empty
+    /// session; at capacity this returns
+    /// [`SessionDataErrorKind::SessionUnavailable`].
+    pub fn regenerate(&self, session_id: &str) -> Result<String, SessionDataError> {
+        let new_id = self.generate_id();
+        if !self.store.rotate(session_id, &new_id, self.idle_timeout)
+            && !self
+                .store
+                .create(&new_id, self.idle_timeout, self.max_sessions)
+        {
+            return Err(SessionDataError::new(
+                SessionDataErrorKind::SessionUnavailable,
+                None,
+            ));
+        }
+        self.store
+            .record_rotation(session_id, &new_id, self.max_sessions);
+        Ok(new_id)
+    }
+
     /// Drops all data for a session and invalidates its signed id.
     pub fn clear(&self, session_id: &str) {
         self.store.clear(session_id);
@@ -782,14 +859,20 @@ impl Sessions {
                     Some(id) => id,
                     None => sessions.generate_id(),
                 };
+                // The header is kept for compatibility with handlers that read
+                // it directly; `session_id()` only trusts the private field.
                 if let Err(error) = req.set_header(SESSION_ID_HEADER, &id) {
                     let mut response = Response::from_error(error);
                     ensure_private_cache_control(&mut response);
                     return response;
                 }
+                req.session_id = Some(id.clone());
 
                 let mut res = next(req).await;
                 ensure_private_cache_control(&mut res);
+                // A handler that called `Sessions::regenerate` moved the
+                // session; reissue the cookie for its new id.
+                let id = sessions.store.take_rotation(&id).unwrap_or(id);
 
                 if !response_sets_root_host_cookie(&res, &sessions.cookie_name, &request_path) {
                     let secure = secure_transport
@@ -992,8 +1075,11 @@ impl Request {
     /// Returns the session id assigned by the [`Sessions`] middleware. For an
     /// anonymous request this id remains transient until a successful
     /// [`Sessions::set`] call persists it.
+    ///
+    /// Outside the middleware's scope this is `None`, even if the client sent
+    /// an `x-session-id` header.
     pub fn session_id(&self) -> Option<&str> {
-        self.header(SESSION_ID_HEADER)
+        self.session_id.as_deref()
     }
 }
 

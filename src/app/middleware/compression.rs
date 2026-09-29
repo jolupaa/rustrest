@@ -117,8 +117,13 @@ fn compression_with_min_size_and_supported(
         Box::pin(async move {
             let mut res = next(req).await;
 
-            // These statuses never carry a representation to negotiate.
+            // These statuses never carry a representation to negotiate, but
+            // a 304 must still send the Vary the 200 would have carried
+            // (RFC 9110 §15.4.5) so caches key the stored response correctly.
             if status_has_no_representation(res.status) {
+                if res.status == 304 {
+                    ensure_accept_encoding_vary(&mut res);
+                }
                 return res;
             }
 

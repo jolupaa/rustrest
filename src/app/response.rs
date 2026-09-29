@@ -20,6 +20,29 @@ use super::websocket::{ResolvedWebSocketConfig, validate_handshake};
 use super::{BoxError, HttpError, IntoHttpError, Request, SseEvent, WebSocketConfig};
 
 pub(crate) type ResponseBody = UnsyncBoxBody<Bytes, BoxError>;
+
+/// Percent-encodes the bytes of `location` that may not appear in a
+/// URI-reference, like Express's `encodeurl`: reserved and unreserved
+/// characters and valid `%XX` escapes are kept, everything else (spaces,
+/// controls, non-ASCII UTF-8) is encoded.
+fn encode_location(location: &str) -> String {
+    let bytes = location.as_bytes();
+    let mut encoded = String::with_capacity(location.len());
+    for (index, &byte) in bytes.iter().enumerate() {
+        let is_escape = byte == b'%'
+            && bytes
+                .get(index + 1..index + 3)
+                .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit));
+        let allowed =
+            byte.is_ascii_alphanumeric() || b"-._~:/?#[]@!$&'()*+,;=".contains(&byte) || is_escape;
+        if allowed {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
 type ResponseStream = Pin<Box<dyn Stream<Item = Result<Frame<Bytes>, BoxError>> + Send>>;
 
 enum BodyKind {
@@ -151,12 +174,28 @@ impl Response {
         response
     }
 
+    /// `302 Found` to `location`. Characters that are not valid in a
+    /// URI-reference (RFC 3986), such as spaces or non-ASCII text, are
+    /// percent-encoded; existing `%XX` escapes are preserved.
     pub fn redirect(location: &str) -> Self {
         Self::redirect_with_status(location, 302)
     }
 
+    /// Like [`Response::redirect`] with an explicit status. A status outside
+    /// `300..=399` is recorded as a construction error and rendered as `500`.
     pub fn redirect_with_status(location: &str, status: u16) -> Self {
-        Self::send("").status(status).header("location", location)
+        let response = Self::send("")
+            .status(status)
+            .header("location", &encode_location(location));
+        if (300..=399).contains(&status) {
+            response
+        } else {
+            let mut response = response;
+            response.record_build_error(ResponseBuildError::invalid_status(format!(
+                "{status} no es un estado de redireccion"
+            )));
+            response
+        }
     }
 
     pub fn status(mut self, status: u16) -> Self {
@@ -967,7 +1006,22 @@ where
             Ok(response) => response,
             Err(err) => {
                 let err = err.into_http_error();
-                eprintln!("Handler returned error: {}", err);
+                // Client errors are expected outcomes, not server faults.
+                if err.status().is_server_error() {
+                    match err.source() {
+                        Some(source) => super::log::log_error!(
+                            "El manejador devolvio un error {}: {} ({})",
+                            err.status().as_u16(),
+                            err.public_message(),
+                            source
+                        ),
+                        None => super::log::log_error!(
+                            "El manejador devolvio un error {}: {}",
+                            err.status().as_u16(),
+                            err.public_message()
+                        ),
+                    }
+                }
                 Response::from_error(err)
             }
         }

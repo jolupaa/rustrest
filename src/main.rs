@@ -3,9 +3,13 @@
 mod api;
 mod users;
 
-use rustrest::{App, Next, Request, Response, middleware};
+use rustrest::{App, HttpError, Json, Response, middleware};
+use serde::Deserialize;
 
-use std::collections::HashMap;
+#[derive(Deserialize)]
+struct Greeting {
+    nombre: String,
+}
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -14,27 +18,28 @@ async fn main() -> std::io::Result<()> {
     app.layer(middleware::cors());
 
     // Global middleware (onion model): runs before and after the handler.
-    app.layer(|req: Request, next: Next| async move {
+    // `from_fn` infers the `Request`/`Next` parameter types.
+    app.layer(middleware::from_fn(|req, next| async move {
         println!("--> {} {}", req.method, req.path);
         let res = next(req).await;
         println!("<-- {} ({})", res.status, res.content_type);
         res
-    });
+    }));
 
-    // Root route (synchronous handler).
-    app.get("/", |mut req: Request| async move {
-        if let Some(user) = req.params.get("user") {
-            Response::send(format!("Hola {}", user).as_str())
-        } else {
-            let body: HashMap<String, String> = req.json().await.unwrap_or_default();
-            Response::send(body.get("Hola").unwrap_or(&"tonto".to_string()).as_str())
-        }
-    })
-    .unwrap();
+    // Synchronous handler.
+    app.get("/", |_req: rustrest::Request| {
+        Response::send("Hola desde RustRest")
+    })?;
+
+    // Asynchronous handler with a typed JSON body: a missing or malformed
+    // body becomes a structured 4xx problem response instead of a default.
+    app.post("/saludo", |Json(greeting): Json<Greeting>| async move {
+        Ok::<_, HttpError>(Response::send(&format!("Hola, {}", greeting.nombre)))
+    })?;
 
     // Routes and sub-routes organized in files: `api` mounts `users`.
     // Result: /api/users, /api/users/:id, ...
-    app.mount("/api", api::router()).unwrap();
+    app.mount("/api", api::router())?;
 
     app.listen("127.0.0.1:3000").await
 }
