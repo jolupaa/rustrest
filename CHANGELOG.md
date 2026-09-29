@@ -8,6 +8,9 @@ The format follows Keep a Changelog and the project uses Semantic Versioning.
 
 ### Added
 
+- `examples/http_load.rs` (dependency-free HTTP/1.1 keep-alive, per-request
+  connection, and HTTP/2 load generator) and `examples/bench_server.rs`, with
+  results in `docs/benchmarks/http-transport.md`.
 - `Sessions::regenerate`, which moves a session to a fresh id (for example at
   login) and makes the middleware issue the new cookie, preventing session
   fixation.
@@ -46,6 +49,9 @@ The format follows Keep a Changelog and the project uses Semantic Versioning.
 
 ### Changed
 
+- Accepted TCP connections (plaintext and TLS) set `TCP_NODELAY`, so small
+  responses are not delayed by Nagle's algorithm waiting for the peer's
+  delayed ACK (most visible on multiplexed HTTP/2).
 - Internal diagnostics go through `tracing` (target `rustrest`) when that
   feature is enabled. Expected 4xx handler errors, client disconnects, TLS
   handshake failures, and protocol mismatches are no longer written to stderr;

@@ -129,6 +129,10 @@ impl App {
                 _ = &mut shutdown => break,
             };
 
+            // Responses are written as soon as they are ready; Nagle's
+            // algorithm would hold small writes back until the peer's delayed
+            // ACK (tens of milliseconds, most visible on HTTP/2).
+            let _ = stream.set_nodelay(true);
             let permit = match try_admit_connection(admission.as_ref()) {
                 Ok(permit) => permit,
                 Err(()) => {
