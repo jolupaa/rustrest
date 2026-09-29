@@ -289,6 +289,9 @@ The format follows Keep a Changelog and the project uses Semantic Versioning.
 
 ### Security
 
+- Lockfiles now use `h2` 0.4.19 (RUSTSEC-2026-0258, unbounded empty DATA
+  frames) and `rustls` 0.23.45 (RUSTSEC-2026-0285, TLS 1.3 handshake
+  messages across encryption levels).
 - HTTP/1 request smuggling: the `Transfer-Encoding`/`Content-Length` check now
   covers every request on a persistent connection. A connection is closed
   after any request whose successor the raw-head inspector does not track,
